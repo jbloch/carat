@@ -1,0 +1,16 @@
+# --- Core Logic ---
+# The official Python bindings for the MusicBrainz database
+musicbrainzngs>=2.7.0
+
+# Standard HTTP library (likely needed for downloading Cover Art images)
+requests>=2.31.0
+
+# --- GUI & Graphics ---
+# Hard requirement for handling/resizing Cover Art in the GUI
+# (Replaces the old 'HAS_PILLOW' check)
+Pillow>=10.2.0
+
+# --- Dev Tools (Optional but Recommended) ---
+# If we want to run static analysis later
+# pylint
+# black
