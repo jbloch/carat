@@ -1,294 +1,308 @@
+import itertools
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 import queue
-import sys
-import platform
-import os
 import json
 import shutil
 import time
 from pathlib import Path
 from PIL import Image, ImageTk
 
-import carat
-
+import carat  # The backend logic
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
+
 
 class CaratGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Carat: Concise Atmos Ripping Automation Tool")
-        self.root.geometry("650x850")
-        
+        self.root.geometry("850x850") # Square, like an album cover ;)
+
+        try:
+            img_icon = tk.PhotoImage(file='assets/carat_logo.png')
+            self.root.iconphoto(False, img_icon)
+        except Exception:
+            pass  # Failsafe: falls back to the default feather if the image is missing
+
+        # Load config first so we can use it in UI init
         self.config = self._load_config()
+
+        # Initialize thread-safe queues
         self.log_queue = queue.Queue()
         self.progress_queue = queue.Queue()
         self.status_queue = queue.Queue()
         self.art_queue = queue.Queue()
+
         self.current_cover_path = None
-        
+        self.is_ripping = False
+
         self._init_ui()
         self._start_queue_poller()
-        
+
+    @staticmethod
+    def _load_config():
+        """Loads user preferences from the home directory."""
+        if CONFIG_FILE.exists():
+            try:
+                return json.loads(CONFIG_FILE.read_text())
+            except:
+                pass
+        return {}
+
+    def _save_config(self):
+        """Saves current paths to the config file."""
+        cfg = {
+            "last_source": self.src_var.get(),
+            "library_root": self.dest_var.get()
+        }
+        try:
+            CONFIG_FILE.write_text(json.dumps(cfg))
+        except:
+            pass
+
+    def _evaluate_button_state(self, *args):
+        """Instantly updates the RIP button based on current inputs and state."""
+        # State 3 Guard: If we are actively ripping, ignore typing
+        if self.is_ripping:
+            return
+
+            # Check if all four fields have text in them
+        if not all([self.src_var.get().strip(), self.dest_var.get().strip(),
+                    self.artist_var.get().strip(), self.album_var.get().strip()]):
+            # State 1: Not Ready
+            self.btn_rip.config(state="disabled", text="FILL MISSING FIELDS")
+        else:
+            # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
+            self.btn_rip.config(state="normal", text="RIP ATMOS")
+
     def _init_ui(self):
+        """Constructs the visual interface."""
         style = ttk.Style()
         style.theme_use('clam')
-        style.configure("TButton", padding=6, font=('Segoe UI', 10))
-        style.configure("TLabel", font=('Segoe UI', 10))
-        
-        # 1. Source
-        frame_src = ttk.LabelFrame(self.root, text="1. Source", padding=10)
-        frame_src.pack(fill="x", padx=10, pady=5)
-        self.drive_var = tk.StringVar(value=self.config.get("last_drive", ""))
-        self.drives = self._scan_optical_drives()
-        self.drive_combo = ttk.Combobox(frame_src, textvariable=self.drive_var, values=self.drives, state="normal")
-        if not self.drive_var.get() and self.drives: self.drive_combo.current(0)
-        self.drive_combo.pack(side="left", fill="x", expand=True, padx=(0, 5))
-        ttk.Button(frame_src, text="Browse File...", command=self._browse_source).pack(side="right")
 
-        # 2. Destination
-        frame_dest = ttk.LabelFrame(self.root, text="2. Library Root", padding=10)
+        # Override the disabled button state for high visibility (This includes "RIP COMPLETE!")
+        style.map('TButton', foreground=[('disabled', 'black')], background=[('disabled', '#e0e0e0')])
+
+        # 1. Destination (Library Root)
+        section = itertools.count(1)
+        frame_dest = ttk.LabelFrame(self.root, text=f"{next(section)}. Library Root", padding=10)
         frame_dest.pack(fill="x", padx=10, pady=5)
-        # Default is now generic, but remembers user choice
+
         default_root = str(Path.cwd() / "output_library")
         self.dest_var = tk.StringVar(value=self.config.get("library_root", default_root))
         ttk.Entry(frame_dest, textvariable=self.dest_var).pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Button(frame_dest, text="Browse...", command=self._browse_dest).pack(side="right")
 
-        # 3. Metadata & Art
+        # 2. Source Selection
+        frame_src = ttk.LabelFrame(self.root, text=f"{next(section)}. Source (Disc, ISO, or Folder)", padding=10)
+        frame_src.pack(fill="x", padx=10, pady=5)
+
+        self.src_var = tk.StringVar(value=self.config.get("last_source", ""))
+        ttk.Entry(frame_src, textvariable=self.src_var).pack(side="left", fill="x", expand=True, padx=(0, 5))
+        ttk.Button(frame_src, text="Folder/Disc...", command=self._browse_source_folder).pack(side="right", padx=(2, 0))
+        ttk.Button(frame_src, text="File...", command=self._browse_source_file).pack(side="right")
+
+        # 3. Metadata & Art Container
         frame_meta_cont = ttk.Frame(self.root)
         frame_meta_cont.pack(fill="x", padx=10, pady=5)
-        frame_meta = ttk.LabelFrame(frame_meta_cont, text="3. Metadata", padding=10)
+
+        # Metadata Sub-Frame
+        frame_meta = ttk.LabelFrame(frame_meta_cont, text=f"{next(section)} Metadata", padding=10)
         frame_meta.pack(side="left", fill="both", expand=True, padx=(0, 5))
-        
-        ttk.Label(frame_meta, text="Artist:").grid(row=0, column=0, sticky="w")
-        self.entry_artist = ttk.Entry(frame_meta)
-        self.entry_artist.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
-        
-        # NEW: Album Line with Suffix
-        ttk.Label(frame_meta, text="Album:").grid(row=1, column=0, sticky="w")
-        
-        frame_album_line = ttk.Frame(frame_meta)
-        frame_album_line.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
-        
-        self.entry_album = ttk.Entry(frame_album_line)
-        self.entry_album.pack(side="left", fill="x", expand=True)
-        
-        # Suffix Field (Default: " (Atmos)")
-        self.entry_suffix = ttk.Entry(frame_album_line, width=12)
-        self.entry_suffix.insert(0, " (Atmos)")
-        self.entry_suffix.pack(side="right", padx=(5, 0))
-        
+
+        ttk.Label(frame_meta, text="Artist:").grid(row=0, column=0, sticky="w", pady=2)
+        self.artist_var = tk.StringVar()
+        self.ent_artist = ttk.Entry(frame_meta, textvariable=self.artist_var)
+        self.ent_artist.grid(row=0, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Label(frame_meta, text="Album:").grid(row=1, column=0, sticky="w", pady=2)
+        self.album_var = tk.StringVar()
+        self.ent_album = ttk.Entry(frame_meta, textvariable=self.album_var)
+        self.ent_album.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+
         frame_meta.columnconfigure(1, weight=1)
 
+        # Cover Art Sub-Frame
         frame_art = ttk.LabelFrame(frame_meta_cont, text="Cover Art", padding=10)
         frame_art.pack(side="right", fill="y", padx=(5, 0))
-        self.lbl_art = ttk.Label(frame_art, text="Waiting...", anchor="center", background="#eee", width=15)
+
+        # The Anti-Jump Container: Forces exactly 200x200 pixels
+        art_container = ttk.Frame(frame_art, width=200, height=200)
+        art_container.pack()
+        art_container.pack_propagate(False)  # Prevents container from shrinking to fit the text
+
+        # The Label inside the container (drop the 'width=15' text sizing)
+        self.lbl_art = ttk.Label(art_container, text="Waiting...", anchor="center", background="#eee")
         self.lbl_art.pack(fill="both", expand=True)
         self.lbl_art.bind("<Button-1>", self._change_cover_art)
-        
-        ttk.Label(frame_art, text="(Click to Replace)", font=('Segoe UI', 8)).pack()
 
-        # 4. Action
-        frame_action = ttk.Frame(self.root, padding=10)
-        frame_action.pack(fill="x", padx=10)
-        self.led_canvas = tk.Canvas(frame_action, width=30, height=30, highlightthickness=0)
-        self.led = self.led_canvas.create_oval(5, 5, 25, 25, fill="lightgray", outline="gray")
-        self.led_canvas.pack(side="left", padx=(0, 10))
-        self.btn_rip = ttk.Button(frame_action, text="RIP ATMOS", command=self._start_rip_thread)
-        self.btn_rip.pack(side="left", fill="x", expand=True)
+        # 4. Action Buttons
+        frame_actions = ttk.Frame(self.root)
+        frame_actions.pack(fill="x", padx=15, pady=10)
 
-        # Progress
+        self.btn_rip = ttk.Button(frame_actions, text="RIP ATMOS", command=self._start_rip_thread)
+        self.btn_rip.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.btn_clear = ttk.Button(frame_actions, text="Clear Console", command=self._clear_console)
+        self.btn_clear.pack(side="right")
+
+        # Progress & Status
         frame_prog = ttk.Frame(self.root, padding=(10, 0, 10, 0))
         frame_prog.pack(fill="x", padx=10)
         self.progress_var = tk.DoubleVar()
         self.progress_bar = ttk.Progressbar(frame_prog, variable=self.progress_var, maximum=100)
         self.progress_bar.pack(fill="x")
         self.lbl_status = ttk.Label(frame_prog, text="Ready", font=('Segoe UI', 9, 'italic'), foreground="gray")
-        self.lbl_status.pack(anchor="w", pady=(2,0))
+        self.lbl_status.pack(anchor="w", pady=(2, 0))
 
-        # Console
+        # Console Output
         frame_log = ttk.LabelFrame(self.root, text="Console Output", padding=10)
         frame_log.pack(fill="both", expand=True, padx=10, pady=10)
-        self.txt_log = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9), height=12)
+        self.txt_log = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9))
         self.txt_log.pack(fill="both", expand=True)
-        self.txt_log.tag_config("err", foreground="red")
-        self.txt_log.tag_config("suc", foreground="green")
-        self.txt_log.tag_config("progress", foreground="blue")
 
-    def _scan_optical_drives(self):
-        drives = ["Disc 0 (Auto-Detected)"]
-        if platform.system() == "Windows":
-            try:
-                import ctypes
-                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-                for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-                    if bitmask & 1:
-                        if ctypes.windll.kernel32.GetDriveTypeW(f"{letter}:\\") == 5:
-                            drives.append(f"Drive {letter}:")
-                    bitmask >>= 1
-            except Exception: pass
-        return drives
+        # Bind the variables to the state evaluator
+        self.src_var.trace_add("write", self._evaluate_button_state)
+        self.dest_var.trace_add("write", self._evaluate_button_state)
+        self.artist_var.trace_add("write", self._evaluate_button_state)
+        self.album_var.trace_add("write", self._evaluate_button_state)
 
-    def _browse_source(self):
-        path = filedialog.askopenfilename(filetypes=[("Disc Image / MKV", "*.iso *.mkv")])
-        if not path: path = filedialog.askdirectory(title="Select Folder")
-        if path:
-            self.drive_var.set(path)
-            if path not in self.drives: self.drive_combo['values'] = [path] + list(self.drives)
+        # Force an initial evaluation on startup
+        self._evaluate_button_state()
+
+    def _browse_source_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Media File", "*.iso *.mkv *.mp4")])
+        if path: self.src_var.set(path)
+
+    def _browse_source_folder(self):
+        path = filedialog.askdirectory(title="Folder of media files or Blu-ray Drive")
+        if path: self.src_var.set(path)
 
     def _browse_dest(self):
-        path = filedialog.askdirectory()
+        """Prompts the user for the library root."""
+        path = filedialog.askdirectory(title="Select Library Root")
         if path: self.dest_var.set(path)
 
-    def _load_config(self):
-        if CONFIG_FILE.exists():
-            try: return json.loads(CONFIG_FILE.read_text())
-            except: pass
-        return {}
-
-    def _save_config(self):
-        cfg = { "last_drive": self.drive_var.get(), "library_root": self.dest_var.get() }
-        try: CONFIG_FILE.write_text(json.dumps(cfg))
-        except: pass
-
-    def _log(self, msg, is_progress=False):
-        msg = msg.strip()
-        if not msg: return
+    def _log_callback(self, msg, is_progress=False):
+        """Thread-safe logging back to the UI."""
         if is_progress:
-            try:
-                if "Copying:" in msg:
-                    val = float(msg.split(":")[1].strip().replace("%",""))
+            self.status_queue.put(msg)
+            if "%" in msg:
+                try:
+                    val = float(msg.split(":")[1].strip().replace("%", ""))
                     self.progress_queue.put(val)
-                    self.status_queue.put(msg)
-                elif "Transcoding:" in msg:
-                    self.status_queue.put(msg)
-            except: pass
-            self.log_queue.put(("PROG", msg))
+                except:
+                    pass
         else:
-            self.log_queue.put(("TEXT", msg))
+            self.log_queue.put(msg)
 
-    def _start_queue_poller(self):
-        while not self.log_queue.empty():
-            type_, msg = self.log_queue.get_nowait()
-            self.txt_log.config(state="normal")
-            
-            if type_ == "PROG":
-                ranges = self.txt_log.tag_ranges("dynamic")
-                if ranges:
-                    self.txt_log.delete(ranges[0], ranges[1])
-                self.txt_log.insert("end", msg + "\n", ("progress", "dynamic"))
-            else:
-                self.txt_log.tag_remove("dynamic", "1.0", "end")
-                tag = "err" if "Error" in msg or "Die" in msg else "suc" if "Complete" in msg else None
-                self.txt_log.insert("end", msg + "\n", tag)
+    def _start_rip_thread(self):
+        """Collects inputs and launches the background worker."""
+        self._save_config()
 
-            self.txt_log.see("end")
-            self.txt_log.config(state="disabled")
+        self.is_ripping = True
+        self.btn_rip.config(state="disabled", text="RIPPING IN PROGRESS...") # State #3 Rip in progress
 
-        while not self.progress_queue.empty():
-            val = self.progress_queue.get_nowait()
-            self.progress_bar.stop()
-            self.progress_bar.config(mode='determinate')
-            self.progress_var.set(val)
+        source = self.src_var.get().strip()
+        artist = self.artist_var.get().strip()
+        album = self.album_var.get().strip()
+        root = self.dest_var.get().strip()
 
-        while not self.status_queue.empty():
-            self.lbl_status.config(text=self.status_queue.get_nowait())
+        self._save_config()
+        self.btn_rip.config(state="disabled")
+        self.progress_bar.config(mode='indeterminate')
+        self.progress_bar.start(10)
 
-        while not self.art_queue.empty():
-            path = self.art_queue.get_nowait()
-            self._display_cover(path)
+        # Hardcode the expected Atmos suffix for cover art polling
+        expected_cover = Path(root) / artist / f"{album} (Atmos)" / "cover.jpg"
 
-        self.root.after(100, self._start_queue_poller)
+        thread = threading.Thread(target=self._run_logic, args=(source, artist, album, root))
+        thread.daemon = True
+        thread.start()
+
+        threading.Thread(target=self._poll_for_cover, args=(expected_cover,), daemon=True).start()
+
+    def _run_logic(self, source, artist, album, root):
+        """The worker thread function."""
+        try:
+            # Assuming carat.process_release was updated to drop the suffix argument
+            carat.rip_album_to_library(source, artist, album, root, self._log_callback)
+            self.log_queue.put("[+] Process Complete.")
+        except Exception as e:
+            self.log_queue.put(f"CRITICAL ERROR: {e}")
+        finally:
+            self.root.after(0, self._finalize_ui)
+
+    def _finalize_ui(self):
+        self.progress_bar.stop()
+        self.progress_bar.config(mode='determinate')
+        self.progress_var.set(100)
+        self.lbl_status.config(text="Idle")
+
+        self.is_ripping = False
+        self.btn_rip.config(state="disabled", text="RIP COMPLETE")  # State 4: Complete
+
+    def _poll_for_cover(self, path):
+        """Watches for the cover art file to appear."""
+        for _ in range(10000):
+            if path.exists() and path.stat().st_size > 0:
+                self.art_queue.put(str(path))
+                return
+            time.sleep(1)
 
     def _display_cover(self, path):
+        """Updates the cover art label using Pillow."""
         self.current_cover_path = path
         try:
             pil_img = Image.open(path)
-            pil_img.thumbnail((120, 120)) 
+            pil_img.thumbnail((200, 200))
             img = ImageTk.PhotoImage(pil_img)
             self.lbl_art.config(image=img, text="")
-            self.lbl_art.image = img 
+            self.lbl_art.image = img
         except Exception:
             self.lbl_art.config(text="[Image Error]", image="")
 
     def _change_cover_art(self, event):
+        """Allows user to click and replace the cover art manually."""
         if not self.current_cover_path: return
         new_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png")])
         if new_path:
             try:
                 shutil.copy(new_path, self.current_cover_path)
-                self._display_cover(self.current_cover_path) 
-                messagebox.showinfo("Updated", "Cover art updated.")
+                self._display_cover(self.current_cover_path)
             except Exception as e:
-                messagebox.showerror("Error", f"Failed: {e}")
+                messagebox.showerror("Error", f"Failed to update cover: {e}")
 
-    def _start_rip_thread(self):
-        source = self.drive_var.get()
-        artist = self.entry_artist.get().strip()
-        album = self.entry_album.get().strip()
-        # Get Suffix (Don't strip, we want the leading space!)
-        suffix = self.entry_suffix.get()
-        root = self.dest_var.get().strip()
-        
-        if not all([artist, album, root]):
-            messagebox.showwarning("Missing Info", "Please fill all fields.")
-            return
+    def _start_queue_poller(self):
+        """Consumes queue events and updates the UI (must run on main thread)."""
+        while not self.log_queue.empty():
+            msg = self.log_queue.get_nowait()
+            self.txt_log.config(state="normal")
+            self.txt_log.insert("end", f"{msg}\n")
+            self.txt_log.see("end")
+            self.txt_log.config(state="disabled")
 
-        self._save_config()
-        self.btn_rip.config(state="disabled")
-        self.led_canvas.itemconfig(self.led, fill="yellow")
-        self.lbl_art.config(image="", text="Scanning...")
-        self.progress_bar.config(mode='indeterminate')
-        self.progress_bar.start(10)
-        self.lbl_status.config(text="Scanning source (this may take 60s)...")
-        
-        # Calculate expected cover path using new logic
-        full_title = f"{album}{suffix}"
-        expected_cover = Path(root) / artist / full_title / "cover.jpg"
-        
-        t = threading.Thread(target=self._run_rip, args=(source, artist, album, suffix, root, expected_cover))
-        t.daemon = True
-        t.start()
-        self._poll_cover_thread(expected_cover)
+        while not self.progress_queue.empty():
+            self.progress_bar.stop()  # Kills the ghost animation!
+            self.progress_bar.config(mode='determinate')
+            self.progress_var.set(self.progress_queue.get_nowait())
 
-    def _run_rip(self, source, artist, album, suffix, root, expected_cover):
-        if "Auto-Detect" in source: src = "-1"
-        elif "Drive" in source and ":" in source: src = "0" 
-        else: src = source
-        try:
-            # Updated Call: Pass Suffix
-            carat.process_release(src, artist, album, suffix, root, self._log)
-            self.root.after(0, lambda: self._rip_finished(True))
-        except Exception as e:
-            self._log(f"CRITICAL ERROR: {e}")
-            self.root.after(0, lambda: self._rip_finished(False))
+        while not self.status_queue.empty():
+            self.lbl_status.config(text=self.status_queue.get_nowait())
 
-    def _poll_cover_thread(self, path):
-        def worker():
-            for _ in range(300): 
-                if path.exists() and path.stat().st_size > 0:
-                    self.art_queue.put(str(path))
-                    return
-                time.sleep(1)
-        t = threading.Thread(target=worker)
-        t.daemon = True
-        t.start()
+        while not self.art_queue.empty():
+            self._display_cover(self.art_queue.get_nowait())
 
-    def _rip_finished(self, success):
-        self.btn_rip.config(state="normal")
-        self.progress_bar.stop()
-        self.progress_bar.config(mode='determinate')
-        color = "green" if success else "red"
-        self.led_canvas.itemconfig(self.led, fill=color)
-        if success:
-            messagebox.showinfo("Done", "Library Entry Complete!")
-            self.progress_var.set(100)
-            self.lbl_status.config(text="Idle")
-        else:
-            self.lbl_status.config(text="Failed")
+        self.root.after(100, self._start_queue_poller)
+
+    def _clear_console(self):
+        """Wipes the console text box clean."""
+        self.txt_log.config(state="normal")
+        self.txt_log.delete('1.0', tk.END)
+        self.txt_log.config(state="disabled")
+
 
 if __name__ == "__main__":
     root = tk.Tk()

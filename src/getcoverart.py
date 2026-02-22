@@ -5,7 +5,6 @@
 """
 
 import sys
-import os
 import requests
 import musicbrainzngs as mb
 import logger
@@ -106,7 +105,7 @@ def get_itunes_art(artist, album, log_callback):
 
 def download_cover_art(artist, album, target_dir, log_callback=None):
     """
-    Downloads the best available cover art. 
+    Downloads the best available cover art.
     Uses log_callback for thread-safe reporting via logger.py.
     """
     image_url = get_itunes_art(artist, album, log_callback) or get_mb_digital_art(artist, album, log_callback)
