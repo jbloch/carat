@@ -1,6 +1,6 @@
 """
    A freestanding tool and small library to find high-quality album artowork on the web.
-   It currenly uses Apple/iTunes and MusicBrainz as sources, but this does not affect
+   It currently uses Apple/iTunes and MusicBrainz as sources, but this does not affect
    the contract between this module and its users.
 """
 
@@ -103,7 +103,7 @@ def get_itunes_art(artist, album, log_callback):
     except: pass
     return None
 
-def download_cover_art(artist, album, target_dir, log_callback=None):
+def get_cover_art(artist, album, target_dir, log_callback=None):
     """
     Downloads the best available cover art.
     Uses log_callback for thread-safe reporting via logger.py.
@@ -131,7 +131,7 @@ def main():
     target_dir = Path(library_root) / artist / album
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    download_cover_art(artist, album, target_dir)
+    get_cover_art(artist, album, target_dir)
 
 if __name__ == "__main__":
     main()

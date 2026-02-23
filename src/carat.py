@@ -10,7 +10,7 @@ import getcoverart, logger
 
 __all__ = ['rip_album_to_library']
 
-# --- (1) The Porcelain (Metadata & Utils) ---
+# --- (1) Metadata & Utils ---
 
 def seconds_to_cue(seconds: float) -> str:
     """Converts seconds to MM:SS:FF for gapless CUE sheets."""
@@ -41,7 +41,7 @@ def _parse_makemkv_msg(line: str) -> Optional[str]:
 
     return None
 
-# --- (2) The Plumbing (Clean Subprocess + Beautifier) ---
+# --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
 def _process_output_line(line: str, output_acc: List[str], state: dict, log_callback: Optional[Callable]):
     line = line.rstrip('\r\n')
@@ -137,7 +137,7 @@ def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Cal
 
     logger.emit(summary, log_callback)
 
-# --- (3) The Logic (Atmos or Die) ---
+# --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
 def find_primary_title(source_spec: str, log_callback: Optional[Callable] = None) -> str:
     """Identifies the Atmos title. Fails if no Atmos track is found."""
@@ -186,7 +186,7 @@ def find_primary_title(source_spec: str, log_callback: Optional[Callable] = None
 # --- (4) Toolset & Main ---
 
 class Toolset:
-    def __init__(self) -> None:
+    def __init__(self, fatal_error_handler: Optional[Callable[[str], None]] = None) -> None:
         self.IS_WIN = platform.system() == "Windows"
         self.FFMPEG = self._find("ffmpeg",
                                  [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
@@ -199,7 +199,7 @@ class Toolset:
             "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon",
             "/usr/bin/makemkvcon"
         ])
-        self._validate()
+        self._validate(fatal_error_handler)
 
     @staticmethod
     def _find(name: str, prospects: Optional[List[str]] = None) -> Optional[str]:
@@ -213,19 +213,55 @@ class Toolset:
 
         return None
 
-    def _validate(self) -> None:
-        if any(v is None for v in self.__dict__.values() if not isinstance(v, bool)):
-            logger.emit(f"ERROR: Missing dependencies: {[k for k, v in self.__dict__.items() if v is None]}")
+    def _validate(self, error_handler: Optional[Callable[[str], None]]) -> None:
+        # 1. Check for missing dependencies
+        missing = [k for k, v in self.__dict__.items() if v is None and not isinstance(v, bool) and k != 'IS_WIN']
+        if missing:
+            msg = f"Missing dependencies: {', '.join(missing)}\nPlease install them or check your system paths."
+            self._trigger_fatal(msg, error_handler)
+
+        # 2. Validate MakeMKV License
+        try:
+            # 'info dev:all' triggers the license check without ripping anything
+            result = subprocess.run(
+                [self.MAKEMKV, "info", "dev:all"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            output = (result.stdout + result.stderr).lower()
+
+            if "expired" in output or "too old" in output or "evaluation" in output:
+                msg = "MakeMKV beta key appears to be expired or invalid.\nPlease open the MakeMKV GUI, enter the latest beta key from the forums, and try again."
+                self._trigger_fatal(msg, error_handler)
+
+        except Exception as e:
+            self._trigger_fatal(f"Failed to validate MakeMKV: {e}", error_handler)
+
+    def _trigger_fatal(self, message: str, handler: Optional[Callable[[str], None]]) -> None:
+        """Invokes the injected handler, or falls back to a CLI exit."""
+        if handler:
+            handler(message)
+        else:
+            logger.emit(f"FATAL ERROR: {message}")
             sys.exit(1)
 
 
-TOOLS = Toolset()
-mb.set_useragent("AtmosRipAutomationTool", "0.2", "josh@bloch.us")
+# Global singleton placeholder
+TOOLS: Optional[Toolset] = None
 
 
-def rip_atmos(source_spec: str, mkv_path: Path, title_idx: str = "all",
-              log_callback: Optional[Callable] = None) -> Path:
-    # Force a strict, absolute Windows path to prevent MakeMKV from mixing slashes
+def init_toolset(error_handler: Optional[Callable[[str], None]] = None) -> None:
+    """Instantiates the toolset. Must be called by the frontend before ripping."""
+    global TOOLS
+    TOOLS = Toolset(error_handler)
+
+mb.set_useragent("AtmosRipAutomationTool", "1.0β", "josh@bloch.us")
+
+
+def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "all",
+                            log_callback: Optional[Callable] = None) -> Path:
+    # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
     clean_mkv_path = str(mkv_path.resolve())
     cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_mkv_path, "--minlength=600"]
     run_command(cmd, f"Ripping Title {title_idx}", log_callback)
@@ -295,20 +331,31 @@ def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int, log_
     return None, None
 
 
-def merge_iaa_folder(directory_path: Path, ssd_path: Path, log_callback: Optional[Callable] = None) -> Path:
-    files = sorted(list(directory_path.glob("*.mk*")))
-    if not files: raise FileNotFoundError("No MKV files found in source folder.")
+def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callback: Optional[Callable] = None) -> Path:
+    """
+    Merges a directory of sequential audio files (MKV, MKA, M4A, or MP4) into a single master MKV.
+    This allows Immersive Audio Album (IAA) track-by-track downloads to be processed as a single album.
+    """
+    files = sorted(
+        [f for f in directory_path.iterdir() if f.is_file() and f.suffix.lower() in ('.mkv', '.mka', '.m4a', '.mp4')])
+
+    if not files:
+        raise FileNotFoundError("No valid media files (MKV, MKA, M4A, MP4) found in source folder.")
+
     out = ssd_path / "master.mkv"
     cmd = [TOOLS.MKVMERGE, "--priority", "lower", "-o", str(out)]
+
     for i, f in enumerate(files):
         cmd.append(str(f) if i == 0 else f"+{str(f)}")
 
     # Simple blind append logic for IAA
-    run_command(cmd, f"Merging IAA Folder", log_callback)
+    run_command(cmd, "Merging IAA Folder", log_callback)
     return out
 
 # We do all of our work in a temp directory, which will contain a huge MKV. The following code ensures that the
 # contents of this directory get deleted, come hell or highwater (though they might survive a BSOD or power outage).
+# Similarly, the heavy lifiting is done by a background process, and we must track that process so we can kill it
+# if the tool dies or is terminated, e.g., by clicking the close button, while a rip is in progress.
 TMP_DIR = Path(tempfile.mkdtemp(prefix="carat_"))
 _active_subprocess: Optional[subprocess.Popen[str]] = None  # Tracks the currently running tool
 
@@ -359,9 +406,10 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
       3. CUE sheets are generated for gapless playback support.
       4. Heavy lifting (Cover Art download, Transcoding) is parallelized where possible.
     """
-    # 1. Prepare the destination directory
+    # 1. Prepare the destination directory, and ensure tmp directory exists
     target = Path(library_root) / artist / f"{album} (Atmos)"
     target.mkdir(parents=True, exist_ok=True)
+    TMP_DIR.mkdir(parents=True, exist_ok=True)  # Normally a no-op, but recreates directory if this is not the first rip
 
     try:
         try:
@@ -376,7 +424,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # Execute "Atmos or Die" Scan & Rip
             source_spec = f"disc:{drive_idx}"
             title_idx = find_primary_title(source_spec, log_callback)
-            atmos_mkv = rip_atmos(source_spec, TMP_DIR, title_idx, log_callback)
+            atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
 
         except (ValueError, TypeError):
             # Input is not an integer; handle as Path
@@ -386,19 +434,19 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             if src_p.suffix.lower() == ".iso":
                 source_spec = f"iso:{src_p.resolve()}"
                 title_idx = find_primary_title(source_spec, log_callback)
-                atmos_mkv = rip_atmos(source_spec, TMP_DIR, title_idx, log_callback)
+                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
 
-            # --- CASE C: BDMV Folder Structure (Decrypted Backup) ---
+            # --- CASE C: Mounted Blu-ray or other BDMV Folder Structure ---
             elif src_p.is_dir() and (src_p / "BDMV").exists():
                 source_spec = f"file:{src_p.resolve() / 'BDMV'}"
                 title_idx = find_primary_title(source_spec, log_callback)
-                atmos_mkv = rip_atmos(source_spec, TMP_DIR, title_idx, log_callback)
+                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
 
-            # --- CASE D: IAA / Generic Folder (Merge MKVs) ---
+            # --- CASE D: Folder of MKVs, such as IAA distribution  (Merge MKVs or MP4s rather than ripping) ---
             elif src_p.is_dir():
-                atmos_mkv = merge_iaa_folder(src_p, TMP_DIR, log_callback)
+                atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR, log_callback)
 
-            # --- CASE E: Direct MKV File (Bypass Rip) ---
+            # --- CASE E: Direct MKV File, such as Headphone Dust distribution (Bypass Rip; input is master MKV) ---
             else:
                 atmos_mkv = src_p.resolve()
                 if not atmos_mkv.exists(): raise FileNotFoundError(f"Not found: {src_path}")
@@ -414,12 +462,12 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         # 4. Final Assembly (Concurrent)
         # We run the Cover Art download in parallel with the heavy Transcode
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(getcoverart.download_cover_art, artist, album, target, log_callback)
+            cover_future = ex.submit(getcoverart.get_cover_art, artist, album, target, log_callback)
 
-            # Generate "Porcelain" (CUE Sheet)
+            # Generate CUE Sheet
             generate_cue_sheet(target / f"{album} (Atmos).cue", f"{album} (Atmos).m4a", info, chaps, tracks or [])
 
-            # Transcode (TrueHD/Atmos -> M4A Container)
+            # Transcode Master MKV, whose chapters are the TrueHD/Atmos songs to a chapterless M4A Container
             transcode_mkv_to_m4a(atmos_mkv, target / f"{album} (Atmos).m4a", album, log_callback)
 
             # Ensure Cover Art finished (soft timeout)
@@ -433,6 +481,11 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     logger.emit(f"\n[+] Library Entry Complete: {album}", log_callback)
 
 
+def _clean_path_arg(arg: str) -> str:
+    """Strips rogue literal quotes caused by Windows shell path escaping (e.g., \\")."""
+    return arg.strip('"')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("source")
@@ -440,7 +493,16 @@ def main():
     parser.add_argument("album")
     parser.add_argument("library_root")
     args = parser.parse_args()
-    rip_album_to_library(args.source, args.artist, args.album, args.library_root)
+
+    # Initialize for CLI (no UI handler)
+    init_toolset()
+
+    rip_album_to_library(
+        _clean_path_arg(args.source),
+        args.artist,
+        args.album,
+        _clean_path_arg(args.library_root)
+    )
 
 if __name__ == "__main__":
     main()

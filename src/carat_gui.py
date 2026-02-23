@@ -290,7 +290,13 @@ class CaratGUI:
             self.progress_var.set(self.progress_queue.get_nowait())
 
         while not self.status_queue.empty():
-            self.lbl_status.config(text=self.status_queue.get_nowait())
+            msg = self.status_queue.get_nowait()
+            self.lbl_status.config(text=msg)
+
+            # Switch to bouncing mode when FFmpeg starts
+            if "Transcoding" in msg and self.progress_bar.cget("mode") != "indeterminate":
+                self.progress_bar.config(mode="indeterminate")
+                self.progress_bar.start(15)
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())
@@ -303,8 +309,20 @@ class CaratGUI:
         self.txt_log.delete('1.0', tk.END)
         self.txt_log.config(state="disabled")
 
+    def handle_fatal_error(self, message: str) -> None:
+        """
+        Matches the Callable[[str], None] signature.
+        Pops the dialog over the main window, then cleanly kills the app.
+        """
+        from tkinter import messagebox
+        import sys
+
+        messagebox.showerror("Carat: Startup Error", message, parent=self.root)
+        self.root.destroy()
+        sys.exit(1)
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = CaratGUI(root)
+    carat.init_toolset(app.handle_fatal_error)
     root.mainloop()
