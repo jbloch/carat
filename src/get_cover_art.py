@@ -1,5 +1,5 @@
 """
-   A freestanding tool and small library to find high-quality album artowork on the web.
+   A freestanding tool and small library to find high-quality album artwork on the web.
    It currently uses Apple/iTunes and MusicBrainz as sources, but this does not affect
    the contract between this module and its users.
 """
@@ -12,13 +12,18 @@ from PIL import Image
 from io import BytesIO
 from pathlib import Path
 
-# Configuration
+__all__ = ['get_cover_art']
+
+# We search multiple albums on Apple Music to give us a buffer against Apple's fuzzy search
+MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5
+
 mb.set_useragent("CoverArtRetrievalTool", "0.1", "josh@bloch.us")
 
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB Cap
 MIN_DIMENSION = 1000              # Minimum pixels for 'High Res'
 
 def is_valid_image(url):
+    """ Returns true and the image dimensions if the image at the given URL has appropriate shape for cover art. """
     try:
         # If it's a known CAA thumbnail, we trust the size and skip the HEAD request
         is_thumbnail = "/thumbnails/" in url or "itunes.apple.com" in url
@@ -29,15 +34,14 @@ def is_valid_image(url):
             if size > MAX_FILE_SIZE:
                 return False, 0, 0
 
-        # We still use stream=True here to check the Aspect Ratio/Dimensions 
-        # because we only need the first few KB of the header.
+        # We use stream=True to check the Aspect Ratio/Dimensions because we only need the first few KB of the header.
         resp = requests.get(url, stream=True, timeout=10)
         img = Image.open(resp.raw)
         w, h = img.size
         
         # Validation logic...
         aspect_ratio = w / h
-        if 0.95 < aspect_ratio < 1.05 and w >= MIN_DIMENSION:
+        if 0.95 < aspect_ratio < 1.05 and w >= MIN_DIMENSION:  #Square-ish
             return True, w, h
     except Exception:
         pass
@@ -45,17 +49,18 @@ def is_valid_image(url):
 
 def get_mb_digital_art(artist, album, log_callback):
     logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...", log_callback, log_callback)
+    image_url = None
     try:
         release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
         if release_groups['release-group-count'] == 0: return None
         
-        rgid = release_groups['release-group-list'][0]['id']
-        releases = mb.get_release_group_by_id(rgid, includes=["releases"])['release-group']['release-list']
+        rg_id = release_groups['release-group-list'][0]['id']
+        releases = mb.get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
         
         # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
         digital = [r for r in releases if r.get('status') == 'Official' and r.get('packaging') is None]
-        image_url = get_mb_art_from_releases(digital)
-        if (not image_url):
+        image_url = get_mb_art_from_releases(digital, log_callback)
+        if not image_url:
             official = [r for r in releases if r.get('status') == 'Official']
             image_url = get_mb_art_from_releases(official, log_callback)
     except: pass
@@ -66,16 +71,16 @@ def get_mb_art_from_releases(releases, log_callback):
     releases.sort(key=lambda x: str(x.get('date', '0000')), reverse=True)
     
     for r in releases:
-        mbid = r['id']
+        mb_id = r['id']
         # IMPORTANT: Perform a direct lookup for the release to get fresh CAA status
         # The release data inside a release-group object is often incomplete.
         try:
-            full_release = mb.get_release_by_id(mbid)
+            full_release = mb.get_release_by_id(mb_id)
             status = full_release['release'].get('cover-art-archive', {})
             
             if status.get('artwork') == 'true':
-                logger.emit(f"  [+] Found CAA art for: {mbid}", log_callback)
-                caa_data = requests.get(f"https://coverartarchive.org/release/{mbid}").json()
+                logger.emit(f"  [+] Found CAA art for: {mb_id}", log_callback)
+                caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}").json()
                 for img_entry in caa_data['images']:
                     if img_entry['front']:
                         url = img_entry['thumbnails'].get('1200') or img_entry['image']
@@ -83,24 +88,34 @@ def get_mb_art_from_releases(releases, log_callback):
                         if valid: return url
                         else: logger.emit(f"Invalid CAA art: '{img_entry}'", log_callback);
         except Exception as e:
-            logger.emit(f"  [!] Error checking release {mbid}: {e}", log_callback)
+            logger.emit(f"  [!] Error checking release {mb_id}: {e}", log_callback)
             continue
     return None
 
+
 def get_itunes_art(artist, album, log_callback):
     url = "https://itunes.apple.com/search"
-    params = {"term": f"{artist} {album}", "entity": "album", "limit": 1}
+    params = {"term": f"{artist} {album}", "entity": "album", "limit": MAX_APPLE_ALBUM_COVERS_TO_SEARCH}
     try:
         r = requests.get(url, params=params).json()
-        if r.get('resultCount', 0) > 0:
-            res = r['results'][0]
-            if album.lower() not in res['collectionName'].lower():
-                logger.emit(f"Possible mismatch: cover art is for {res['artistName']} - {res['collectionName']}", log_callback)
-            else:
-                hq_url = r['results'][0]['artworkUrl100'].replace("100x100bb.jpg", "1200x1200bb.jpg")
+        results = r.get('results', [])
+
+        for res in results:
+            retrieved_album = res.get('collectionName', '')
+            retrieved_artist = res.get('artistName', '')
+
+            # Require both the artist and album strings to be present in the result
+            if album.lower() in retrieved_album.lower() and artist.lower() in retrieved_artist.lower():
+                hq_url = res['artworkUrl100'].replace("100x100bb.jpg", "1200x1200bb.jpg")
                 valid, w, h = is_valid_image(hq_url)
-                if valid: return hq_url
-    except: pass
+                if valid:
+                    return hq_url
+            else:
+                if log_callback:
+                    logger.emit(f"[*] Skipping iTunes mismatch: {retrieved_artist} - {retrieved_album}", log_callback)
+
+    except Exception:
+        pass
     return None
 
 def get_cover_art(artist, album, target_dir, log_callback=None):
@@ -124,7 +139,7 @@ def get_cover_art(artist, album, target_dir, log_callback=None):
 
 def main():
     if len(sys.argv) < 4:
-        logger.emit('Usage: python getcoverart.py "Artist" "Album" "/Library/Root"')
+        logger.emit('Usage: python get_cover_art.py "Artist" "Album" "/Library/Root"')
         sys.exit(1)
 
     artist, album, library_root = sys.argv[1], sys.argv[2], sys.argv[3]

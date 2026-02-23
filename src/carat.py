@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Callable, Any
 import musicbrainzngs as mb
-import getcoverart, logger
+import get_cover_art, logger
 
 __all__ = ['rip_album_to_library']
 
@@ -462,7 +462,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         # 4. Final Assembly (Concurrent)
         # We run the Cover Art download in parallel with the heavy Transcode
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(getcoverart.get_cover_art, artist, album, target, log_callback)
+            cover_future = ex.submit(get_cover_art.get_cover_art, artist, album, target, log_callback)
 
             # Generate CUE Sheet
             generate_cue_sheet(target / f"{album} (Atmos).cue", f"{album} (Atmos).m4a", info, chaps, tracks or [])
