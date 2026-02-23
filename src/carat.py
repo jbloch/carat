@@ -1,14 +1,40 @@
+"""
+Carat - Concise Atmos Ripping Automation Tool.
+
+A GUI tool, command line tool, and library for ripping Dolby Atmos albums (digital and physical) into digital music
+libraries, providing gapless playback and track selection. This tool emphasizes ease of use over flexibility. With a
+single click, carat automatically gets metadata and cover art from trusted sources (MusicBrainz, CAA, and Apple), and
+supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
+"""
+
+# Copyright (c) 2026 Joshua Bloch
+# SPDX-License-Identifier: MIT
+
+__author__ = "Joshua Bloch"
+__copyright__ = "Copyright 2026, Joshua Bloch"
+__license__ = "MIT"
+__version__ = "1.0β"
+
+import argparse
 import atexit
+import concurrent.futures
+import json
 import os
+import platform
+import re
+import shutil
 import signal
-import sys, json, subprocess, shutil, tempfile, concurrent.futures, argparse, re, platform
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Callable, Any
-import musicbrainzngs as mb
-import get_cover_art, logger
+from typing import Any, Callable  # Note: Any and Callable still come from typing
 
-__all__ = ['rip_album_to_library']
+import musicbrainzngs as mb
+import get_cover_art
+
+import logger
 
 # --- (1) Metadata & Utils ---
 
@@ -17,7 +43,7 @@ def seconds_to_cue(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}:{int((seconds % 1) * 75):02d}"
 
 
-def generate_cue_sheet(cue_path: Path, m4a_name: str, info: Dict, chapters: List, mb_tracks: List) -> None:
+def generate_cue_sheet(cue_path: Path, m4a_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
     """Generates the CUE sheet for gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
         f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{m4a_name}" WAVE\n')
@@ -26,7 +52,7 @@ def generate_cue_sheet(cue_path: Path, m4a_name: str, info: Dict, chapters: List
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
 
 
-def _parse_makemkv_msg(line: str) -> Optional[str]:
+def _parse_makemkv_msg(line: str) -> str|None:
     """Extracts the human-readable text from MakeMKV MSG lines."""
     if not line.startswith("MSG:"):
         return None
@@ -43,7 +69,7 @@ def _parse_makemkv_msg(line: str) -> Optional[str]:
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
-def _process_output_line(line: str, output_acc: List[str], state: dict, log_callback: Optional[Callable]):
+def _process_output_line(line: str, output_acc: list[str], state: dict, log_callback: Callable|None):
     line = line.rstrip('\r\n')
     if not line: return
 
@@ -89,7 +115,7 @@ def _process_output_line(line: str, output_acc: List[str], state: dict, log_call
 
         state["last_was_progress"] = False
 
-def run_command(cmd: List[str], desc: Optional[str] = None, log_callback: Optional[Callable] = None) -> str:
+def run_command(cmd: list[str], desc: str|None = None, log_callback: Callable|None = None) -> str:
     """
     Executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
@@ -126,7 +152,7 @@ def run_command(cmd: List[str], desc: Optional[str] = None, log_callback: Option
 
 def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Callable[..., Any] | None):
     elapsed = time.time() - start_time
-    # 1. Search backwards through the accumulated log for FFmpeg's final stats
+    # 1. Search backwards through the accumulated log for ffmpeg's final stats
     final_stats = next((line for line in reversed(output_acc) if "size=" in line and "time=" in line), None)
 
     if final_stats:
@@ -139,7 +165,7 @@ def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Cal
 
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
-def find_primary_title(source_spec: str, log_callback: Optional[Callable] = None) -> str:
+def find_primary_title(source_spec: str, log_callback: Callable|None = None) -> str:
     """Identifies the Atmos title. Fails if no Atmos track is found."""
     res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
                       "Surgical Atmos Scan", log_callback)
@@ -186,7 +212,7 @@ def find_primary_title(source_spec: str, log_callback: Optional[Callable] = None
 # --- (4) Toolset & Main ---
 
 class Toolset:
-    def __init__(self, fatal_error_handler: Optional[Callable[[str], None]] = None) -> None:
+    def __init__(self, fatal_error_handler: Callable[[str], None]|None = None) -> None:
         self.IS_WIN = platform.system() == "Windows"
         self.FFMPEG = self._find("ffmpeg",
                                  [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
@@ -202,7 +228,7 @@ class Toolset:
         self._validate(fatal_error_handler)
 
     @staticmethod
-    def _find(name: str, prospects: Optional[List[str]] = None) -> Optional[str]:
+    def _find(name: str, prospects: list[str]|None = None) -> str|None:
         # noinspection PyDeprecation
         found = shutil.which(name)
         if found: return found
@@ -213,7 +239,7 @@ class Toolset:
 
         return None
 
-    def _validate(self, error_handler: Optional[Callable[[str], None]]) -> None:
+    def _validate(self, error_handler: Callable[[str], None]|None) -> None:
         # 1. Check for missing dependencies
         missing = [k for k, v in self.__dict__.items() if v is None and not isinstance(v, bool) and k != 'IS_WIN']
         if missing:
@@ -238,7 +264,8 @@ class Toolset:
         except Exception as e:
             self._trigger_fatal(f"Failed to validate MakeMKV: {e}", error_handler)
 
-    def _trigger_fatal(self, message: str, handler: Optional[Callable[[str], None]]) -> None:
+    @staticmethod
+    def _trigger_fatal(message: str, handler: Callable[[str], None]|None) -> None:
         """Invokes the injected handler, or falls back to a CLI exit."""
         if handler:
             handler(message)
@@ -248,10 +275,10 @@ class Toolset:
 
 
 # Global singleton placeholder
-TOOLS: Optional[Toolset] = None
+TOOLS: Toolset|None = None
 
 
-def init_toolset(error_handler: Optional[Callable[[str], None]] = None) -> None:
+def init_toolset(error_handler: Callable[[str], None]|None = None) -> None:
     """Instantiates the toolset. Must be called by the frontend before ripping."""
     global TOOLS
     TOOLS = Toolset(error_handler)
@@ -260,7 +287,7 @@ mb.set_useragent("AtmosRipAutomationTool", "1.0β", "josh@bloch.us")
 
 
 def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "all",
-                            log_callback: Optional[Callable] = None) -> Path:
+                            log_callback: Callable|None = None) -> Path:
     # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
     clean_mkv_path = str(mkv_path.resolve())
     cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_mkv_path, "--minlength=600"]
@@ -275,7 +302,7 @@ def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "
     return winner
 
 
-def find_truehd_stream(mkv_path: Path, log_callback: Optional[Callable] = None) -> Optional[int]:
+def find_truehd_stream(mkv_path: Path, log_callback: Callable|None = None) -> int|None:
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for TrueHD Stream", log_callback)
@@ -288,7 +315,7 @@ def find_truehd_stream(mkv_path: Path, log_callback: Optional[Callable] = None) 
 
 
 def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str,
-                         log_callback: Optional[Callable] = None) -> None:
+                         log_callback: Callable|None = None) -> None:
     idx = find_truehd_stream(mkv_path, log_callback)
     if idx is None: raise ValueError("No TrueHD stream found.")
 
@@ -302,7 +329,7 @@ def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str,
     run_command(cmd, "Finalizing Atmos M4A", log_callback)
 
 
-def extract_chapters_from_mkv(mkv_path: Path, log_callback: Optional[Callable] = None) -> List[Dict]:
+def extract_chapters_from_mkv(mkv_path: Path, log_callback: Callable|None = None) -> list[dict]:
     cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", str(mkv_path)]
     res = run_command(cmd, "Extracting Chapter Markers", log_callback)
     try:
@@ -313,8 +340,7 @@ def extract_chapters_from_mkv(mkv_path: Path, log_callback: Optional[Callable] =
 # Maximum number of release groups to search in MusicBrainz when look for the album
 MAX_RELEASE_GROUPS: int = 5
 
-def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int, log_callback: Optional[Callable] = None) -> Tuple[
-    Optional[Dict], Optional[List]]:
+def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int) -> tuple[dict|None, list|None]:
     try:
         rg_res = mb.search_release_groups(artist=artist, release=album)
         for rg in rg_res.get('release-group-list', [])[:MAX_RELEASE_GROUPS]:
@@ -331,7 +357,7 @@ def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int, log_
     return None, None
 
 
-def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callback: Optional[Callable] = None) -> Path:
+def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callback: Callable|None = None) -> Path:
     """
     Merges a directory of sequential audio files (MKV, MKA, M4A, or MP4) into a single master MKV.
     This allows Immersive Audio Album (IAA) track-by-track downloads to be processed as a single album.
@@ -354,10 +380,10 @@ def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callbac
 
 # We do all of our work in a temp directory, which will contain a huge MKV. The following code ensures that the
 # contents of this directory get deleted, come hell or highwater (though they might survive a BSOD or power outage).
-# Similarly, the heavy lifiting is done by a background process, and we must track that process so we can kill it
+# Similarly, the heavy lifting is done by a background process, and we must track that process so we can kill it
 # if the tool dies or is terminated, e.g., by clicking the close button, while a rip is in progress.
 TMP_DIR = Path(tempfile.mkdtemp(prefix="carat_"))
-_active_subprocess: Optional[subprocess.Popen[str]] = None  # Tracks the currently running tool
+_active_subprocess: subprocess.Popen[str]|None = None  # Tracks the currently running tool
 
 def _nuke_tmp_dir():
     """ Terminates active subprocesses and deletes the tmp directory. """
@@ -378,6 +404,7 @@ def _nuke_tmp_dir():
 atexit.register(_nuke_tmp_dir)
 
 # Catch OS-level interruptions (Ctrl+C, normal termination signals)
+# noinspection PyUnusedLocal
 def _signal_handler(signum, frame):
     _nuke_tmp_dir()
     os._exit(1)
@@ -389,7 +416,7 @@ for sig in (signal.SIGINT, signal.SIGTERM):
         pass
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str,
-                         log_callback: Optional[Callable] = None) -> None:
+                         log_callback: Callable|None = None) -> None:
     """
     Orchestrates the rip/transcode pipeline for a single release.
 
@@ -456,7 +483,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         chaps = extract_chapters_from_mkv(atmos_mkv, log_callback)
 
         # Fetch metadata (Track titles, Year) from MusicBrainz
-        info, tracks = get_metadata_from_musicbrainz(album, artist, len(chaps), log_callback)
+        info, tracks = get_metadata_from_musicbrainz(album, artist, len(chaps))
         info = info or {'artist': artist, 'title': album, 'year': 'Unknown'}
 
         # 4. Final Assembly (Concurrent)
