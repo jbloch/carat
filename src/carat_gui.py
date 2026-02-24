@@ -32,7 +32,7 @@ import logger
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
 class CaratGUI:
-    """ The Tkinter GUI for Carat """
+    """ Tkinter GUI for Carat """
 
     def _log_callback(self, msg: str, is_progress: bool = False) -> None:
         """Thread-safe logging back to the UI."""
@@ -42,7 +42,7 @@ class CaratGUI:
                 try:
                     val = float(msg.split(":")[1].strip().replace("%", ""))
                     self.progress_queue.put(val)
-                except:
+                except (ValueError, IndexError, queue.Full):
                     pass
         else:
             self.log_queue.put(msg)
@@ -55,7 +55,7 @@ class CaratGUI:
         try:
             img_icon = tk.PhotoImage(file='assets/carat_logo.png')
             self.parent.iconphoto(False, img_icon)
-        except Exception:
+        except tk.TclError:
             pass  # Failsafe: falls back to the default feather if the image is missing
 
         # Load config first so we can use it in UI init
@@ -81,7 +81,7 @@ class CaratGUI:
         if CONFIG_FILE.exists():
             try:
                 return json.loads(CONFIG_FILE.read_text())
-            except:
+            except (FileNotFoundError, json.JSONDecodeError):
                 pass
         return {}
 
@@ -93,7 +93,7 @@ class CaratGUI:
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg))
-        except:
+        except (OSError, TypeError):
             pass
 
     # noinspection PyUnusedLocal
@@ -249,7 +249,7 @@ class CaratGUI:
         """The worker thread function."""
         try:
             # Assuming carat.process_release was updated to drop the suffix argument
-            carat.rip_album_to_library(source, artist, album, music_lib_root, self._log_callback)
+            carat.rip_album_to_library(source, artist, album, music_lib_root)
             self.log_queue.put("[+] Process Complete.")
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
@@ -283,7 +283,7 @@ class CaratGUI:
             img = ImageTk.PhotoImage(pil_img)
             self.lbl_art.config(image=img, text="")
             self.lbl_art.image = img
-        except Exception:
+        except (OSError, tk.TclError):
             self.lbl_art.config(text="[Image Error]", image="")
 
     # noinspection PyUnusedLocal

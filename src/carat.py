@@ -29,7 +29,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NoReturn
 
 import musicbrainzngs as mb
 
@@ -73,7 +73,7 @@ def _parse_makemkv_msg(line: str) -> str | None:
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
-def _process_output_line(line: str, output_acc: list[str], state: dict, log_callback: Callable | None):
+def _process_output_line(line: str, output_acc: list[str], state: dict):
     line = line.rstrip('\r\n')
     if not line: return
 
@@ -119,7 +119,7 @@ def _process_output_line(line: str, output_acc: list[str], state: dict, log_call
         state["last_was_progress"] = False
 
 
-def run_command(cmd: list[str], desc: str | None = None, log_callback: Callable | None = None) -> str:
+def run_command(cmd: list[str], desc: str | None = None) -> str:
     """
     Executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
@@ -142,7 +142,7 @@ def run_command(cmd: list[str], desc: str | None = None, log_callback: Callable 
             "is_extracting": False
         }
         for line in process.stdout:
-            _process_output_line(line, output_acc, parser_state, log_callback)
+            _process_output_line(line, output_acc, parser_state)
 
         process.wait()
     finally:
@@ -150,11 +150,11 @@ def run_command(cmd: list[str], desc: str | None = None, log_callback: Callable 
 
     if process.returncode != 0:
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
-    emit_summary_log(output_acc, start_time, log_callback)
+    emit_summary_log(output_acc, start_time)
     return "\n".join(output_acc)
 
 
-def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Callable[..., Any] | None):
+def emit_summary_log(output_acc: list[Any], start_time: float):
     elapsed = time.time() - start_time
     # 1. Search backwards through the accumulated log for ffmpeg's final stats
     final_stats = next((line for line in reversed(output_acc) if "size=" in line and "time=" in line), None)
@@ -170,10 +170,10 @@ def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Cal
 
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
-def find_primary_title(source_spec: str, log_callback: Callable | None = None) -> str:
+def find_primary_title(source_spec: str) -> str:
     """Identifies the Atmos title. Fails if no Atmos track is found."""
     res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
-                      "Surgical Atmos Scan", log_callback)
+                      "Surgical Atmos Scan")
 
     title_scores = {}
     title_chapters = {}
@@ -292,12 +292,11 @@ def init_toolset(error_handler: Callable[[str], None] | None = None) -> None:
 mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
 
 
-def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "all",
-                            log_callback: Callable | None = None) -> Path:
+def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "all") -> Path:
     # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
     clean_mkv_path = str(mkv_path.resolve())
     cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_mkv_path, "--minlength=600"]
-    run_command(cmd, f"Ripping Title {title_idx}", log_callback)
+    run_command(cmd, f"Ripping Title {title_idx}")
 
     mkv_files = list(mkv_path.glob("*.mkv"))
     if not mkv_files: raise RuntimeError("MakeMKV produced no output.")
@@ -308,10 +307,10 @@ def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "
     return winner
 
 
-def find_truehd_stream(mkv_path: Path, log_callback: Callable | None = None) -> int | None:
+def find_truehd_stream(mkv_path: Path) -> int | None:
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
-    res = run_command(cmd, "Scanning for TrueHD Stream", log_callback)
+    res = run_command(cmd, "Scanning for TrueHD Stream")
     try:
         streams = json.loads(res).get('streams', [])
         candidates = [s for s in streams if s.get('codec_name') == 'truehd']
@@ -320,9 +319,8 @@ def find_truehd_stream(mkv_path: Path, log_callback: Callable | None = None) -> 
         return None
 
 
-def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str,
-                         log_callback: Callable | None = None) -> None:
-    idx = find_truehd_stream(mkv_path, log_callback)
+def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str) -> None:
+    idx = find_truehd_stream(mkv_path)
     if idx is None: raise ValueError("No TrueHD stream found.")
 
     cmd = [
@@ -332,12 +330,12 @@ def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str,
         "-f", "mp4", "-movflags", "+faststart", "-strict", "-2",
         "-fflags", "+genpts", "-map_chapters", "-1", "-y", str(m4a_path)
     ]
-    run_command(cmd, "Finalizing Atmos M4A", log_callback)
+    run_command(cmd, "Finalizing Atmos M4A")
 
 
-def extract_chapters_from_mkv(mkv_path: Path, log_callback: Callable | None = None) -> list[dict]:
+def extract_chapters_from_mkv(mkv_path: Path) -> list[dict]:
     cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", str(mkv_path)]
-    res = run_command(cmd, "Extracting Chapter Markers", log_callback)
+    res = run_command(cmd, "Extracting Chapter Markers")
     try:
         return json.loads(res).get('chapters', [])
     except json.JSONDecodeError:
@@ -360,12 +358,12 @@ def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int) -> t
                     if len(all_tracks) == num_tracks:
                         return {'title': rg['title'], 'artist': rg.get('artist-credit-phrase', artist),
                                 'year': r.get('date', 'Unknown')[:4]}, all_tracks
-    except Exception:
+    except (mb.MusicBrainzError, KeyError, TypeError):
         pass
     return None, None
 
 
-def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callback: Callable | None = None) -> Path:
+def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path) -> Path:
     """
     Merges a directory of sequential audio files (MKV, MKA, M4A, or MP4) into a single master MKV.
     This allows Immersive Audio Album (IAA) track-by-track downloads to be processed as a single album.
@@ -383,7 +381,7 @@ def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path, log_callbac
         cmd.append(str(f) if i == 0 else f"+{str(f)}")
 
     # Simple blind append logic for IAA
-    run_command(cmd, "Merging IAA Folder", log_callback)
+    run_command(cmd, "Merging IAA Folder")
     return out
 
 
@@ -402,12 +400,12 @@ def _nuke_dir(path: Path) -> None:
             shutil.rmtree(path, ignore_errors=True)
             if not path.exists():
                 return
-        except Exception:
+        except OSError:
             pass
         time.sleep(0.2)  # Give the OS a moment to release file handles
 
 
-def _clean_up():
+def _clean_up()->None:
     """ Terminates active subprocesses and deletes the tmp directory (idempotent). """
     global _active_subprocess
 
@@ -416,7 +414,7 @@ def _clean_up():
         try:
             _active_subprocess.kill()
             _active_subprocess.wait(timeout=2)  # Give Windows a second to release the file lock
-        except Exception:
+        except OSError:
             pass
 
     # 2. Nuke the directory now that the locks are gone
@@ -429,7 +427,7 @@ atexit.register(_clean_up) # Ensure _clean_up gets called for all but the most a
 
 # Catch OS-level interruptions (Ctrl+C, normal termination signals)
 # noinspection PyUnusedLocal
-def _signal_handler(signum, frame):
+def _signal_handler(signum: object, frame: object) -> NoReturn:
     _clean_up()
     os._exit(1)
 
@@ -454,11 +452,10 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             age = now - carat_tmp_dir.stat().st_mtime
             if age > seconds_limit:
                 _nuke_dir(carat_tmp_dir)
-        except Exception:
+        except (FileNotFoundError, PermissionError):
             pass # Silent failure for cleanup to prevent app startup crashes
 
-def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str,
-                         log_callback: Callable | None = None) -> None:
+def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str) -> None:
     """
     Orchestrates the rip/transcode pipeline for a single release.
 
@@ -492,8 +489,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
             # Execute "Atmos or Die" Scan & Rip
             source_spec = f"disc:{drive_idx}"
-            title_idx = find_primary_title(source_spec, log_callback)
-            atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
+            title_idx = find_primary_title(source_spec)
+            atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
 
         except (ValueError, TypeError):
             # Input is not an integer; handle as Path
@@ -502,18 +499,18 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # --- CASE B: ISO Image ---
             if src_p.suffix.lower() == ".iso":
                 source_spec = f"iso:{src_p.resolve()}"
-                title_idx = find_primary_title(source_spec, log_callback)
-                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
+                title_idx = find_primary_title(source_spec)
+                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
 
             # --- CASE C: Mounted Blu-ray or other BDMV Folder Structure ---
             elif src_p.is_dir() and (src_p / "BDMV").exists():
                 source_spec = f"file:{src_p.resolve() / 'BDMV'}"
-                title_idx = find_primary_title(source_spec, log_callback)
-                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx, log_callback)
+                title_idx = find_primary_title(source_spec)
+                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
 
             # --- CASE D: Folder of MKVs, such as IAA distribution  (Merge MKVs or MP4s rather than ripping) ---
             elif src_p.is_dir():
-                atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR, log_callback)
+                atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR)
 
             # --- CASE E: Direct MKV File, such as Headphone Dust distribution (Bypass Rip; input is master MKV) ---
             else:
@@ -522,7 +519,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
         # 3. Post-Rip Processing
         # Extract chapter markers from the master MKV (essential for CUE sheet)
-        chaps = extract_chapters_from_mkv(atmos_mkv, log_callback)
+        chaps = extract_chapters_from_mkv(atmos_mkv)
 
         # Fetch metadata (Track titles, Year) from MusicBrainz
         info, tracks = get_metadata_from_musicbrainz(album, artist, len(chaps))
@@ -531,18 +528,18 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         # 4. Final Assembly (Concurrent)
         # We run the Cover Art download in parallel with the heavy Transcode
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(get_cover_art.get_cover_art, artist, album, target, log_callback)
+            cover_future = ex.submit(get_cover_art.get_cover_art, artist, album, target)
 
             # Generate CUE Sheet
             generate_cue_sheet(target / f"{album} (Atmos).cue", f"{album} (Atmos).m4a", info, chaps, tracks or [])
 
             # Transcode Master MKV, whose chapters are the TrueHD/Atmos songs to a chapterless M4A Container
-            transcode_mkv_to_m4a(atmos_mkv, target / f"{album} (Atmos).m4a", album, log_callback)
+            transcode_mkv_to_m4a(atmos_mkv, target / f"{album} (Atmos).m4a", album)
 
             # Ensure Cover Art finished (soft timeout)
             try:
                 cover_future.result(timeout=45)
-            except Exception:
+            except TimeoutError:
                 pass
     finally:
         _clean_up()
@@ -566,12 +563,7 @@ def main():
     # Initialize for CLI (no UI handler)
     init_toolset()
 
-    rip_album_to_library(
-        _clean_path_arg(args.source),
-        args.artist,
-        args.album,
-        _clean_path_arg(args.library_root)
-    )
+    rip_album_to_library(_clean_path_arg(args.source), args.artist, args.album, _clean_path_arg(args.library_root))
 
 
 if __name__ == "__main__":
