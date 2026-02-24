@@ -93,7 +93,7 @@ def _process_output_line(line: str, output_acc: list[str], state: dict, log_call
                 if max_val > 0 and state.get("is_extracting"):
                     pct = (current / max_val) * 100
                     if 0 <= pct <= 100:
-                        logger.emit(f"    Atmos Extraction: {pct:.1f}%", log_callback, is_progress=True)
+                        logger.emit(f"    Atmos Extraction: {pct:.1f}%", is_progress=True)
             except (IndexError, ValueError):
                 pass
 
@@ -103,7 +103,7 @@ def _process_output_line(line: str, output_acc: list[str], state: dict, log_call
     # [2] ffmpeg Progress
     elif "size=" in line and "time=" in line and "bitrate=" in line:
         clean_stats = line.strip().replace("frame=", " ")
-        logger.emit(f"Transcoding: {clean_stats}", log_callback, is_progress=True)
+        logger.emit(f"Transcoding: {clean_stats}", is_progress=True)
 
         state["last_was_progress"] = True
         return
@@ -112,9 +112,9 @@ def _process_output_line(line: str, output_acc: list[str], state: dict, log_call
     else:
         msg = _parse_makemkv_msg(line)
         if msg:
-            logger.emit(f"[*] {msg}", log_callback)
+            logger.emit(f"[*] {msg}")
         elif not line.startswith(("DRV:", "TDRV:", "CIDC:", "SINFO:", "TINFO:", "CINFO:")):
-            logger.emit(line, log_callback)
+            logger.emit(line)
 
         state["last_was_progress"] = False
 
@@ -127,8 +127,8 @@ def run_command(cmd: list[str], desc: str | None = None, log_callback: Callable 
     """
     global _active_subprocess
 
-    if desc: logger.emit(f"[*] {desc}...", log_callback)
-    logger.emit(f"[*] Command: {cmd}", log_callback)
+    if desc: logger.emit(f"[*] {desc}...")
+    logger.emit(f"[*] Command: {cmd}")
 
     # text=True handles decoding; bufsize=1 ensures line-buffered output
     start_time = time.time()
@@ -165,7 +165,7 @@ def emit_summary_log(output_acc: list[Any], start_time: float, log_callback: Cal
     else:
         summary = f"[+] Task finished in {elapsed:.1f} seconds."
 
-    logger.emit(summary, log_callback)
+    logger.emit(summary)
 
 
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
@@ -194,10 +194,10 @@ def find_primary_title(source_spec: str, log_callback: Callable | None = None) -
         if line.startswith("SINFO:"):
             if "A_TRUEHD" in line or "TrueHD Atmos" in line:
                 title_scores[t_idx] = max(title_scores.get(t_idx, 0), 1000)
-                logger.emit(f"    [*] Title {t_idx}: Found Lossless Atmos (+1000)", log_callback)
+                logger.emit(f"    [*] Title {t_idx}: Found Lossless Atmos (+1000)")
             elif "A_EAC3" in line and "Atmos" in line:
                 title_scores[t_idx] = max(title_scores.get(t_idx, 0), 500)
-                logger.emit(f"    [*] Title {t_idx}: Found Lossy Atmos (+500)", log_callback)
+                logger.emit(f"    [*] Title {t_idx}: Found Lossy Atmos (+500)")
 
     if not title_scores:
         raise RuntimeError("No valid titles found on source.")
@@ -205,12 +205,12 @@ def find_primary_title(source_spec: str, log_callback: Callable | None = None) -
     winner = max(title_scores, key=lambda k: (title_scores[k], title_chapters.get(k, 0)))
     winning_score = title_scores[winner]
 
-    logger.emit(f"[*] Scan Results: {json.dumps(title_scores)}", log_callback)
+    logger.emit(f"[*] Scan Results: {json.dumps(title_scores)}")
 
     if winning_score < 500:
         raise RuntimeError(f"Atmos or Die: Best title ({winner}) has score {winning_score}. No Atmos track found.")
 
-    logger.emit(f"[*] Winner: Title {winner} (Score: {winning_score})", log_callback)
+    logger.emit(f"[*] Winner: Title {winner} (Score: {winning_score})")
     return winner
 
 
@@ -547,7 +547,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     finally:
         _clean_up()
 
-    logger.emit(f"\n[+] Library Entry Complete: {album}", log_callback)
+    logger.emit(f"\n[+] Library Entry Complete: {album}")
 
 
 def _clean_path_arg(arg: str) -> str:

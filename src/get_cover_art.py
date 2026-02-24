@@ -59,7 +59,7 @@ def is_valid_image(url):
     return False, 0, 0
 
 def get_mb_digital_art(artist, album, log_callback):
-    logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...", log_callback, log_callback)
+    logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...", log_callback)
     image_url = None
     try:
         release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
@@ -78,9 +78,8 @@ def get_mb_digital_art(artist, album, log_callback):
     return image_url
 
 def get_mb_art_from_releases(releases, log_callback):
-    # Sort by date desc (ensure date is treated as a string)
+    # Sort releases by date desc (ensure date is treated as a string)
     releases.sort(key=lambda x: str(x.get('date', '0000')), reverse=True)
-    
     for r in releases:
         mb_id = r['id']
         # IMPORTANT: Perform a direct lookup for the release to get fresh CAA status
@@ -90,16 +89,16 @@ def get_mb_art_from_releases(releases, log_callback):
             status = full_release['release'].get('cover-art-archive', {})
             
             if status.get('artwork') == 'true':
-                logger.emit(f"  [+] Found CAA art for: {mb_id}", log_callback)
+                logger.emit(f"  [+] Found CAA art for: {mb_id}")
                 caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}").json()
                 for img_entry in caa_data['images']:
                     if img_entry['front']:
                         url = img_entry['thumbnails'].get('1200') or img_entry['image']
                         valid, w, h = is_valid_image(url)
                         if valid: return url
-                        else: logger.emit(f"Invalid CAA art: '{img_entry}'", log_callback);
+                        else: logger.emit(f"Invalid CAA art: '{img_entry}'")
         except Exception as e:
-            logger.emit(f"  [!] Error checking release {mb_id}: {e}", log_callback)
+            logger.emit(f"  [!] Error checking release {mb_id}: {e}")
             continue
     return None
 
@@ -123,7 +122,7 @@ def get_itunes_art(artist, album, log_callback):
                     return hq_url
             else:
                 if log_callback:
-                    logger.emit(f"[*] Skipping iTunes mismatch: {retrieved_artist} - {retrieved_album}", log_callback)
+                    logger.emit(f"[*] Skipping iTunes mismatch: {retrieved_artist} - {retrieved_album}")
 
     except Exception:
         pass
@@ -137,14 +136,14 @@ def get_cover_art(artist, album, target_dir, log_callback=None):
     image_url = get_itunes_art(artist, album, log_callback) or get_mb_digital_art(artist, album, log_callback)
 
     if image_url:
-        logger.emit(f"[*] Downloading: {image_url}", log_callback)
+        logger.emit(f"[*] Downloading: {image_url}")
         img_data = requests.get(image_url).content
         img = Image.open(BytesIO(img_data))
         
         # Save as high-quality JPEG for Kodi
         save_path = target_dir / "cover.jpg"
         img.save(save_path, "JPEG", quality=95)
-        logger.emit(f"[+] Success: Saved {img.width}x{img.height} cover to {save_path}", log_callback, log_callback)
+        logger.emit(f"[+] Success: Saved {img.width}x{img.height} cover to {save_path}", log_callback)
     else:
         logger.emit("[!] No suitable art found.")
 

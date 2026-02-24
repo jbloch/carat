@@ -27,11 +27,25 @@ from typing import Any
 from PIL import Image, ImageTk
 
 import carat
+import logger
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
 class CaratGUI:
     """ The Tkinter GUI for Carat """
+
+    def _log_callback(self, msg: str, is_progress: bool = False) -> None:
+        """Thread-safe logging back to the UI."""
+        if is_progress:
+            self.status_queue.put(msg)
+            if "%" in msg:
+                try:
+                    val = float(msg.split(":")[1].strip().replace("%", ""))
+                    self.progress_queue.put(val)
+                except:
+                    pass
+        else:
+            self.log_queue.put(msg)
 
     def __init__(self, parent: tk.Tk) -> None:
         self.parent = parent
@@ -55,6 +69,8 @@ class CaratGUI:
 
         self.current_cover_path = None
         self.is_ripping = False
+
+        logger.init(self._log_callback)
 
         self._init_ui()
         self._start_queue_poller()
@@ -203,19 +219,6 @@ class CaratGUI:
         path = filedialog.askdirectory(title="Select Library Root")
         if path: self.dest_var.set(path)
 
-    def _log_callback(self, msg: str, is_progress: bool = False) -> None:
-        """Thread-safe logging back to the UI."""
-        if is_progress:
-            self.status_queue.put(msg)
-            if "%" in msg:
-                try:
-                    val = float(msg.split(":")[1].strip().replace("%", ""))
-                    self.progress_queue.put(val)
-                except:
-                    pass
-        else:
-            self.log_queue.put(msg)
-
     def _start_rip_thread(self) -> None:
         """Collects inputs and launches the background workers."""
 
@@ -283,6 +286,7 @@ class CaratGUI:
         except Exception:
             self.lbl_art.config(text="[Image Error]", image="")
 
+    # noinspection PyUnusedLocal
     def _change_cover_art(self, event: object) -> None:
         """Allows user to click and replace the cover art manually."""
         if not self.current_cover_path: return
