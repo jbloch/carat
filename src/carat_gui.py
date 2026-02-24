@@ -1,28 +1,46 @@
+"""
+Simple GUI for carat (Concise Atmos Ripping Automation Tool).
+
+Provides one-click ripping and transcoding of Dolby Atmos albums in common formats for gapless playback with track
+selection. (See carat.py for details.)
+"""
+
+# Copyright (c) 2026 Joshua Bloch
+# SPDX-License-Identifier: MIT
+
+__author__ = "Joshua Bloch"
+__copyright__ = "Copyright 2026, Joshua Bloch"
+__license__ = "MIT"
+__version__ = "1.0B"
+
 import itertools
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
-import queue
 import json
+import queue
 import shutil
+import threading
 import time
+import tkinter as tk
 from pathlib import Path
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+from typing import Any
+
 from PIL import Image, ImageTk
 
-import carat  # The backend logic
+import carat
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
-
 class CaratGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Carat: Concise Atmos Ripping Automation Tool")
-        self.root.geometry("850x850") # Square, like an album cover ;)
+    """ The Tkinter GUI for Carat """
+
+    def __init__(self, parent: tk.Tk) -> None:
+        self.parent = parent
+        self.parent.title("Carat: Concise Atmos Ripping Automation Tool")
+        self.parent.geometry("850x850") # Square, like an album cover ;)
 
         try:
             img_icon = tk.PhotoImage(file='assets/carat_logo.png')
-            self.root.iconphoto(False, img_icon)
+            self.parent.iconphoto(False, img_icon)
         except Exception:
             pass  # Failsafe: falls back to the default feather if the image is missing
 
@@ -42,7 +60,7 @@ class CaratGUI:
         self._start_queue_poller()
 
     @staticmethod
-    def _load_config():
+    def _load_config() -> dict[Any, Any] | None:
         """Loads user preferences from the home directory."""
         if CONFIG_FILE.exists():
             try:
@@ -51,7 +69,7 @@ class CaratGUI:
                 pass
         return {}
 
-    def _save_config(self):
+    def _save_config(self) -> None:
         """Saves current paths to the config file."""
         cfg = {
             "last_source": self.src_var.get(),
@@ -62,7 +80,8 @@ class CaratGUI:
         except:
             pass
 
-    def _evaluate_button_state(self, *args):
+    # noinspection PyUnusedLocal
+    def _evaluate_button_state(self, *args: object) -> None:
         """Instantly updates the RIP button based on current inputs and state."""
         # State 3 Guard: If we are actively ripping, ignore typing
         if self.is_ripping:
@@ -77,7 +96,7 @@ class CaratGUI:
             # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
             self.btn_rip.config(state="normal", text="RIP ATMOS")
 
-    def _init_ui(self):
+    def _init_ui(self) -> None:
         """Constructs the visual interface."""
         style = ttk.Style()
         style.theme_use('clam')
@@ -87,7 +106,7 @@ class CaratGUI:
 
         # 1. Destination (Library Root)
         section = itertools.count(1)
-        frame_dest = ttk.LabelFrame(self.root, text=f"{next(section)}. Library Root", padding=10)
+        frame_dest = ttk.LabelFrame(self.parent, text=f"{next(section)}. Library Root", padding=10)
         frame_dest.pack(fill="x", padx=10, pady=5)
 
         default_root = str(Path.cwd() / "output_library")
@@ -96,7 +115,7 @@ class CaratGUI:
         ttk.Button(frame_dest, text="Browse...", command=self._browse_dest).pack(side="right")
 
         # 2. Source Selection
-        frame_src = ttk.LabelFrame(self.root, text=f"{next(section)}. Source (Disc, ISO, or Folder)", padding=10)
+        frame_src = ttk.LabelFrame(self.parent, text=f"{next(section)}. Source (Disc, ISO, or Folder)", padding=10)
         frame_src.pack(fill="x", padx=10, pady=5)
 
         self.src_var = tk.StringVar(value=self.config.get("last_source", ""))
@@ -105,7 +124,7 @@ class CaratGUI:
         ttk.Button(frame_src, text="File...", command=self._browse_source_file).pack(side="right")
 
         # 3. Metadata & Art Container
-        frame_meta_cont = ttk.Frame(self.root)
+        frame_meta_cont = ttk.Frame(self.parent)
         frame_meta_cont.pack(fill="x", padx=10, pady=5)
 
         # Metadata Sub-Frame
@@ -128,7 +147,6 @@ class CaratGUI:
         frame_art = ttk.LabelFrame(frame_meta_cont, text="Cover Art", padding=10)
         frame_art.pack(side="right", fill="y", padx=(5, 0))
 
-        # The Anti-Jump Container: Forces exactly 200x200 pixels
         art_container = ttk.Frame(frame_art, width=200, height=200)
         art_container.pack()
         art_container.pack_propagate(False)  # Prevents container from shrinking to fit the text
@@ -139,7 +157,7 @@ class CaratGUI:
         self.lbl_art.bind("<Button-1>", self._change_cover_art)
 
         # 4. Action Buttons
-        frame_actions = ttk.Frame(self.root)
+        frame_actions = ttk.Frame(self.parent)
         frame_actions.pack(fill="x", padx=15, pady=10)
 
         self.btn_rip = ttk.Button(frame_actions, text="RIP ATMOS", command=self._start_rip_thread)
@@ -149,16 +167,16 @@ class CaratGUI:
         self.btn_clear.pack(side="right")
 
         # Progress & Status
-        frame_prog = ttk.Frame(self.root, padding=(10, 0, 10, 0))
+        frame_prog = ttk.Frame(self.parent, padding=(10, 0, 10, 0))
         frame_prog.pack(fill="x", padx=10)
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(frame_prog, variable=self.progress_var, maximum=100)
+        self.progress_bar = ttk.Progressbar(frame_prog, variable=self.progress_var)
         self.progress_bar.pack(fill="x")
         self.lbl_status = ttk.Label(frame_prog, text="Ready", font=('Segoe UI', 9, 'italic'), foreground="gray")
         self.lbl_status.pack(anchor="w", pady=(2, 0))
 
         # Console Output
-        frame_log = ttk.LabelFrame(self.root, text="Console Output", padding=10)
+        frame_log = ttk.LabelFrame(self.parent, text="Console Output", padding=10)
         frame_log.pack(fill="both", expand=True, padx=10, pady=10)
         self.txt_log = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9))
         self.txt_log.pack(fill="both", expand=True)
@@ -172,20 +190,20 @@ class CaratGUI:
         # Force an initial evaluation on startup
         self._evaluate_button_state()
 
-    def _browse_source_file(self):
+    def _browse_source_file(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Media File", "*.iso *.mkv *.mp4")])
         if path: self.src_var.set(path)
 
-    def _browse_source_folder(self):
+    def _browse_source_folder(self) -> None:
         path = filedialog.askdirectory(title="Folder of media files or Blu-ray Drive")
         if path: self.src_var.set(path)
 
-    def _browse_dest(self):
+    def _browse_dest(self) -> None:
         """Prompts the user for the library root."""
         path = filedialog.askdirectory(title="Select Library Root")
         if path: self.dest_var.set(path)
 
-    def _log_callback(self, msg, is_progress=False):
+    def _log_callback(self, msg: str, is_progress: bool = False) -> None:
         """Thread-safe logging back to the UI."""
         if is_progress:
             self.status_queue.put(msg)
@@ -198,42 +216,43 @@ class CaratGUI:
         else:
             self.log_queue.put(msg)
 
-    def _start_rip_thread(self):
-        """Collects inputs and launches the background worker."""
-        self._save_config()
+    def _start_rip_thread(self) -> None:
+        """Collects inputs and launches the background workers."""
 
+        #Change state to State #3 - Rip in progress
+        self._save_config()
         self.is_ripping = True
         self.btn_rip.config(state="disabled", text="RIPPING IN PROGRESS...") # State #3 Rip in progress
 
+        # Collect arguments for the rip
         source = self.src_var.get().strip()
         artist = self.artist_var.get().strip()
         album = self.album_var.get().strip()
-        root = self.dest_var.get().strip()
+        music_lib_root = self.dest_var.get().strip()
 
-        self._save_config()
-        self.btn_rip.config(state="disabled")
         self.progress_bar.config(mode='indeterminate')
         self.progress_bar.start(10)
 
-        # Hardcode the expected Atmos suffix for cover art polling
-        expected_cover = Path(root) / artist / f"{album} (Atmos)" / "cover.jpg"
-
-        thread = threading.Thread(target=self._run_logic, args=(source, artist, album, root))
+        # Start a worker thread to get the cover art
+        cover_path = Path(music_lib_root) / artist / f"{album} (Atmos)" / "cover.jpg"
+        cover_path.unlink(missing_ok=True)  # Remove any file that's already there, so as not to confuse the thread
+        thread = threading.Thread(target=self._run_logic, args=(source, artist, album, music_lib_root))
         thread.daemon = True
         thread.start()
 
-        threading.Thread(target=self._poll_for_cover, args=(expected_cover,), daemon=True).start()
+        threading.Thread(target=self._poll_for_cover, args=(cover_path,), daemon=True).start()
 
-    def _run_logic(self, source, artist, album, root):
+    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str) -> None:
         """The worker thread function."""
         try:
             # Assuming carat.process_release was updated to drop the suffix argument
-            carat.rip_album_to_library(source, artist, album, root, self._log_callback)
+            carat.rip_album_to_library(source, artist, album, music_lib_root, self._log_callback)
             self.log_queue.put("[+] Process Complete.")
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
         finally:
-            self.root.after(0, self._finalize_ui)
+            # noinspection PyTypeChecker
+            self.parent.after(0, self._finalize_ui)
 
     def _finalize_ui(self):
         self.progress_bar.stop()
@@ -244,7 +263,7 @@ class CaratGUI:
         self.is_ripping = False
         self.btn_rip.config(state="disabled", text="RIP COMPLETE")  # State 4: Complete
 
-    def _poll_for_cover(self, path):
+    def _poll_for_cover(self, path: Path) -> None:
         """Watches for the cover art file to appear."""
         for _ in range(10000):
             if path.exists() and path.stat().st_size > 0:
@@ -252,7 +271,7 @@ class CaratGUI:
                 return
             time.sleep(1)
 
-    def _display_cover(self, path):
+    def _display_cover(self, path: Path) -> None:
         """Updates the cover art label using Pillow."""
         self.current_cover_path = path
         try:
@@ -264,7 +283,7 @@ class CaratGUI:
         except Exception:
             self.lbl_art.config(text="[Image Error]", image="")
 
-    def _change_cover_art(self, event):
+    def _change_cover_art(self, event: object) -> None:
         """Allows user to click and replace the cover art manually."""
         if not self.current_cover_path: return
         new_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png")])
@@ -275,7 +294,7 @@ class CaratGUI:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to update cover: {e}")
 
-    def _start_queue_poller(self):
+    def _start_queue_poller(self) -> None:
         """Consumes queue events and updates the UI (must run on main thread)."""
         while not self.log_queue.empty():
             msg = self.log_queue.get_nowait()
@@ -301,9 +320,10 @@ class CaratGUI:
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())
 
-        self.root.after(100, self._start_queue_poller)
+        # noinspection PyTypeChecker
+        self.parent.after(100, self._start_queue_poller)
 
-    def _clear_console(self):
+    def _clear_console(self) -> None:
         """Wipes the console text box clean."""
         self.txt_log.config(state="normal")
         self.txt_log.delete('1.0', tk.END)
@@ -317,8 +337,8 @@ class CaratGUI:
         from tkinter import messagebox
         import sys
 
-        messagebox.showerror("Carat: Startup Error", message, parent=self.root)
-        self.root.destroy()
+        messagebox.showerror("Carat: Startup Error", message, parent=self.parent)
+        self.parent.destroy()
         sys.exit(1)
 
 if __name__ == "__main__":

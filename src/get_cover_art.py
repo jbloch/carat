@@ -1,16 +1,27 @@
 """
-   A freestanding tool and small library to find high-quality album artwork on the web.
-   It currently uses Apple/iTunes and MusicBrainz as sources, but this does not affect
-   the contract between this module and its users.
+Cover art retrieval component of Carat.
+
+A freestanding tool and small library to find high-quality album artwork on the web. It currently uses Apple/iTunes
+and MusicBrainz as sources, but this does not affect the contract between this module and its users.
 """
 
+# Copyright (c) 2026 Joshua Bloch
+# SPDX-License-Identifier: MIT
+
+__author__ = "Joshua Bloch"
+__copyright__ = "Copyright 2026, Joshua Bloch"
+__license__ = "MIT"
+__version__ = "1.0B"
+
 import sys
-import requests
-import musicbrainzngs as mb
-import logger
-from PIL import Image
 from io import BytesIO
 from pathlib import Path
+
+import musicbrainzngs as mb
+import requests
+from PIL import Image
+
+import logger
 
 __all__ = ['get_cover_art']
 
