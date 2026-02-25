@@ -107,13 +107,13 @@ class CaratGUI:
         if not all([self.src_var.get().strip(), self.dest_var.get().strip(),
                     self.artist_var.get().strip(), self.album_var.get().strip()]):
             # State 1: Not Ready
-            self.btn_rip.config(state="disabled", text="FILL MISSING FIELDS")
+            self.btn_rip.config(state="disabled", text="FILL IN BLANK FIELDS (ABOVE)")
         else:
             # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
             self.btn_rip.config(state="normal", text="RIP ATMOS")
 
     def _init_ui(self) -> None:
-        """Constructs the visual interface."""
+        """Constructs the GUI."""
         style = ttk.Style()
         style.theme_use('clam')
 
@@ -122,11 +122,10 @@ class CaratGUI:
 
         # 1. Destination (Library Root)
         section = itertools.count(1)
-        frame_dest = ttk.LabelFrame(self.parent, text=f"{next(section)}. Library Root", padding=10)
+        frame_dest = ttk.LabelFrame(self.parent, text=f"{next(section)}. Music Library Root", padding=10)
         frame_dest.pack(fill="x", padx=10, pady=5)
 
-        default_root = str(Path.cwd() / "output_library")
-        self.dest_var = tk.StringVar(value=self.config.get("library_root", default_root))
+        self.dest_var = tk.StringVar(value=self.config.get("library_root"))
         ttk.Entry(frame_dest, textvariable=self.dest_var).pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Button(frame_dest, text="Browse...", command=self._browse_dest).pack(side="right")
 
@@ -320,6 +319,7 @@ class CaratGUI:
             if "Transcoding" in msg and self.progress_bar.cget("mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
                 self.progress_bar.start(15)
+                self.btn_rip.config(text="TRANSCODING IN PROGRESS...")  # Still State #3
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())

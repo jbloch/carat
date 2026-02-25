@@ -23,7 +23,7 @@ from PIL import Image
 
 import logger
 
-__all__ = ['get_cover_art']
+__all__ = ['download_cover_art']
 
 # We search multiple albums on Apple Music to give us a buffer against Apple's fuzzy search
 MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5
@@ -60,7 +60,7 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
     return False, 0, 0
 
 
-def get_mb_digital_art(artist: str, album: str) -> str | None:
+def get_mb_digital_art_url(artist: str, album: str) -> str | None:
     """ Returns the URL of acceptable album art from MusicBrainz, or None if not found. """
     logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...")
     image_url = None
@@ -73,16 +73,17 @@ def get_mb_digital_art(artist: str, album: str) -> str | None:
 
         # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
         digital = [r for r in releases if r.get('status') == 'Official' and r.get('packaging') is None]
-        image_url = get_mb_art_from_releases(digital)
+        image_url = get_mb_art_url_from_releases(digital)
         if not image_url:
             official = [r for r in releases if r.get('status') == 'Official']
-            image_url = get_mb_art_from_releases(official)
+            image_url = get_mb_art_url_from_releases(official)
     except (mb.MusicBrainzError, KeyError, IndexError):
         pass
     return image_url
 
 
-def get_mb_art_from_releases(releases):
+def get_mb_art_url_from_releases(releases)-> str | None:
+    """ Returns the URL of best candidate from the given MB releases, or None if none appear satisfactory. """
     # Sort releases by date desc (ensure date is treated as a string)
     releases.sort(key=lambda x: str(x.get('date', '0000')), reverse=True)
     for r in releases:
@@ -110,7 +111,7 @@ def get_mb_art_from_releases(releases):
     return None
 
 
-def get_itunes_art(artist: str, album: str) -> str | None:
+def get_itunes_art_url(artist: str, album: str) -> str | None:
     """ Returns the URL of acceptable album art from Apple/iTunes, or None if not found. """
     url = "https://itunes.apple.com/search"
     params = {"term": f"{artist} {album}", "entity": "album", "limit": MAX_APPLE_ALBUM_COVERS_TO_SEARCH}
@@ -135,11 +136,11 @@ def get_itunes_art(artist: str, album: str) -> str | None:
     return None
 
 
-def get_cover_art(artist: str, album: str, target_dir: Path) -> None:
+def download_cover_art(artist: str, album: str, target_dir: Path) -> None:
     """
     Downloads the "best" available cover art for the specified release (or does nothing, if no acceptable art found).
     """
-    image_url = get_itunes_art(artist, album) or get_mb_digital_art(artist, album)
+    image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album)
 
     if image_url:
         logger.emit(f"[*] Downloading: {image_url}")
@@ -155,6 +156,7 @@ def get_cover_art(artist: str, album: str, target_dir: Path) -> None:
 
 
 def main():
+    """ Simple command line tool to get cover art for the specified release """
     if len(sys.argv) < 4:
         logger.emit('Usage: python get_cover_art.py "Artist" "Album" "/Library/Root"')
         sys.exit(1)
@@ -163,7 +165,7 @@ def main():
     target_dir = Path(library_root) / artist / album
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    get_cover_art(artist, album, target_dir)
+    download_cover_art(artist, album, target_dir)
 
 
 if __name__ == "__main__":

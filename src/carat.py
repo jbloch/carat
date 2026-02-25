@@ -36,6 +36,7 @@ import musicbrainzngs as mb
 import get_cover_art
 import logger
 
+__all__ = ['rip_album_to_library']
 
 # --- (1) Metadata & Utils ---
 
@@ -154,10 +155,11 @@ def run_command(cmd: list[str], desc: str | None = None) -> str:
     return "\n".join(output_acc)
 
 
-def emit_summary_log(output_acc: list[Any], start_time: float):
+def emit_summary_log(entire_log: list[Any], start_time: float):
+    """Emits to the logger a summary of a completed rip based on the given log and start time."""
     elapsed = time.time() - start_time
     # 1. Search backwards through the accumulated log for ffmpeg's final stats
-    final_stats = next((line for line in reversed(output_acc) if "size=" in line and "time=" in line), None)
+    final_stats = next((line for line in reversed(entire_log) if "size=" in line and "time=" in line), None)
 
     if final_stats:
         clean_stats = final_stats.strip().replace("frame=", " ")
@@ -171,7 +173,7 @@ def emit_summary_log(output_acc: list[Any], start_time: float):
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
 def find_primary_title(source_spec: str) -> str:
-    """Identifies the Atmos title. Fails if no Atmos track is found."""
+    """Identifies the main Atmos title in the specified source. Throws exception if no Atmos stream is found."""
     res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
                       "Surgical Atmos Scan")
 
@@ -217,6 +219,7 @@ def find_primary_title(source_spec: str) -> str:
 # --- (4) Toolset & Main ---
 
 class Toolset:
+    """ The collection of underlying AV processing programs that this program depends on. """
     def __init__(self, fatal_error_handler: Callable[[str], None] | None = None) -> None:
         self.IS_WIN = platform.system() == "Windows"
         self.FFMPEG = self._find("ffmpeg",
@@ -292,13 +295,14 @@ def init_toolset(error_handler: Callable[[str], None] | None = None) -> None:
 mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
 
 
-def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "all") -> Path:
+def rip_stream_to_mkv(source_spec: str, output_path: Path, title_idx: str) -> Path:
+    """Rips the indexed stream of the longest title in the specified source to the specified output mkv file."""
     # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
-    clean_mkv_path = str(mkv_path.resolve())
-    cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_mkv_path, "--minlength=600"]
+    clean_output_path = str(output_path.resolve())
+    cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_output_path, "--minlength=600"]
     run_command(cmd, f"Ripping Title {title_idx}")
 
-    mkv_files = list(mkv_path.glob("*.mkv"))
+    mkv_files = list(output_path.glob("*.mkv"))
     if not mkv_files: raise RuntimeError("MakeMKV produced no output.")
 
     winner = max(mkv_files, key=lambda x: x.stat().st_size)
@@ -308,6 +312,10 @@ def rip_atmos_to_master_mkv(source_spec: str, mkv_path: Path, title_idx: str = "
 
 
 def find_truehd_stream(mkv_path: Path) -> int | None:
+    """
+    Returns the index of the TrueHD stream with the most channels from the given mkv file, or None if no TrueHD streams
+    are found in the file.
+    """
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for TrueHD Stream")
@@ -320,6 +328,7 @@ def find_truehd_stream(mkv_path: Path) -> int | None:
 
 
 def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str) -> None:
+    """Transcodes the specified mkv file into a chapterless m4a file"""
     idx = find_truehd_stream(mkv_path)
     if idx is None: raise ValueError("No TrueHD stream found.")
 
@@ -334,6 +343,7 @@ def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str) -> No
 
 
 def extract_chapters_from_mkv(mkv_path: Path) -> list[dict]:
+    """Returns a list of dictionaries describing the chapters of the specified mkv file"""
     cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", str(mkv_path)]
     res = run_command(cmd, "Extracting Chapter Markers")
     try:
@@ -347,6 +357,7 @@ MAX_RELEASE_GROUPS: int = 5
 
 
 def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int) -> tuple[dict | None, list | None]:
+    """Returns a metadata dictionary for the given release from MusicBrainz, or None if no matching release is found."""
     try:
         rg_res = mb.search_release_groups(artist=artist, release=album)
         for rg in rg_res.get('release-group-list', [])[:MAX_RELEASE_GROUPS]:
@@ -457,20 +468,26 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str) -> None:
     """
-    Orchestrates the rip/transcode pipeline for a single release.
+    Rips the Atmos stream representing the main title in the specified source into the music library with the
+    specified root. The artist and album title are used to obtain metadata and cover art, which are used to
+    generate the cue file and cover.jpg in the music library. The library entry consists of a chapterless m4a file
+    containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless playback of the
+    entire album, as well as access to individual tracks in Kodi version 21, and is the sole format known to do so.
+
+    This method offers complete ripping of Atmos sources into digital music libraries in a single call, with:
 
     Polymorphic Input Handling:
-      - Integers (e.g. "0", "-1"): Treated as Physical Optical Disc indices.
-      - .iso files: Mounted virtually and scanned as discs.
-      - BDMV folders: Scanned as Blu-ray structures.
-      - .mkv files: Treated as direct sources (bypassing MakeMKV rip).
-      - Standard folders: Treated as IAA (Immersive Audio Album) collections to be merged.
+      - Integers (e.g. "0", "-1") are Treated as Physical Optical Disc indices
+      - .iso files are Mounted virtually and scanned as discs
+      - BDMV folders are Scanned as Blu-ray structures
+      - .mkv files are Treated as direct sources, bypassing MakeMKV rip (Headphone Dust release format)
+      - Standard folders are treated as collections of tracks to be merged into an album (IAA release format)
 
-    The pipeline ensures:
-      1. A temporary workspace is used for intermediate files.
-      2. Metadata is fetched from MusicBrainz based on track counts.
-      3. CUE sheets are generated for gapless playback support.
-      4. Heavy lifting (Cover Art download, Transcoding) is parallelized where possible.
+    The processing pipeline ensures:
+      1. A temporary workspace is used for intermediate files
+      2. Metadata is fetched from MusicBrainz only if track count matches what's found on the input source
+      3. CUE sheets are generated for gapless playback support
+      4. Time-consuming tasks (e.g., Cover Art download, Transcoding) are parallelized where possible
     """
     # 1. Prepare the destination directory, and ensure tmp directory exists
     target = Path(library_root) / artist / f"{album} (Atmos)"
@@ -490,7 +507,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # Execute "Atmos or Die" Scan & Rip
             source_spec = f"disc:{drive_idx}"
             title_idx = find_primary_title(source_spec)
-            atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
+            atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
 
         except (ValueError, TypeError):
             # Input is not an integer; handle as Path
@@ -500,13 +517,13 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             if src_p.suffix.lower() == ".iso":
                 source_spec = f"iso:{src_p.resolve()}"
                 title_idx = find_primary_title(source_spec)
-                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
+                atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
 
             # --- CASE C: Mounted Blu-ray or other BDMV Folder Structure ---
             elif src_p.is_dir() and (src_p / "BDMV").exists():
                 source_spec = f"file:{src_p.resolve() / 'BDMV'}"
                 title_idx = find_primary_title(source_spec)
-                atmos_mkv = rip_atmos_to_master_mkv(source_spec, TMP_DIR, title_idx)
+                atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
 
             # --- CASE D: Folder of MKVs, such as IAA distribution  (Merge MKVs or MP4s rather than ripping) ---
             elif src_p.is_dir():
@@ -528,7 +545,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         # 4. Final Assembly (Concurrent)
         # We run the Cover Art download in parallel with the heavy Transcode
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(get_cover_art.get_cover_art, artist, album, target)
+            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target)
 
             # Generate CUE Sheet
             generate_cue_sheet(target / f"{album} (Atmos).cue", f"{album} (Atmos).m4a", info, chaps, tracks or [])
@@ -553,6 +570,7 @@ def _clean_path_arg(arg: str) -> str:
 
 
 def main():
+    """Simple command line tool for carat"""
     parser = argparse.ArgumentParser()
     parser.add_argument("source")
     parser.add_argument("artist")

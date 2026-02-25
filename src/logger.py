@@ -18,6 +18,8 @@ import sys
 import threading
 from collections.abc import Callable
 
+__all__ = ['init', 'emit']
+
 # Global lock to prevent threads from garbling the console
 _print_lock = threading.Lock()
 
