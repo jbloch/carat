@@ -146,8 +146,13 @@ def run_command(cmd: list[str], desc: str | None = None) -> str:
             _process_output_line(line, output_acc, parser_state)
 
         process.wait()
+    except:
+        # If we are exiting via exception (e.g. Ctrl+C), kill the process and wait for it to die
+        process.kill()
+        process.wait()
+        raise  # Re-raise the exception to let the app handle the crash
     finally:
-        _active_subprocess = None
+        _active_subprocess = None # We *know* process is dead, so no further process cleanup is necessary
 
     if process.returncode != 0:
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
