@@ -67,13 +67,24 @@ class CaratGUI:
         self.status_queue = queue.Queue()
         self.art_queue = queue.Queue()
 
+        # Initialize state variables
         self.current_cover_path = None
         self.is_ripping = False
-
         logger.init(self._log_callback)
+
+        # Override window close hook to give the user a chance to back out and clean up if they don't
+        self.parent.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._init_ui()
         self._start_queue_poller()
+
+    def _on_close(self):
+        if self.is_ripping:
+            if not messagebox.askyesno("Exit", "Ripping is in progress. Are you sure you want to quit?"):
+                return
+        # Force the cleanup explicitly before destroying root
+        carat.clean_up()
+        self.parent.destroy()
 
     @staticmethod
     def _load_config() -> dict[Any, Any] | None:

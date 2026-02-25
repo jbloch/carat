@@ -421,7 +421,7 @@ def _nuke_dir(path: Path) -> None:
         time.sleep(0.2)  # Give the OS a moment to release file handles
 
 
-def _clean_up()->None:
+def clean_up()->None:
     """ Terminates active subprocesses and deletes the tmp directory (idempotent). """
     global _active_subprocess
 
@@ -438,13 +438,13 @@ def _clean_up()->None:
         _nuke_dir(TMP_DIR)
 
 
-atexit.register(_clean_up) # Ensure _clean_up gets called for all but the most abrupt of process terminations
+atexit.register(clean_up) # Ensure _clean_up gets called for all but the most abrupt of process terminations
 
 
 # Catch OS-level interruptions (Ctrl+C, normal termination signals)
 # noinspection PyUnusedLocal
 def _signal_handler(signum: object, frame: object) -> NoReturn:
-    _clean_up()
+    clean_up()
     os._exit(1)
 
 
@@ -564,7 +564,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             except TimeoutError:
                 pass
     finally:
-        _clean_up()
+        clean_up()
 
     logger.emit(f"\n[+] Library Entry Complete: {album}")
 
