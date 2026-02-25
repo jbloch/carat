@@ -97,9 +97,8 @@ class CaratGUI:
         return {}
 
     def _save_config(self) -> None:
-        """Saves current paths to the config file."""
+        """Saves persistent data to the config file."""
         cfg = {
-            "last_source": self.src_var.get(),
             "library_root": self.dest_var.get()
         }
         try:
@@ -118,17 +117,17 @@ class CaratGUI:
         if not all([self.src_var.get().strip(), self.dest_var.get().strip(),
                     self.artist_var.get().strip(), self.album_var.get().strip()]):
             # State 1: Not Ready
-            self.btn_rip.config(state="disabled", text="FILL IN BLANK FIELDS (ABOVE)")
+            self.btn_rip.config(state="disabled", text="Fill in Blank Fields (above)")
         else:
             # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
-            self.btn_rip.config(state="normal", text="RIP ATMOS")
+            self.btn_rip.config(state="normal", text="Rip Atmos")
 
     def _init_ui(self) -> None:
         """Constructs the GUI."""
         style = ttk.Style()
         style.theme_use('clam')
 
-        # Override the disabled button state for high visibility (This includes "RIP COMPLETE!")
+        # Override the disabled button state for high visibility (This includes "Rip Complete")
         style.map('TButton', foreground=[('disabled', 'black')], background=[('disabled', '#e0e0e0')])
 
         # 1. Destination (Library Root)
@@ -144,7 +143,7 @@ class CaratGUI:
         frame_src = ttk.LabelFrame(self.parent, text=f"{next(section)}. Source (Disc, ISO, or Folder)", padding=10)
         frame_src.pack(fill="x", padx=10, pady=5)
 
-        self.src_var = tk.StringVar(value=self.config.get("last_source", ""))
+        self.src_var = tk.StringVar()
         ttk.Entry(frame_src, textvariable=self.src_var).pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Button(frame_src, text="Folder/Disc...", command=self._browse_source_folder).pack(side="right", padx=(2, 0))
         ttk.Button(frame_src, text="File...", command=self._browse_source_file).pack(side="right")
@@ -235,7 +234,7 @@ class CaratGUI:
         #Change state to State #3 - Rip in progress
         self._save_config()
         self.is_ripping = True
-        self.btn_rip.config(state="disabled", text="RIPPING IN PROGRESS...") # State #3 Rip in progress
+        self.btn_rip.config(state="disabled", text="Ripping in Progress...") # State #3 Rip in progress
 
         # Collect arguments for the rip
         source = self.src_var.get().strip()
@@ -274,7 +273,7 @@ class CaratGUI:
         self.lbl_status.config(text="Idle")
 
         self.is_ripping = False
-        self.btn_rip.config(state="disabled", text="RIP COMPLETE")  # State 4: Complete
+        self.btn_rip.config(state="disabled", text="Rip Complete")  # State 4: Complete
 
     def _poll_for_cover(self, path: Path) -> None:
         """Watches for the cover art file to appear."""
@@ -330,7 +329,7 @@ class CaratGUI:
             if "Transcoding" in msg and self.progress_bar.cget("mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
                 self.progress_bar.start(15)
-                self.btn_rip.config(text="TRANSCODING IN PROGRESS...")  # Still State #3
+                self.btn_rip.config(text="Transcoding in Progress...")  # Still State #3
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())
