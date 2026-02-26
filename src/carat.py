@@ -101,15 +101,16 @@ def _ensure_writable(path: Path) -> None:
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
-def _process_output_line(line: str, output_acc: list[str], state: dict):
+def _process_output_line(line: str, output_acc: list[str], env: dict):
+    """Process the given line of output from a MakeMKV subprocess and emit the processed output to the logger."""
     line = line.rstrip('\r\n')
     if not line: return
 
     output_acc.append(line)
 
-    # Latch Trigger. We do not report MakeMKV progress until it starts the main extraction
+    # Latch Trigger for MakeMKV
     if "PRGC:5017" in line:
-        state["is_extracting"] = True
+        env["is_extracting"] = True
 
     # [1] MakeMKV Progress
     if "PRG" in line:
@@ -118,22 +119,35 @@ def _process_output_line(line: str, output_acc: list[str], state: dict):
                 parts = line.split(":")[1].split(",")
                 current, max_val = float(parts[0]), float(parts[2])
 
-                if max_val > 0 and state.get("is_extracting"):
+                if max_val > 0 and env.get("is_extracting"):
                     pct = (current / max_val) * 100
                     if 0 <= pct <= 100:
                         logger.emit(f"    Atmos Extraction: {pct:.1f}%", is_progress=True)
             except (IndexError, ValueError):
                 pass
-
-        state["last_was_progress"] = True
+        env["last_was_progress"] = True
         return
 
     # [2] ffmpeg Progress
-    elif "size=" in line and "time=" in line and "bitrate=" in line:
-        clean_stats = line.strip().replace("frame=", " ")
-        logger.emit(f"Transcoding: {clean_stats}", is_progress=True)
+    elif "time=" in line and "speed=" in line:
+        try:
+            # Parse current time (HH:MM:SS.ms)
+            time_str = line.split("time=")[1].split()[0]
+            h, m, s = time_str.split(':')
+            current_seconds = int(h) * 3600 + int(m) * 60 + float(s)
 
-        state["last_was_progress"] = True
+            clean_stats = line.strip().replace("frame=", "")
+
+            total = env.get("ffmpeg_duration", 0)
+            if total > 0:
+                pct = (current_seconds / total) * 100
+                logger.emit(f"Remuxing: [{pct:.1f}%] {clean_stats}", is_progress=True)
+            else:
+                logger.emit(f"Remuxing: {clean_stats}", is_progress=True)
+        except (ValueError, IndexError):
+            pass
+
+        env["last_was_progress"] = True
         return
 
     # [3] Normal Output
@@ -144,13 +158,14 @@ def _process_output_line(line: str, output_acc: list[str], state: dict):
         elif not line.startswith(("DRV:", "TDRV:", "CIDC:", "SINFO:", "TINFO:", "CINFO:")):
             logger.emit(line)
 
-        state["last_was_progress"] = False
+        env["last_was_progress"] = False
 
 
-def run_command(cmd: list[str], desc: str | None = None) -> str:
+def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None) -> str:
     """
     Executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
+    Accepts an optional environment dict to pass state (such as album duration) to the output parser.
     This method is aggressively single-threaded. Don't even think about running it in multiple threads.
     """
     global _active_subprocess
@@ -158,28 +173,29 @@ def run_command(cmd: list[str], desc: str | None = None) -> str:
     if desc: logger.emit(f"[*] {desc}...")
     logger.emit(f"[*] Command: {cmd}")
 
-    # text=True handles decoding; bufsize=1 ensures line-buffered output
+    if env is None: env = {}
+
+    # Initialize parser state keys
+    env.setdefault("last_was_progress", False)
+    env.setdefault("is_extracting", False)
+
     start_time = time.time()
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    _active_subprocess = process  # So we can kill the process from outside this method if it all goes south
+    _active_subprocess = process
 
     try:
         output_acc = []
-        parser_state = {
-            "last_was_progress": False,
-            "is_extracting": False
-        }
         for line in process.stdout:
-            _process_output_line(line, output_acc, parser_state)
+            _process_output_line(line, output_acc, env)
 
         process.wait()
     except:
-        # If we are exiting via exception (e.g. Ctrl+C), kill the process and wait for it to die
+        # If we are exiting via exception (e.g., Cancel/Ctrl C), kill the process
         process.kill()
         process.wait()
         raise  # Re-raise the exception to let the app handle the crash
     finally:
-        _active_subprocess = None # We *know* process is dead, so no further process cleanup is necessary
+        _active_subprocess = None  # Whether it succeeded or failed, it's gone
 
     if process.returncode != 0:
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
@@ -195,7 +211,7 @@ def emit_summary_log(entire_log: list[Any], start_time: float):
 
     if final_stats:
         clean_stats = final_stats.strip().replace("frame=", " ")
-        summary = f"[+] Transcode finished in {elapsed:.1f}s -> {clean_stats}"
+        summary = f"[+] Remux finished in {elapsed:.1f}s -> {clean_stats}"
     else:
         summary = f"[+] Task finished in {elapsed:.1f} seconds."
 
@@ -359,8 +375,8 @@ def find_truehd_stream(mkv_path: Path) -> int | None:
         return None
 
 
-def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str) -> None:
-    """Transcodes the specified mkv file into a chapterless m4a file"""
+def remux_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str, total_duration: float = 0) -> None:
+    """Remuxes the specified mkv file into a chapterless m4a file"""
     idx = find_truehd_stream(mkv_path)
     if idx is None: raise ValueError("No TrueHD stream found.")
 
@@ -371,17 +387,21 @@ def transcode_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str) -> No
         "-f", "mp4", "-movflags", "+faststart", "-strict", "-2",
         "-fflags", "+genpts", "-map_chapters", "-1", "-y", str(m4a_path)
     ]
-    run_command(cmd, "Finalizing Atmos M4A")
+    run_command(cmd, "Finalizing Atmos M4A", {"ffmpeg_duration": total_duration})
 
 
-def extract_chapters_from_mkv(mkv_path: Path) -> list[dict]:
-    """Returns a list of dictionaries describing the chapters of the specified mkv file"""
-    cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", str(mkv_path)]
+def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], float]:
+    """Returns a list of chapters and the total duration in seconds from the given mkv file."""
+    # We add -show_format to get the duration
+    cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", "-show_format", str(mkv_path)]
     res = run_command(cmd, "Extracting Chapter Markers")
     try:
-        return json.loads(res).get('chapters', [])
-    except json.JSONDecodeError:
-        return []
+        data = json.loads(res)
+        chapters = data.get('chapters', [])
+        duration = float(data.get('format', {}).get('duration', 0))
+        return chapters, duration
+    except (json.JSONDecodeError, ValueError):
+        return [], 0.0
 
 
 # Maximum number of release groups to search in MusicBrainz when look for the album
@@ -517,9 +537,9 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
     The processing pipeline ensures:
       1. A temporary workspace is used for intermediate files
-      2. Metadata is fetched from MusicBrainz only if track count matches what's found on the input source
+      2. Metadata is fetched from MusicBrainz only if the track count matches what's found on the input source
       3. CUE sheets are generated for gapless playback support
-      4. Time-consuming tasks (e.g., Cover Art download, Transcoding) are parallelized where possible
+      4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible
     """
     # 1. Fail Fast: Ensure we can actually write to the library before we start ripping
     lib_path = Path(library_root)
@@ -566,10 +586,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 if not atmos_mkv.exists(): raise FileNotFoundError(f"Not found: {src_path}")
 
         # 3. Post-Rip Processing & Metadata Fetch
-        chaps = extract_chapters_from_mkv(atmos_mkv)
-
-        # We fetch metadata *before* defining the final folder name, so we can name the folder properly
-        info, tracks = get_metadata_from_musicbrainz(album, artist, len(chaps))
+        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
+        info, tracks = get_metadata_from_musicbrainz(album, artist, len(chapters))
         if info:
             # Canonicalize! Use the official MB names.
             artist = info['artist']
@@ -593,9 +611,9 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # Pass the (possibly updated) artist/album to cover art search
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target)
 
-            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", f"{clean_album} (Atmos).m4a", info, chaps,
+            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", f"{clean_album} (Atmos).m4a", info, chapters,
                                tracks or [])
-            transcode_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album)
+            remux_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album, duration)
 
             try:
                 cover_future.result(timeout=45)

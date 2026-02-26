@@ -37,7 +37,7 @@ MIN_DIMENSION = 1000  # Minimum pixels for 'High Res'
 
 
 def is_valid_image(url: str) -> tuple[bool, int, int]:
-    """ Returns true and the image dimensions if the image at the given URL has appropriate shape for cover art. """
+    """ Returns true and the image dimensions if the image at the given URL has an appropriate shape for cover art. """
     try:
         # If it's a known CAA thumbnail, we trust the size and skip the HEAD request
         is_thumbnail = "/thumbnails/" in url or "itunes.apple.com" in url
@@ -119,7 +119,7 @@ def _normalize_for_fuzzy_comparison(s: str) -> str:
         1. Normalizes Unicode (NFKD) to decompose diacritics and fix full-width chars.
         2. Strips combining diacritics (e.g., the dots on 'ö').
         3. Lowercases and expands '&'.
-        4. Keeps ALL alphanumeric characters (including Cyrillic, Kanji, etc).
+        4. Keeps ALL alphanumeric characters (including Cyrillic, Kanji, etc.)
         5. Collapses whitespace.
     """
     if not s: return ""  #  Shouldn't be necessary, but acceptably defensive under the circumstances
@@ -171,7 +171,7 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
 
 def download_cover_art(artist: str, album: str, target_dir: Path) -> None:
     """
-    Downloads the "best" available cover art for the specified release (or does nothing, if no acceptable art found).
+    Downloads the "best" available cover art for the specified release (or does nothing if no acceptable art found).
     """
     image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album)
 

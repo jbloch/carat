@@ -1,7 +1,7 @@
 """
 Simple GUI for carat (Concise Atmos Ripping Automation Tool).
 
-Provides one-click ripping and transcoding of Dolby Atmos albums in common formats for gapless playback with track
+Provides one-click ripping and remuxing of Dolby Atmos albums in common formats for gapless playback with track
 selection. (See carat.py for details.)
 """
 
@@ -18,7 +18,6 @@ import json
 import queue
 import shutil
 import threading
-import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -35,17 +34,34 @@ class CaratGUI:
     """ Tkinter GUI for Carat """
 
     def _log_callback(self, msg: str, is_progress: bool = False) -> None:
-        """Thread-safe logging back to the UI."""
+        """Thread-safe logging callback from carat to the UI."""
         if is_progress:
             self.status_queue.put(msg)
-            if "%" in msg:
+            if "Extraction:" in msg and "%" in msg:
                 try:
                     val = float(msg.split(":")[1].strip().replace("%", ""))
                     self.progress_queue.put(val)
-                except (ValueError, IndexError, queue.Full):
+                except ValueError:
+                    pass
+            elif "Remuxing:" in msg and "[" in msg and "%]" in msg:
+                try:
+                    start = msg.find("[") + 1
+                    end = msg.find("%]")
+                    val = float(msg[start:end])
+                    self.progress_queue.put(val)
+                except ValueError:
                     pass
         else:
             self.log_queue.put(msg)
+            if "Success: Saved" in msg and "cover to" in msg:
+                try:
+                    # Extract the path from the end of the log message
+                    # Msg: "[+] Success: Saved 1200x1200 cover to /path/to/cover.jpg"
+                    path_str = msg.split("cover to")[1].strip()
+                    self.art_queue.put(path_str)
+                except IndexError:
+                    pass
+
 
     def __init__(self, parent: tk.Tk) -> None:
         self.parent = parent
@@ -82,7 +98,7 @@ class CaratGUI:
         if self.is_ripping:
             if not messagebox.askyesno("Exit", "Ripping is in progress. Are you sure you want to quit?"):
                 return
-        # Force the cleanup explicitly before destroying root
+        # Force cleanup before destroying root
         carat.clean_up()
         self.parent.destroy()
 
@@ -252,7 +268,6 @@ class CaratGUI:
         thread.daemon = True
         thread.start()
 
-        threading.Thread(target=self._poll_for_cover, args=(cover_path,), daemon=True).start()
 
     def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str) -> None:
         """The worker thread function."""
@@ -275,13 +290,6 @@ class CaratGUI:
         self.is_ripping = False
         self.btn_rip.config(state="disabled", text="Rip Complete")  # State 4: Complete
 
-    def _poll_for_cover(self, path: Path) -> None:
-        """Watches for the cover art file to appear."""
-        for _ in range(10000):
-            if path.exists() and path.stat().st_size > 0:
-                self.art_queue.put(str(path))
-                return
-            time.sleep(1)
 
     def _display_cover(self, path: Path) -> None:
         """Updates the cover art label using Pillow."""
@@ -308,7 +316,7 @@ class CaratGUI:
                 messagebox.showerror("Error", f"Failed to update cover: {e}")
 
     def _start_queue_poller(self) -> None:
-        """Consumes queue events and updates the UI (must run on main thread)."""
+        """Consumes queue events and updates the UI (must run on the main thread)."""
         while not self.log_queue.empty():
             msg = self.log_queue.get_nowait()
             self.txt_log.config(state="normal")
@@ -317,19 +325,29 @@ class CaratGUI:
             self.txt_log.config(state="disabled")
 
         while not self.progress_queue.empty():
-            self.progress_bar.stop()  # Kills the ghost animation!
-            self.progress_bar.config(mode='determinate')
+            # If we get a valid number, we are Determinate. Stop any bouncing.
+            if self.progress_bar.cget("mode") != "determinate":
+                self.progress_bar.stop()
+                self.progress_bar.config(mode='determinate')
+
             self.progress_var.set(self.progress_queue.get_nowait())
 
         while not self.status_queue.empty():
             msg = self.status_queue.get_nowait()
             self.lbl_status.config(text=msg)
 
-            # Switch to bouncing mode when FFmpeg starts
-            if "Transcoding" in msg and self.progress_bar.cget("mode") != "indeterminate":
+            # ONLY switch to indeterminate (bounce) if we are remuxing WITHOUT a percentage
+            if "Remuxing" in msg and "%" not in msg and self.progress_bar.cget("mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
                 self.progress_bar.start(15)
-                self.btn_rip.config(text="Transcoding in Progress...")  # Still State #3
+                self.btn_rip.config(text="Remuxing in Progress...")
+
+            # If we DO have a percentage (bracket style), ensure we stay Determinate
+            elif "Remuxing" in msg and "[" in msg and "%]" in msg:
+                if self.progress_bar.cget("mode") != "determinate":
+                    self.progress_bar.stop()
+                    self.progress_bar.config(mode="determinate")
+                self.btn_rip.config(text="Remuxing in Progress")
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())

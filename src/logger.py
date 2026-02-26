@@ -43,7 +43,7 @@ def init(log_callback: Callable[[str, bool], None] | None) -> None:
 def emit(line: str, is_progress: bool = False) -> None:
     """
     Emits the given line to the log_callback, if provided, or to stdout if it is not. If is_progress is true, then
-    line represents progress, and should overwrite the previously logged string.
+    the line represents progress, and should overwrite the previously logged string.
     """
     global _print_lock, _log_callback
     with _print_lock:
