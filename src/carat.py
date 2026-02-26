@@ -45,15 +45,13 @@ def seconds_to_cue(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}:{int((seconds % 1) * 75):02d}"
 
 
-def generate_cue_sheet(cue_path: Path, m4a_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
-    """Generates the CUE sheet for gapless playback."""
+def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
+    """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
-        f.write(
-            f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{m4a_name}" WAVE\n')
+        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             title = mb_tracks[i]['recording']['title'] if i < len(mb_tracks) else f"Track {i + 1}"
-            f.write(
-                f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
+            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
 
 
 def _parse_makemkv_msg(line: str) -> str | None:
@@ -180,7 +178,9 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
     env.setdefault("is_extracting", False)
 
     start_time = time.time()
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    hide_console_flag = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+                               creationflags=hide_console_flag)  # Suppress console window from popping up on Windows
     _active_subprocess = process
 
     try:
@@ -271,11 +271,11 @@ class Toolset:
     def __init__(self, fatal_error_handler: Callable[[str], None] | None = None) -> None:
         self.IS_WIN = platform.system() == "Windows"
         self.FFMPEG = self._find("ffmpeg",
-                                 [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
+                        [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
         self.FFPROBE = self._find("ffprobe",
-                                  [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"])
-        self.MKVMERGE = self._find("mkvmerge", [r"C:\Program Files\MKVToolNix\mkvmerge.exe", "/usr/local/bin/mkvmerge",
-                                                "/opt/homebrew/bin/mkvmerge"])
+                        [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"])
+        self.MKVMERGE = self._find("mkvmerge",
+       [r"C:\Program Files\MKVToolNix\mkvmerge.exe", "/usr/local/bin/mkvmerge", "/opt/homebrew/bin/mkvmerge"])
         self.MAKEMKV = self._find("makemkvcon64" if self.IS_WIN else "makemkvcon", [
             r"C:\Program Files (x86)\MakeMKV\makemkvcon64.exe",
             "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon",
@@ -314,7 +314,8 @@ class Toolset:
             output = (result.stdout + result.stderr).lower()
 
             if "expired" in output or "too old" in output or "evaluation" in output:
-                msg = "MakeMKV beta key appears to be expired or invalid.\nPlease open the MakeMKV GUI, enter the latest beta key from the forums, and try again."
+                msg = ("MakeMKV beta key appears to be expired or invalid.\nPlease open the MakeMKV GUI, enter the "
+                       "latest beta key from the forums, and try again.")
                 self._trigger_fatal(msg, error_handler)
 
         except Exception as e:
@@ -343,14 +344,14 @@ def init_toolset(error_handler: Callable[[str], None] | None = None) -> None:
 mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
 
 
-def rip_stream_to_mkv(source_spec: str, output_path: Path, title_idx: str) -> Path:
+def rip_stream_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
     """Rips the indexed stream of the longest title in the specified source to the specified output mkv file."""
     # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
-    clean_output_path = str(output_path.resolve())
-    cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", source_spec, title_idx, clean_output_path, "--minlength=600"]
+    clean_output_path = str(out_path.resolve())
+    cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", src_spec, title_idx, clean_output_path, "--minlength=600"]
     run_command(cmd, f"Ripping Title {title_idx}")
 
-    mkv_files = list(output_path.glob("*.mkv"))
+    mkv_files = list(out_path.glob("*.mkv"))
     if not mkv_files: raise RuntimeError("MakeMKV produced no output.")
 
     winner = max(mkv_files, key=lambda x: x.stat().st_size)
@@ -611,8 +612,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # Pass the (possibly updated) artist/album to cover art search
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target)
 
-            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", f"{clean_album} (Atmos).m4a", info, chapters,
-                               tracks or [])
+            generate_cue_sheet(target / f"{clean_album} (Atmos).cue",
+                               f"{clean_album} (Atmos).m4a", info, chapters, tracks or [])
             remux_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album, duration)
 
             try:
