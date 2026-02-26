@@ -72,6 +72,33 @@ def _parse_makemkv_msg(line: str) -> str | None:
     return None
 
 
+def _sanitize_filename(name: str) -> str:
+    """
+    Replaces characters illegal in Windows/Unix filenames with safe alternatives.
+    """
+    # specific replacement for colons to make "Title: Subtitle" look nice
+    name = name.replace(":", " -")
+    # Zap standard illegal characters
+    return re.sub(r'[\\/*?"<>|]', '_', name).strip()
+
+
+def _ensure_writable(path: Path) -> None:
+    """
+    Verifies that the given path exists and is writable by creating and deleting a temp file.
+    Raises PermissionError if not writable.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Library root does not exist: {path}")
+
+    # We use a localized test file to verify permissions explicitly
+    test_file = path / ".carat_write_test"
+    try:
+        test_file.touch()
+        test_file.unlink()
+    except OSError:
+        raise PermissionError(f"Library root is not writable: {path}")
+
+
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
 def _process_output_line(line: str, output_acc: list[str], state: dict):
@@ -494,22 +521,21 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
       3. CUE sheets are generated for gapless playback support
       4. Time-consuming tasks (e.g., Cover Art download, Transcoding) are parallelized where possible
     """
-    # 1. Prepare the destination directory, and ensure tmp directory exists
-    target = Path(library_root) / artist / f"{album} (Atmos)"
-    target.mkdir(parents=True, exist_ok=True)
-    TMP_DIR.mkdir(parents=True, exist_ok=True)  # Normally a no-op, but recreates directory if this is not the first rip
+    # 1. Fail Fast: Ensure we can actually write to the library before we start ripping
+    lib_path = Path(library_root)
+    _ensure_writable(lib_path)
+
+    # 2. Prepare Temp Directory
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
         try:
             # --- CASE A: Physical Disc (Integer Input) ---
             drive_idx = int(src_path)
-
-            # Auto-detect drive if -1 is passed (Heuristic: Look for BD-RE/BD-ROM)
             if drive_idx == -1:
                 res = run_command([TOOLS.MAKEMKV, "-r", "info", "disc:0"])
                 if "BD-RE" in res or "BD-ROM" in res: drive_idx = 0
 
-            # Execute "Atmos or Die" Scan & Rip
             source_spec = f"disc:{drive_idx}"
             title_idx = find_primary_title(source_spec)
             atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
@@ -524,44 +550,56 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 title_idx = find_primary_title(source_spec)
                 atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
 
-            # --- CASE C: Mounted Blu-ray or other BDMV Folder Structure ---
+            # --- CASE C: BDMV Folder ---
             elif src_p.is_dir() and (src_p / "BDMV").exists():
                 source_spec = f"file:{src_p.resolve() / 'BDMV'}"
                 title_idx = find_primary_title(source_spec)
                 atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
 
-            # --- CASE D: Folder of MKVs, such as IAA distribution  (Merge MKVs or MP4s rather than ripping) ---
+            # --- CASE D: Folder of Files (IAA) ---
             elif src_p.is_dir():
                 atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR)
 
-            # --- CASE E: Direct MKV File, such as Headphone Dust distribution (Bypass Rip; input is master MKV) ---
+            # --- CASE E: Direct MKV ---
             else:
                 atmos_mkv = src_p.resolve()
                 if not atmos_mkv.exists(): raise FileNotFoundError(f"Not found: {src_path}")
 
-        # 3. Post-Rip Processing
-        # Extract chapter markers from the master MKV (essential for CUE sheet)
+        # 3. Post-Rip Processing & Metadata Fetch
         chaps = extract_chapters_from_mkv(atmos_mkv)
 
-        # Fetch metadata (Track titles, Year) from MusicBrainz
+        # We fetch metadata *before* defining the final folder name, so we can name the folder properly
         info, tracks = get_metadata_from_musicbrainz(album, artist, len(chaps))
-        info = info or {'artist': artist, 'title': album, 'year': 'Unknown'}
+        if info:
+            # Canonicalize! Use the official MB names.
+            artist = info['artist']
+            album = info['title']
+            logger.emit(f"[*] Canonicalized as Artist: {artist}, Album: {album}")
+        else:
+            # Fallback to user input if MB fails
+            logger.emit(f"[*] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
+            info = {'artist': artist, 'title': album, 'year': 'Unknown'}
 
-        # 4. Final Assembly (Concurrent)
-        # We run the Cover Art download in parallel with the heavy Transcode
+        clean_artist = _sanitize_filename(artist)
+        clean_album = _sanitize_filename(album)
+        logger.emit(f"[*] Sanitized as Artist: {artist}, Album: {album}")
+
+        # 4. Create Final Directory (Now that we have the clean name)
+        target = lib_path / clean_artist / f"{clean_album} (Atmos)"
+        target.mkdir(parents=True, exist_ok=True)
+
+        # 5. Final Assembly (Concurrent)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            # Pass the (possibly updated) artist/album to cover art search
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target)
 
-            # Generate CUE Sheet
-            generate_cue_sheet(target / f"{album} (Atmos).cue", f"{album} (Atmos).m4a", info, chaps, tracks or [])
+            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", f"{clean_album} (Atmos).m4a", info, chaps,
+                               tracks or [])
+            transcode_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album)
 
-            # Transcode Master MKV, whose chapters are the TrueHD/Atmos songs to a chapterless M4A Container
-            transcode_mkv_to_m4a(atmos_mkv, target / f"{album} (Atmos).m4a", album)
-
-            # Ensure Cover Art finished (soft timeout)
             try:
                 cover_future.result(timeout=45)
-            except TimeoutError:
+            except (concurrent.futures.TimeoutError, Exception):
                 pass
     finally:
         clean_up()

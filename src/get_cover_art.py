@@ -13,12 +13,14 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B"
 
+import re
 import sys
 from io import BytesIO
 from pathlib import Path
 
 import musicbrainzngs as mb
 import requests
+import unicodedata
 from PIL import Image
 
 import logger
@@ -47,9 +49,9 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
                 return False, 0, 0
 
         # We use stream=True to check the Aspect Ratio/Dimensions because we only need the first few KB of the header.
-        resp = requests.get(url, stream=True, timeout=10)
-        img = Image.open(resp.raw)
-        w, h = img.size
+        with requests.get(url, stream=True, timeout=10) as resp:
+            img = Image.open(resp.raw)
+            w, h = img.size
 
         # Validation logic...
         aspect_ratio = w / h
@@ -83,7 +85,7 @@ def get_mb_digital_art_url(artist: str, album: str) -> str | None:
 
 
 def get_mb_art_url_from_releases(releases)-> str | None:
-    """ Returns the URL of best candidate from the given MB releases, or None if none appear satisfactory. """
+    """ Returns the URL of the best candidate from the given MB releases, or None if none appear satisfactory. """
     # Sort releases by date desc (ensure date is treated as a string)
     releases.sort(key=lambda x: str(x.get('date', '0000')), reverse=True)
     for r in releases:
@@ -111,6 +113,32 @@ def get_mb_art_url_from_releases(releases)-> str | None:
     return None
 
 
+def _normalize_for_fuzzy_comparison(s: str) -> str:
+    """
+    Robust normalization for fuzzy matching.
+        1. Normalizes Unicode (NFKD) to decompose diacritics and fix full-width chars.
+        2. Strips combining diacritics (e.g., the dots on 'ö').
+        3. Lowercases and expands '&'.
+        4. Keeps ALL alphanumeric characters (including Cyrillic, Kanji, etc).
+        5. Collapses whitespace.
+    """
+    if not s: return ""  #  Shouldn't be necessary, but acceptably defensive under the circumstances
+
+    # 1. Decompose (turn 'ö' into 'o' + '¨', and 'Ｆ' into 'F')
+    s = unicodedata.normalize('NFKD', s)
+
+    # 2. Strip diacritics
+    s = "".join([c for c in s if not unicodedata.combining(c)])
+
+    s = s.lower().replace("&", "and")
+
+    # 3. Filter: Keep only letters/numbers and spaces works for any script, e.g., Greek, Cyrillic, CJK
+    s = "".join([c if c.isalnum() else " " for c in s])
+
+    # 4. Collapse multiple spaces down to one
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 def get_itunes_art_url(artist: str, album: str) -> str | None:
     """ Returns the URL of acceptable album art from Apple/iTunes, or None if not found. """
     url = "https://itunes.apple.com/search"
@@ -119,18 +147,23 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
         r = requests.get(url, params=params).json()
         results = r.get('results', [])
 
-        for res in results:
-            retrieved_album = res.get('collectionName', '')
-            retrieved_artist = res.get('artistName', '')
+        target_album = _normalize_for_fuzzy_comparison(album)
+        target_artist = _normalize_for_fuzzy_comparison(artist)
 
-            # Require both the artist and album strings to be present in the result
-            if album.lower() in retrieved_album.lower() and artist.lower() in retrieved_artist.lower():
+        for res in results:
+            retrieved_album = _normalize_for_fuzzy_comparison(res.get('collectionName', ''))
+            retrieved_artist = _normalize_for_fuzzy_comparison(res.get('artistName', ''))
+
+            # Fuzzy Match: check if the target's normalized string is inside the candidate's normalized string
+            # The fuzzy match is necessary because Apple and MusicBrainz can disagree on names
+            if target_album in retrieved_album and target_artist in retrieved_artist:
                 hq_url = res['artworkUrl100'].replace("100x100bb.jpg", "1200x1200bb.jpg")
                 valid, w, h = is_valid_image(hq_url)
                 if valid:
                     return hq_url
             else:
-                logger.emit(f"[*] Skipping iTunes mismatch: {retrieved_artist} - {retrieved_album}")
+                # Log the raw strings so we can see why it failed if it does
+                logger.emit(f"[*] Skipping iTunes mismatch: {res.get('artistName')} - {res.get('collectionName')}")
     except (requests.RequestException, KeyError, ValueError):
         pass
     return None
