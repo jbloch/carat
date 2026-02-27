@@ -38,6 +38,9 @@ import logger
 
 __all__ = ['rip_album_to_library']
 
+import makemkv_updater
+
+
 # --- (1) Metadata & Utils ---
 
 def seconds_to_cue(seconds: float) -> str:
@@ -267,21 +270,67 @@ def find_primary_title(source_spec: str) -> str:
 # --- (4) Toolset & Main ---
 
 class Toolset:
-    """ The collection of underlying AV processing programs that this program depends on. """
-    def __init__(self, fatal_error_handler: Callable[[str], None] | None = None) -> None:
+    """The collection of underlying AV processing programs that this program depends on."""
+
+    def __init__(self, fatal_error_handler: Callable[[str], None]|None = None) -> None:
+        """
+        Initializes the toolset, locates executables, and validates the environment. Takes a callback which is
+        required to display the fatal error to the user and terminating the application.
+        """
         self.IS_WIN = platform.system() == "Windows"
+
         self.FFMPEG = self._find("ffmpeg",
-                        [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
+                                 [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
         self.FFPROBE = self._find("ffprobe",
-                        [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"])
+                                  [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"])
         self.MKVMERGE = self._find("mkvmerge",
-       [r"C:\Program Files\MKVToolNix\mkvmerge.exe", "/usr/local/bin/mkvmerge", "/opt/homebrew/bin/mkvmerge"])
+                                   [r"C:\Program Files\MKVToolNix\mkvmerge.exe", "/usr/local/bin/mkvmerge",
+                                    "/opt/homebrew/bin/mkvmerge"])
         self.MAKEMKV = self._find("makemkvcon64" if self.IS_WIN else "makemkvcon", [
             r"C:\Program Files (x86)\MakeMKV\makemkvcon64.exe",
             "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon",
             "/usr/bin/makemkvcon"
         ])
+
         self._validate(fatal_error_handler)
+
+    def _validate(self, fatal_error_handler: Callable[[str], None]|None) -> None:
+        """Validates that all required tools exist and are properly licensed.
+
+        Args:
+            fatal_error_handler: The callback to trigger on unrecoverable validation failure.
+        """
+        logger.emit("[*] Validating toolset dependencies...")
+
+        # 1. Update/Validate MakeMKV License first - fails gracefully if offline, due to conservative refresh policy
+        makemkv_updater.main()
+
+        # 2. Check for missing binaries
+        missing = []
+        if not self.FFMPEG: missing.append("FFmpeg")
+        if not self.FFPROBE: missing.append("FFprobe")
+        if not self.MKVMERGE: missing.append("MKVMerge")
+        if not self.MAKEMKV: missing.append("MakeMKV")
+
+        if self.MAKEMKV:
+            # Run a dummy command. If the license is dead, it prints the evaluation error.
+            res = subprocess.run([self.MAKEMKV, "info", "file:dummy"], capture_output=True, text=True)
+            if "Evaluation period has expired" in res.stdout + res.stderr:
+                missing.append("MakeMKV (License Expired)")
+
+        # 3. Handle fatal errors
+        if missing:
+            error_msg = f"Missing required dependencies: {', '.join(missing)}.\n\nPlease ensure they are installed."
+            fatal_error_handler(f"[!] {error_msg}")
+
+            if fatal_error_handler:
+                # Let the GUI show a nice popup and exit
+                fatal_error_handler(error_msg)
+            else:
+                # Fallback if running headless
+                raise RuntimeError(error_msg)
+
+        logger.emit("[*] Toolset validation complete.")
 
     @staticmethod
     def _find(name: str, prospects: list[str] | None = None) -> str | None:
@@ -294,32 +343,6 @@ class Toolset:
             if Path(p).exists(): return str(Path(p))
 
         return None
-
-    def _validate(self, error_handler: Callable[[str], None] | None) -> None:
-        # 1. Check for missing dependencies
-        missing = [k for k, v in self.__dict__.items() if v is None and not isinstance(v, bool) and k != 'IS_WIN']
-        if missing:
-            msg = f"Missing dependencies: {', '.join(missing)}\nPlease install them or check your system paths."
-            self._trigger_fatal(msg, error_handler)
-
-        # 2. Validate MakeMKV License
-        try:
-            # 'info dev:all' triggers the license check without ripping anything
-            result = subprocess.run(
-                [self.MAKEMKV, "info", "dev:all"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            output = (result.stdout + result.stderr).lower()
-
-            if "expired" in output or "too old" in output or "evaluation" in output:
-                msg = ("MakeMKV beta key appears to be expired or invalid.\nPlease open the MakeMKV GUI, enter the "
-                       "latest beta key from the forums, and try again.")
-                self._trigger_fatal(msg, error_handler)
-
-        except Exception as e:
-            self._trigger_fatal(f"Failed to validate MakeMKV: {e}", error_handler)
 
     @staticmethod
     def _trigger_fatal(message: str, handler: Callable[[str], None] | None) -> None:
@@ -335,10 +358,14 @@ class Toolset:
 TOOLS: Toolset | None = None
 
 
-def init_toolset(error_handler: Callable[[str], None] | None = None) -> None:
-    """Instantiates the toolset. Must be called by the frontend before ripping."""
+def init(fatal_error_handler: Callable[[str], None] | None = None) -> None:
+    """
+    Initializes this module. Must be called by the frontend before ripping. This method ensures that the tools that
+    are required for the operation of this module are present and functional. Inf not, it calls the fatal error handler,
+    which is responsible for displaying the error to the user and terminating the application.
+    """
     global TOOLS
-    TOOLS = Toolset(error_handler)
+    TOOLS = Toolset(fatal_error_handler)
 
 
 mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
@@ -495,12 +522,12 @@ def _signal_handler(signum: object, frame: object) -> NoReturn:
     clean_up()
     os._exit(1)
 
-
 for sig in (signal.SIGINT, signal.SIGTERM):
     try:
         signal.signal(sig, _signal_handler)
     except ValueError:
         pass
+
 
 def cleanup_orphaned_temps(min_days_old: int = 1):
     """ Scans sys tmp directory for orphaned carat_ tmp dirs older than the specified number of days & deletes them. """
@@ -518,6 +545,7 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
                 _nuke_dir(carat_tmp_dir)
         except (FileNotFoundError, PermissionError):
             pass # Silent failure for cleanup to prevent app startup crashes
+
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str) -> None:
     """
@@ -641,7 +669,7 @@ def main():
     args = parser.parse_args()
 
     # Initialize for CLI (no UI handler)
-    init_toolset()
+    init()
 
     rip_album_to_library(_clean_path_arg(args.source), args.artist, args.album, _clean_path_arg(args.library_root))
 

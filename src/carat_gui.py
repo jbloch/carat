@@ -68,11 +68,14 @@ class CaratGUI:
         self.parent.title("Carat: Concise Atmos Ripping Automation Tool")
         self.parent.geometry("850x850") # Square, like an album cover ;)
 
+        # User our neat logo as this app's icon, unless it's not there, in which case oh well...
         try:
-            img_icon = tk.PhotoImage(file='assets/carat_logo.png')
+            script_dir = Path(__file__).resolve().parent
+            logo_path = str(script_dir / 'assets' / 'carat_logo.png')
+            img_icon = tk.PhotoImage(file=logo_path)
             self.parent.iconphoto(False, img_icon)
-        except tk.TclError:
-            pass  # Failsafe: falls back to the default feather if the image is missing
+        except tk.TclError as e:
+            logger.emit(f"[!] logo missing, falling back to default icon: {e}")
 
         # Load config first so we can use it in UI init
         self.config = self._load_config()
@@ -376,5 +379,5 @@ class CaratGUI:
 if __name__ == "__main__":
     root = tk.Tk()
     app = CaratGUI(root)
-    carat.init_toolset(app.handle_fatal_error)
+    carat.init(app.handle_fatal_error)
     root.mainloop()
