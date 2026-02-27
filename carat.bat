@@ -1,7 +1,6 @@
 @echo off
-REM Carat Launcher - Unattended Install Edition
-REM 1. Fixes "Delayed Expansion" bug (correctly detects fake Python)
-REM 2. Uses Winget for native, silent dependency installation
+REM Carat Launcher - inlcudes intaller, which runs to the extent necessary for a successful launch
+REM 2. Uses Winget for native, silent dependency installation where possible
 
 REM ----------------------------------------------------
 REM 0. FIX NETWORK/UNC PATHS
@@ -21,17 +20,15 @@ if %errorlevel% equ 0 goto :CHECK_FFMPEG
 
 REM MakeMKV Missing - Concierge Mode
 echo.
-echo [!] CRITICAL: MakeMKV not found.
-echo.
-echo     Carat requires MakeMKV to rip discs.
+echo [*] MakeMKV not found.
+
 echo     1. I am opening the MakeMKV download page.
 echo     2. Download and install the latest version.
 echo     3. Once installed, come back here and press any key.
-echo.
 start https://www.makemkv.com/download/
 echo [*] Waiting for you to install MakeMKV...
 pause
-echo [*] Re-checking system...
+echo [*] Re-checking for MakeMKV...
 goto :CHECK_MAKEMKV
 
 :ADD_MAKEMKV_X86
@@ -56,7 +53,7 @@ set REQUIRES_RESTART=1
 goto :CHECK_MKVTOOLNIX
 
 :MANUAL_FFMPEG
-echo [!] Please install FFmpeg manually and restart this script.
+echo [!] Winget install failed. Install FFmpeg manually and restart this script.
 pause
 exit /b 1
 
@@ -85,7 +82,7 @@ set "PATH=%PATH%;C:\Program Files (x86)\MKVToolNix"
 goto :CHECK_PYTHON
 
 :MANUAL_MKV
-echo [!] Please install MKVToolNix manually and restart this script.
+echo [!] Winget install failed. Please install MKVToolNix manually and restart this script.
 pause
 exit /b 1
 
@@ -122,7 +119,7 @@ set PYTHON_CMD=python
 goto :DO_RESTART
 
 :MANUAL_PYTHON
-echo [!] Winget install failed. Opening download page...
+echo [!] Winget install failed. Opening download page. Please install Python 3.12 (or newer) and restart this script...
 start https://www.python.org/downloads/windows/
 pause
 exit /b 1

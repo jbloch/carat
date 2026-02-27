@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Carat Launcher for macOS
+# Carat Launcher for macOS - inlcudes intaller, which runs to the extent necessary for a successful launch
 # 1. Checks for Homebrew (The "Package Manager")
 # 2. Checks for Dependencies (ffmpeg, mkvmerge, python3)
 # 3. Sets up virtual environment
@@ -13,18 +13,29 @@ echo "[*] CARAT LAUNCHER"
 echo "---------------------------------------------------"
 
 # ---------------------------------------------------------
+# 0. FIX MACOS PATH (APPLE SILICON & INTEL)
+# ---------------------------------------------------------
+# When double-clicked, .command scripts don't always load the full user PATH.
+# This ensures we can find Homebrew if it's installed.
+if [ -x "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+
+# ---------------------------------------------------------
 # 1. CHECK FOR HOMEBREW
 # ---------------------------------------------------------
 if ! command -v brew &>/dev/null; then
-    echo "[!] CRITICAL: Homebrew not found."
+    echo "[!] Homebrew is missing."
     echo ""
     echo "    To run Carat, you need Homebrew (the standard Mac package manager)."
     echo "    1. Go to https://brew.sh"
-    echo "    2. Copy the command on the page"
+    echo "    2. Copy the install command on their page"
     echo "    3. Paste it into this Terminal window and hit Enter"
     echo "    (Note: This may take a few minutes to install Xcode tools)"
     echo ""
-    echo "    Once Homebrew is installed, run this script again."
+    echo "    Once Homebrew is installed, run this Carat script again."
     echo "---------------------------------------------------"
     read -n 1 -s -r -p "Press any key to exit..."
     exit 1
@@ -49,26 +60,34 @@ if ! command -v mkvmerge &>/dev/null; then
     if [ $? -ne 0 ]; then MISSING_TOOLS=1; fi
 fi
 
-# Check MakeMKV (App Location)
-if [ ! -f "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon" ]; then
-    echo "[!] CRITICAL: MakeMKV not found in /Applications."
-    echo "    Please install it from makemkv.com"
-    MISSING_TOOLS=1
-else
-    # Add MakeMKV to PATH for this session
-    export PATH=$PATH:/Applications/MakeMKV.app/Contents/MacOS
-fi
-
 if [ $MISSING_TOOLS -eq 1 ]; then
     echo "---------------------------------------------------"
-    echo "[!] Failed to install dependencies."
-    echo "    Please fix the errors above and run this script again."
+    echo "[!] Failed to install Homebrew dependencies."
+    echo "    Please check your internet connection and try again."
     read -n 1 -s -r -p "Press any key to exit..."
     exit 1
 fi
 
 # ---------------------------------------------------------
-# 3. SETUP PYTHON ENVIRONMENT
+# 3. THE MAKEMKV CONCIERGE
+# ---------------------------------------------------------
+while [ ! -f "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon" ]; do
+    echo ""
+    echo "[*] MakeMKV is not installed in your Applications folder."
+    echo "    Carat requires MakeMKV to read discs."
+    echo "    1. Opening the MakeMKV download page..."
+    open https://www.makemkv.com/download/
+    echo "    2. Download the Mac OS X version."
+    echo "    3. Open the .dmg file and drag MakeMKV to your Applications folder."
+    echo ""
+    read -p "    Press [Enter] here once MakeMKV is in your Applications folder..."
+done
+
+# Add MakeMKV to PATH for this session
+export PATH=$PATH:/Applications/MakeMKV.app/Contents/MacOS
+
+# ---------------------------------------------------------
+# 4. SETUP PYTHON ENVIRONMENT
 # ---------------------------------------------------------
 # We use the Homebrew python3 if system python is missing/old
 if ! command -v python3 &>/dev/null; then
@@ -78,7 +97,6 @@ fi
 
 if [ ! -d ".venv" ]; then
     echo "[*] Creating virtual environment (.venv)..."
-    # Ensure we use the 'python3' we just found/installed
     python3 -m venv .venv
 fi
 
@@ -86,7 +104,7 @@ fi
 source .venv/bin/activate
 
 # ---------------------------------------------------------
-# 4. INSTALL REQUIREMENTS
+# 5. INSTALL REQUIREMENTS
 # ---------------------------------------------------------
 if [ ! -f ".venv/installed.marker" ]; then
     echo "[*] Installing Python libraries..."
@@ -101,13 +119,12 @@ if [ ! -f ".venv/installed.marker" ]; then
 fi
 
 # ---------------------------------------------------------
-# 5. LAUNCH GUI
+# 6. LAUNCH GUI
 # ---------------------------------------------------------
 echo "[*] Launching Carat..."
 
 # Launch in background, suppressing output
-# nohup allows the terminal to close without killing the app
 nohup python src/carat_gui.py >/dev/null 2>&1 &
 
-# Close the terminal window automatically
-osascript -e 'tell application "Terminal" to close front window' & exit
+# Exit gracefully
+exit 0
