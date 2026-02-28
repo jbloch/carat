@@ -71,11 +71,11 @@ class CaratGUI:
         # User our neat logo as this app's icon, unless it's not there, in which case oh well...
         try:
             script_dir = Path(__file__).resolve().parent
-            logo_path = str(script_dir / 'assets' / 'carat_logo.png')
-            img_icon = tk.PhotoImage(file=logo_path)
+            icon_path = str(script_dir / 'assets' / 'carat_logo_icon.png')
+            img_icon = tk.PhotoImage(file=icon_path)
             self.parent.iconphoto(False, img_icon)
         except tk.TclError as e:
-            logger.emit(f"[!] logo missing, falling back to default icon: {e}")
+            logger.emit(f"[!] logo icon missing, falling back to default icon: {e}")
 
         # Load config first so we can use it in UI init
         self.config = self._load_config()
