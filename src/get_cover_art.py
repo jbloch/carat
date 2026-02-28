@@ -96,7 +96,7 @@ def get_mb_art_url_from_releases(releases)-> str | None:
             full_release = mb.get_release_by_id(mb_id)
             status = full_release['release'].get('cover-art-archive', {})
 
-            if status.get('artwork') == 'true':
+            if str(status.get('artwork')).lower() == 'true':
                 logger.emit(f"  [+] Found CAA art for: {mb_id}")
                 caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}").json()
                 for img_entry in caa_data['images']:
