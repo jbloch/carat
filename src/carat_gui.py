@@ -43,7 +43,7 @@ class CaratGUI:
                     self.progress_queue.put(val)
                 except ValueError:
                     pass
-            elif "Remuxing:" in msg and "[" in msg and "%]" in msg:
+            elif ("Remuxing:" in msg or "Merging:" in msg) and "[" in msg and "%]" in msg:
                 try:
                     start = msg.find("[") + 1
                     end = msg.find("%]")
@@ -56,7 +56,6 @@ class CaratGUI:
             if "Success: Saved" in msg and "cover to" in msg:
                 try:
                     # Extract the path from the end of the log message
-                    # Msg: "[+] Success: Saved 1200x1200 cover to /path/to/cover.jpg"
                     path_str = msg.split("cover to")[1].strip()
                     self.art_queue.put(path_str)
                 except IndexError:
@@ -346,11 +345,16 @@ class CaratGUI:
                 self.btn_rip.config(text="Remuxing in Progress...")
 
             # If we DO have a percentage (bracket style), ensure we stay Determinate
-            elif "Remuxing" in msg and "[" in msg and "%]" in msg:
+            # --- PATCH: Also catch "Merging" for mkvmerge ---
+            elif ("Remuxing" in msg or "Merging" in msg) and "[" in msg and "%]" in msg:
                 if self.progress_bar.cget("mode") != "determinate":
                     self.progress_bar.stop()
                     self.progress_bar.config(mode="determinate")
-                self.btn_rip.config(text="Remuxing in Progress")
+
+                if "Merging" in msg:
+                    self.btn_rip.config(text="Merging Audio Files...")
+                else:
+                    self.btn_rip.config(text="Remuxing in Progress")
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())

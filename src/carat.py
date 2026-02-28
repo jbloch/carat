@@ -126,6 +126,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
                         logger.emit(f"    Atmos Extraction: {pct:.1f}%", is_progress=True)
             except (IndexError, ValueError):
                 pass
+
         env["last_was_progress"] = True
         return
 
@@ -151,7 +152,20 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
         env["last_was_progress"] = True
         return
 
-    # [3] Normal Output
+    # [3] mkvmerge Progress
+    elif line.startswith("Progress:"):
+        try:
+            # mkvmerge outputs lines look like "Progress: 14%"
+            pct_str = line.replace("Progress:", "").replace("%", "").strip()
+            pct = float(pct_str)
+            logger.emit(f"Merging: [{pct:.1f}%]", is_progress=True)
+        except ValueError:
+            pass
+
+        env["last_was_progress"] = True
+        return
+
+    # [4] Normal Output
     else:
         msg = _parse_makemkv_msg(line)
         if msg:
