@@ -180,6 +180,10 @@ def download_cover_art(artist: str, album: str, target_dir: Path) -> None:
         img_data = requests.get(image_url).content
         img = Image.open(BytesIO(img_data))
 
+        # Strip transparency layer if present, as it would cause Pillow to crash on jpeg conversion
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
         # Save as high-quality JPEG for Kodi
         save_path = target_dir / "cover.jpg"
         img.save(save_path, "JPEG", quality=95)
