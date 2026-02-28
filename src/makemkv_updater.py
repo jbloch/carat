@@ -24,7 +24,7 @@ __version__ = "1.0B"
 ROOT_DIR: str = str(Path(__file__).resolve().parent.parent)
 CONFIG_FILE: str = str(Path(ROOT_DIR) / ".carat_config.json")
 
-# 30 days in seconds (half the lifetime of a MakeMKV trial key
+# 30 days in seconds (half the lifetime of a MakeMKV trial key)
 REFRESH_INTERVAL: int = 30 * 24 * 60 * 60
 
 
