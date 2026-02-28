@@ -312,7 +312,10 @@ class CaratGUI:
         new_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png")])
         if new_path:
             try:
-                shutil.copy(new_path, self.current_cover_path)
+                img = Image.open(new_path)
+                if img.mode in ("RGBA", "P"):
+                    img = img.convert("RGB")
+                img.save(self.current_cover_path, "JPEG", quality=95)
                 self._display_cover(self.current_cover_path)
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to update cover: {e}")
@@ -342,7 +345,7 @@ class CaratGUI:
             if "Remuxing" in msg and "%" not in msg and self.progress_bar.cget("mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
                 self.progress_bar.start(15)
-                self.btn_rip.config(text="Remuxing in Progress...")
+                self.btn_rip.config(text="Remuxing...")
 
             # If we DO have a percentage (bracket style), ensure we stay Determinate
             # --- PATCH: Also catch "Merging" for mkvmerge ---
@@ -354,7 +357,7 @@ class CaratGUI:
                 if "Merging" in msg:
                     self.btn_rip.config(text="Merging Audio Files...")
                 else:
-                    self.btn_rip.config(text="Remuxing in Progress")
+                    self.btn_rip.config(text="Remuxing...")
 
         while not self.art_queue.empty():
             self._display_cover(self.art_queue.get_nowait())
