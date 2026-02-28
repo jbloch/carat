@@ -126,5 +126,8 @@ echo "[*] Launching Carat..."
 # Launch in background, suppressing output
 nohup python src/carat_gui.py >/dev/null 2>&1 &
 
-# Exit gracefully
+# Force Terminal.app to close the active window, ignoring errors
+# (in case they somehow launched this from iTerm2)
+osascript -e 'tell application "Terminal" to close front window' >/dev/null 2>&1 &
+
 exit 0
