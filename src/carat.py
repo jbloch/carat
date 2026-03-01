@@ -401,25 +401,39 @@ def rip_stream_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
     return winner
 
 
-def find_truehd_stream(mkv_path: Path) -> int | None:
+def find_atmos_stream(mkv_path: Path) -> int | None:
     """
-    Returns the index of the TrueHD stream with the most channels from the given mkv file, or None if no TrueHD streams
-    are found in the file.
+    Returns the index of the highest quality Atmos stream TrueHD (lossless) prioritized over EAC3 (lossy).
+    from the given mkv file, or None if neither are found. Emits a warning if we have to settle for EAC3.
     """
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
-    res = run_command(cmd, "Scanning for TrueHD Stream")
+    res = run_command(cmd, "Scanning for Atmos Stream")
     try:
         streams = json.loads(res).get('streams', [])
-        candidates = [s for s in streams if s.get('codec_name') == 'truehd']
-        return int(max(candidates, key=lambda x: int(x.get('channels', 0)))['index']) if candidates else None
+
+        # 1. Try to find Lossless TrueHD first
+        truehd_candidates = [s for s in streams if s.get('codec_name') == 'truehd']
+        if truehd_candidates:
+            return int(max(truehd_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+
+        # 2. Fall back to Lossy E-AC-3
+        eac3_candidates = [s for s in streams if s.get('codec_name') == 'eac3']
+        if eac3_candidates:
+            # Universal warning for all input formats
+            logger.emit("[!] ========================================================")
+            logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3.")
+            logger.emit("[!] ========================================================")
+            return int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+
+        return None
     except json.JSONDecodeError:
         return None
 
 
 def remux_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str, total_duration: float = 0) -> None:
     """Remuxes the specified mkv file into a chapterless m4a file"""
-    idx = find_truehd_stream(mkv_path)
+    idx = find_atmos_stream(mkv_path)
     if idx is None: raise ValueError("No TrueHD stream found.")
 
     cmd = [
@@ -455,7 +469,7 @@ def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int) -> t
     try:
         rg_res = mb.search_release_groups(artist=artist, release=album)
         for rg in rg_res.get('release-group-list', [])[:MAX_RELEASE_GROUPS]:
-            rel_res = mb.browse_releases(release_group=rg['id'], includes=["recordings"])
+            rel_res = mb.browse_releases(release_group=rg['id'], includes=["recordings"], limit=100)
             for r in rel_res.get('release-list', []):
                 if r.get('status') == 'Official':
                     all_tracks = []
@@ -480,9 +494,18 @@ def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path) -> Path:
         raise FileNotFoundError("No valid media files (MKV, MKA, M4A, MP4) found in source folder.")
 
     out = ssd_path / "master.mkv"
-    cmd = [TOOLS.MKVMERGE, "--priority", "lower", "-o", str(out)]
 
+    # Global options: Output file and chapter generation strategy
+    cmd = [
+        TOOLS.MKVMERGE,
+        "--priority", "lower",
+        "-o", str(out),
+        "--generate-chapters", "when-appending"
+    ]
+
+    # Input options: Strip existing chapters from every incoming file, then append
     for i, f in enumerate(files):
+        cmd.append("--no-chapters")
         cmd.append(str(f) if i == 0 else f"+{str(f)}")
 
     # Simple blind append logic for IAA
