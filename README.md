@@ -10,7 +10,7 @@
 
 Carat is a lightweight, automated GUI utility designed to accept Dolby Atmos music releases from practically any format and incorporate them directly into your digital music library in a single click. 
 
-From the moment a new Blu-ray arrives in your mailbox, Carat handles the entire pipeline—extraction, processing, metadata acquisition, and cover art—with zero friction. If your source files are already on your SSD, Carat will process an entire release in under a minute (depending on the speed of your computer). If you are starting from a physical disc, the time is limited by the read speed of your optical drive.
+From the moment a new Blu-ray arrives in your mailbox, Carat handles the entire pipeline—extraction, processing, metadata acquisition, and cover art—with zero friction. If your source files are already on your SSD, Carat will process an entire release in a minute or two (depending on the speed of your computer). If you are starting from a physical disc, the time is limited by the read speed of your optical drive.
 
 <div align="center">
   <img src="docs/carat_screenshot.png" alt="Carat screenshot: Frank Zappa remux in progress" width="600"/>

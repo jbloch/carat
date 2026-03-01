@@ -1,0 +1,14 @@
+# This nasty little file is necessary to make the launcher (carat.bat) work properly on Windows. Without it,
+# the goto labels are not recognized, and the launcher crashes hard when it runs, if the release was built on a Mac,
+# which is necessary to make the mac launcher executable (due to deficiencies in the Windows file system).
+# Isn't software fun?
+
+# Default behavior: normalize line endings to LF in the repo, check out as LF
+* text=auto eol=lf
+
+# Force Windows batch scripts to ALWAYS check out with CRLF (\r\n)
+*.bat text eol=crlf
+
+# Force macOS/Linux scripts to ALWAYS check out with LF (\n)
+*.command text eol=lf
+*.sh text eol=lf

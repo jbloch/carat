@@ -1,6 +1,18 @@
 @echo off
 REM Carat Launcher - inlcudes intaller, which runs to the extent necessary for a successful launch
-REM 2. Uses Winget for native, silent dependency installation where possible
+REM Uses Winget for native, silent dependency installation where possible
+
+REM Prevent the window from closing instantly if a fatal syntax error occurs, so the user can debug (or report) it
+if "%~1"=="__RESTARTED__" goto :MAIN
+cmd /c "%~f0" __RESTARTED__ %*
+if %errorlevel% neq 0 (
+    echo.
+    echo [!] The script crashed unexpectedly. Press any key to close this window.
+    pause
+)
+exit /b %errorlevel%
+:MAIN
+shift
 
 REM ----------------------------------------------------
 REM 0. FIX NETWORK/UNC PATHS
@@ -138,11 +150,6 @@ for /f "usebackq tokens=2,*" %%A in (`reg query "HKCU\Environment" /v Path`) do 
 REM Combine them and set the current session's PATH
 set "PATH=%SysPath%;%UsrPath%"
 echo [*] Environment refreshed successfully!
-
-:FOUND_PYTHON
-REM ----------------------------------------------------
-REM 6. SETUP VIRTUAL ENVIRONMENT
-REM ----------------------------------------------------
 
 :FOUND_PYTHON
 REM ----------------------------------------------------
