@@ -108,7 +108,7 @@ source .venv/bin/activate
 # ---------------------------------------------------------
 if [ ! -f ".venv/installed.marker" ]; then
     echo "[*] Installing Python libraries..."
-    pip install -q -r requirements.txt
+    pip3 install -q -r requirements.txt
     if [ $? -eq 0 ]; then
         touch .venv/installed.marker
     else
@@ -124,7 +124,7 @@ fi
 echo "[*] Launching Carat..."
 
 # Launch in background, suppressing output
-nohup python src/carat_gui.py >/dev/null 2>&1 &
+nohup python3 src/carat_gui.py >/dev/null 2>&1 &
 
 # Force Terminal.app to close the active window, ignoring errors
 # (in case they somehow launched this from iTerm2)
