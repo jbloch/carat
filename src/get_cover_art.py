@@ -62,15 +62,18 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
     return False, 0, 0
 
 
-def get_mb_digital_art_url(artist: str, album: str) -> str | None:
+def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> str | None:
     """ Returns the URL of acceptable album art from MusicBrainz, or None if not found. """
     logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...")
     image_url = None
     try:
-        release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
-        if release_groups['release-group-count'] == 0: return None
+        if mbid:
+            rg_id = mbid
+        else:
+            release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
+            if release_groups['release-group-count'] == 0: return None
+            rg_id = release_groups['release-group-list'][0]['id']
 
-        rg_id = release_groups['release-group-list'][0]['id']
         releases = mb.get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
 
         # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
@@ -113,7 +116,7 @@ def get_mb_art_url_from_releases(releases)-> str | None:
     return None
 
 
-def _normalize_for_fuzzy_comparison(s: str) -> str:
+def normalize_for_fuzzy_comparison(s: str) -> str:
     """
     Robust normalization for fuzzy matching.
         1. Normalizes Unicode (NFKD) to decompose diacritics and fix full-width chars.
@@ -147,12 +150,12 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
         r = requests.get(url, params=params).json()
         results = r.get('results', [])
 
-        target_album = _normalize_for_fuzzy_comparison(album)
-        target_artist = _normalize_for_fuzzy_comparison(artist)
+        target_album = normalize_for_fuzzy_comparison(album)
+        target_artist = normalize_for_fuzzy_comparison(artist)
 
         for res in results:
-            retrieved_album = _normalize_for_fuzzy_comparison(res.get('collectionName', ''))
-            retrieved_artist = _normalize_for_fuzzy_comparison(res.get('artistName', ''))
+            retrieved_album = normalize_for_fuzzy_comparison(res.get('collectionName', ''))
+            retrieved_artist = normalize_for_fuzzy_comparison(res.get('artistName', ''))
 
             # Fuzzy Match: check if the target's normalized string is inside the candidate's normalized string
             # The fuzzy match is necessary because Apple and MusicBrainz can disagree on names
@@ -169,11 +172,12 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
     return None
 
 
-def download_cover_art(artist: str, album: str, target_dir: Path) -> None:
+def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | None = None) -> None:
     """
     Downloads the "best" available cover art for the specified release (or does nothing if no acceptable art found).
     """
-    image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album)
+    # Apple's API is still our first choice for high-res art, but MB acts as the precise fallback
+    image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album, mbid)
 
     if image_url:
         logger.emit(f"[*] Downloading: {image_url}")

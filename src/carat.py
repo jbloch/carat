@@ -15,9 +15,12 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B"
 
+__all__ = ['rip_album_to_library']
+
 import argparse
 import atexit
 import concurrent.futures
+import difflib
 import json
 import os
 import platform
@@ -28,17 +31,19 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
+import musicbrainzngs
 import musicbrainzngs as mb
 
 import get_cover_art
 import logger
-
-__all__ = ['rip_album_to_library']
-
 import makemkv_updater
+# noinspection PyProtectedMember
+from get_cover_art import normalize_for_fuzzy_comparison
 
 
 # --- (1) Metadata & Utils ---
@@ -53,7 +58,7 @@ def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: lis
     with cue_path.open('w', encoding='utf-8') as f:
         f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
-            title = mb_tracks[i]['recording']['title'] if i < len(mb_tracks) else f"Track {i + 1}"
+            title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
 
 
@@ -237,13 +242,17 @@ def emit_summary_log(entire_log: list[Any], start_time: float):
 
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
-def find_primary_title(source_spec: str) -> str:
-    """Identifies the main Atmos title in the specified source. Throws exception if no Atmos stream is found."""
-    res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
-                      "Surgical Atmos Scan")
+@dataclass
+class TitleInfo:
+    """Holds the parsed MakeMKV state for a single title."""
+    score: int = 0
+    chapters: int = 0
+    size: int = 0
 
-    title_scores = {}
-    title_chapters = {}
+
+def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
+    """Parses the raw text output of 'makemkvcon info' into a dictionary of TitleInfo objects."""
+    titles = defaultdict(TitleInfo)
 
     for line in res.splitlines():
         parts = line.split(",")
@@ -254,31 +263,126 @@ def find_primary_title(source_spec: str) -> str:
         except IndexError:
             continue
 
-        if line.startswith("TINFO:") and parts[1] == "9" and parts[2] == "4":
-            title_chapters[t_idx] = int(parts[3].strip('"'))
-            title_scores.setdefault(t_idx, 0)
+        # MakeMKV TINFO Format: TINFO:title_idx,attribute_id,code,"value"
+        if line.startswith("TINFO:"):
+            attr_id = parts[1]
+            code = parts[2]
 
+            if code == "0":
+                if attr_id == "8":
+                    titles[t_idx].chapters = int(parts[3].strip('"'))
+                elif attr_id == "11":
+                    titles[t_idx].size = int(parts[3].strip('"'))
+
+        # MakeMKV SINFO Format: SINFO:title_idx,stream_idx,attribute_id,code,"value"
         if line.startswith("SINFO:"):
             if "A_TRUEHD" in line or "TrueHD Atmos" in line:
-                title_scores[t_idx] = max(title_scores.get(t_idx, 0), 1000)
+                titles[t_idx].score = max(titles[t_idx].score, 1000)
                 logger.emit(f"    [*] Title {t_idx}: Found Lossless Atmos (+1000)")
             elif "A_EAC3" in line and "Atmos" in line:
-                title_scores[t_idx] = max(title_scores.get(t_idx, 0), 500)
+                titles[t_idx].score = max(titles[t_idx].score, 500)
                 logger.emit(f"    [*] Title {t_idx}: Found Lossy Atmos (+500)")
 
-    if not title_scores:
-        raise RuntimeError("No valid titles found on source.")
+    return titles
 
-    winner = max(title_scores, key=lambda k: (title_scores[k], title_chapters.get(k, 0)))
-    winning_score = title_scores[winner]
 
-    logger.emit(f"[*] Scan Results: {json.dumps(title_scores)}")
+def get_best_mb_candidate(chapter_count: int, candidates: list[dict]) -> dict | None:
+    """
+    Finds the best MusicBrainz candidate for a given number of chapters.
+    Filters for exact matches or +1 preamble matches, prioritizing exact matches.
+    """
+    if not candidates:
+        return None
 
-    if winning_score < 500:
-        raise RuntimeError(f"Atmos or Die: Best title ({winner}) has score {winning_score}. No Atmos track found.")
+    # Filter for valid matches (exact or +1 preamble)
+    matched = [c for c in candidates if 0 <= (chapter_count - len(c['tracks'])) <= 1]
 
-    logger.emit(f"[*] Winner: Title {winner} (Score: {winning_score})")
-    return winner
+    if matched:
+        # Sort so exact matches (diff=0) win.
+        # Python's stable sort automatically preserves the original MB relevance rank for ties!
+        matched.sort(key=lambda c: chapter_count - len(c['tracks']))
+        return matched[0]
+
+    return None
+
+
+def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, dict | None]:
+    """
+    Identifies the (likely) main Atmos title by "intersecting" MakeMKV and MusicBrainz metadata.
+    Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
+
+    Returns:
+        A tuple containing:
+        - winner_idx (str): The MakeMKV title index of the correct Atmos track (e.g., "0").
+        - matched_candidate (dict | None): The exact MusicBrainz metadata dictionary that validated
+          the winning title, or None if the network fetch failed/timed out.
+    """
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
+        # 1. Fire off the network fetch in the background
+        candidates_future = prefetch_ex.submit(fetch_candidate_metadata, artist, album)
+
+        # 2. Scan input using MakeMKV locally (runs concurrently with the fetch)
+        res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
+                          "Surgical Atmos Scan")
+        titles = parse_makemkv_info(res)
+        if not any(info.score > 0 for info in titles.values()):
+            raise RuntimeError("No valid Atmos titles found on source.")
+
+        # 3. Synchronize: Grab the results of the background fetch
+        candidates = []
+        try:
+            candidates = candidates_future.result(timeout=10) or []
+        except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
+            logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
+
+    # Find all Atmos input titles with the same track count as a candidate MusicBrainz releases
+    if candidates:
+        valid_titles = []
+        for t_idx, info in titles.items():
+            if info.score <= 0:
+                logger.emit(f"    [-] Rejected Title {t_idx} (No Atmos stream detected)")
+                continue
+            best_candidate = get_best_mb_candidate(info.chapters, candidates)
+
+            # Keep the title if it matched a candidate, OR if MB is entirely offline
+            if best_candidate or not candidates:
+                valid_titles.append((t_idx, best_candidate))
+    else:
+        # Graceful degradation if MB is down/offline
+        valid_titles = [(t_idx, None) for t_idx, info in titles.items() if info.score > 0]
+    if not valid_titles:
+        raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
+
+    # noinspection PyShadowingNames
+    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int]:
+        """Sort criterion to rank multiple matches: (MB Relevance Rank, track-count difference, -Size)"""
+        t_idx, matched_candidate = item
+
+        # 1. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
+        rank = candidates.index(matched_candidate) if matched_candidate in candidates else 999
+
+        # 2. Track-count accuracy: How close is the physical chapter count to the logical track count? (0 or 1)
+        diff = abs(titles[t_idx].chapters - len(matched_candidate['tracks'])) if matched_candidate else 0
+
+        # 3. Size: Negated so that larger files sort first when using min()
+        size = titles[t_idx].size
+
+        return rank, diff, -size
+
+    logger.emit("[*] Evaluated Heuristic Scores (MusicBrainz Rank, Track Count Accuracy, File Size):")
+    for vt in valid_titles:
+        rank, diff, neg_size = sort_key(vt)
+        logger.emit(f"    [-] Title {vt[0]}: MB Rank={rank}, Track Count Δ={diff}, Size={-neg_size} bytes")
+
+    # Pick the winner that scores lowest (best) across the 3-tier hierarchy
+    winner_tuple = min(valid_titles, key=sort_key)
+    winner_idx = winner_tuple[0]
+    matched_candidate = winner_tuple[1]
+
+    w_rank, w_diff, w_neg_size = sort_key(winner_tuple)
+    logger.emit(f"[*] Winner: Title {winner_idx} (Rank: {w_rank}, Track count Δ: {w_diff}, Size: {-w_neg_size} bytes, Score: {titles[winner_idx].score})")
+
+    return winner_idx, matched_candidate
 
 
 # --- (4) Toolset & Main ---
@@ -385,26 +489,34 @@ def init(fatal_error_handler: Callable[[str], None] | None = None) -> None:
 mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
 
 
-def rip_stream_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
-    """Rips the indexed stream of the longest title in the specified source to the specified output mkv file."""
+def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
+    """Rips the specified title from the source into a single MKV container file."""
     # Force a strict, absolute path to prevent MakeMKV from mixing slashes and backslashes on Windows
     clean_output_path = str(out_path.resolve())
     cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", src_spec, title_idx, clean_output_path, "--minlength=600"]
+
+    start_time = time.time()
     run_command(cmd, f"Ripping Title {title_idx}")
+    elapsed = time.time() - start_time
 
     mkv_files = list(out_path.glob("*.mkv"))
-    if not mkv_files: raise RuntimeError("MakeMKV produced no output.")
+    if not mkv_files:
+        raise RuntimeError("MakeMKV produced no output.")
+    if len(mkv_files) > 1:
+        # This shouldn't happen in a clean temp dir, but it's good to know if it does!
+        logger.emit(f"[!] Warning: MakeMKV produced {len(mkv_files)} files. Using the first one.")
+    winner = mkv_files[0]
 
-    winner = max(mkv_files, key=lambda x: x.stat().st_size)
-    for f in mkv_files:
-        if f != winner: f.unlink()
+    size_mb = winner.stat().st_size / (1024 * 1024)
+    logger.emit(f"[+] Title extraction complete: {size_mb:.1f} MB in {elapsed:.1f} seconds (Avg: {size_mb / elapsed:.1f} MB/s)")
+
     return winner
 
 
 def find_atmos_stream(mkv_path: Path) -> int | None:
     """
-    Returns the index of the highest quality Atmos stream TrueHD (lossless) prioritized over EAC3 (lossy).
-    from the given mkv file, or None if neither are found. Emits a warning if we have to settle for EAC3.
+    Returns the index of the highest quality Atmos stream, with TrueHD (lossless) prioritized over EAC3-JOC (lossy),
+    from the given mkv file, or None if neither are found. Emits a warning if we have to settle for EAC3-JOC.
     """
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
@@ -417,13 +529,13 @@ def find_atmos_stream(mkv_path: Path) -> int | None:
         if truehd_candidates:
             return int(max(truehd_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
-        # 2. Fall back to Lossy E-AC-3
+        # 2. Fall back to Lossy E-AC-3-JOC
         eac3_candidates = [s for s in streams if s.get('codec_name') == 'eac3']
         if eac3_candidates:
             # Universal warning for all input formats
-            logger.emit("[!] ========================================================")
-            logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3.")
-            logger.emit("[!] ========================================================")
+            logger.emit("[!] =========================================================")
+            logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC.")
+            logger.emit("[!] =========================================================")
             return int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
         return None
@@ -464,22 +576,88 @@ def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], 
 MAX_RELEASE_GROUPS: int = 5
 
 
-def get_metadata_from_musicbrainz(album: str, artist: str, num_tracks: int) -> tuple[dict | None, list | None]:
-    """Returns a metadata dictionary for the given release from MusicBrainz, or None if no matching release is found."""
+def _is_safe_match(expected: str, found: str) -> bool:
+    """
+    Compares two strings for similarity after stripping all spaces and punctuation.
+    Prevents false negatives from stylized acronyms (e.g., 'REM' vs. 'R.E.M.') while
+    guarding against completely mismatched albums.
+    """
+    safe_expected = normalize_for_fuzzy_comparison(expected).replace(" ", "")
+    safe_found = normalize_for_fuzzy_comparison(found).replace(" ", "")
+
+    ratio = difflib.SequenceMatcher(None, safe_expected, safe_found).ratio()
+    return ratio > 0.7
+
+
+def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
+    """
+    Fetches candidates from MusicBrainz, filtering out releases that don't match
+    the requested artist and album name using a fuzzy similarity guardrail.
+    """
+    candidates = []
+    logger.emit(f"[*] Fetching MusicBrainz candidates for: {artist} - {album}")
+
     try:
-        rg_res = mb.search_release_groups(artist=artist, release=album)
-        for rg in rg_res.get('release-group-list', [])[:MAX_RELEASE_GROUPS]:
-            rel_res = mb.browse_releases(release_group=rg['id'], includes=["recordings"], limit=100)
-            for r in rel_res.get('release-list', []):
-                if r.get('status') == 'Official':
-                    all_tracks = []
-                    for m in r.get('medium-list', []): all_tracks.extend(m.get('track-list', []))
-                    if len(all_tracks) == num_tracks:
-                        return {'title': rg['title'], 'artist': rg.get('artist-credit-phrase', artist),
-                                'year': r.get('date', 'Unknown')[:4]}, all_tracks
-    except (mb.MusicBrainzError, KeyError, TypeError):
-        pass
-    return None, None
+        # 1. Search for the Release Group
+        query = f'artist:"{artist}" AND release:"{album}"'
+        res = musicbrainzngs.search_release_groups(query=query, limit=5)
+
+        if not res.get('release-group-list'):
+            logger.emit("    [-] No release groups found.")
+            return []
+
+        # 2. Filter & Fetch Tracks
+        for rg in res['release-group-list']:
+            found_artist = rg['artist-credit'][0]['artist']['name']
+            found_album = rg['title']
+
+            # Guardrail: Prevent wildly incorrect matches
+            if not (_is_safe_match(artist, found_artist) and _is_safe_match(album, found_album)):
+                logger.emit(
+                    f"    [-] Rejected MB Candidate: {found_artist} - {found_album} (Failed similarity guardrail)")
+                continue
+
+            logger.emit(f"    [+] Evaluating MB Candidate: {found_artist} - {found_album}")
+
+            # Fetch releases for this group to get tracklists
+            rg_info = musicbrainzngs.get_release_group_by_id(rg['id'], includes=['releases'])
+            releases = rg_info.get('release-group', {}).get('release-list', [])
+
+            if not releases: continue
+
+            # Grab the tracklist for the first release in the group
+            release_id = releases[0]['id']
+            rel_info = musicbrainzngs.get_release_by_id(release_id, includes=['recordings'])
+
+            all_tracks = []
+            for medium in rel_info.get('release', {}).get('medium-list', []):
+                for track in medium.get('track-list', []):
+                    all_tracks.append({
+                        'title': track.get('recording', {}).get('title', 'Unknown Track'),
+                        'duration': track.get('recording', {}).get('length', 0)
+                    })
+
+            if all_tracks:
+                candidates.append({
+                    'title': found_album,
+                    'artist': found_artist,
+                    'year': rg.get('first-release-date', '')[:4] or 'Unknown',
+                    'mbid': rg['id'],
+                    'tracks': all_tracks
+                })
+
+    except musicbrainzngs.WebServiceError as e:
+        logger.emit(f"    [!] MusicBrainz API Error: {e}")
+    except Exception as e:
+        logger.emit(f"    [!] Unexpected error fetching from MusicBrainz: {e}")
+
+    if candidates:
+        counts = {len(c['tracks']) for c in candidates}
+        logger.emit(f"    [+] Found valid MB candidates with track counts: {counts}")
+    else:
+        logger.emit("    [-] No valid candidates found after filtering.")
+
+    return candidates
 
 
 def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path) -> Path:
@@ -584,6 +762,54 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             pass # Silent failure for cleanup to prevent app startup crashes
 
 
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> tuple[
+    Path, dict[str, Any] | None, list[dict[str, Any]], float]:
+    """
+    Acquires the master MKV file, extracts its chapters/duration, and fetches the matching MusicBrainz metadata.
+    """
+    src_p = Path(src_path)
+    source_spec = None
+
+    # 1. Identify Source Type and Resolve source_spec
+    try:
+        drive_idx = int(src_path)
+        if drive_idx == -1:
+            res = run_command([TOOLS.MAKEMKV, "-r", "info", "disc:0"])
+            if "BD-RE" in res or "BD-ROM" in res: drive_idx = 0
+        source_spec = f"disc:{drive_idx}"
+    except (ValueError, TypeError):
+        if src_p.suffix.lower() == ".iso":
+            source_spec = f"iso:{src_p.resolve()}"
+        elif src_p.is_dir() and (src_p / "BDMV").exists():
+            source_spec = f"file:{src_p.resolve() / 'BDMV'}"
+
+    # 2. Execute Source-Specific Acquisition
+    if source_spec:
+        # --- Handle MakeMKV Supported Formats: Blu-ray, Blu-ray iso, and BDMV folder ---
+        title_idx, matched_candidate = find_primary_title(source_spec, artist, album)
+        atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
+        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
+    else:
+        # --- Handle other formats ---
+        if src_p.is_dir(): # Folder of mkv or mp4 files (IAA)
+            atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR)
+        else:              # Single MKV file (Headphone Dust)
+            atmos_mkv = src_p.resolve()
+            if not atmos_mkv.exists():
+                raise FileNotFoundError(f"Not found: {src_path}")
+
+        # Intersect local MKV chapters with MusicBrainz candidates
+        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
+        candidates = fetch_candidate_metadata(artist, album)
+        matched_candidate = get_best_mb_candidate(len(chapters), candidates)
+
+        # Fallback: if no strict match was found but we HAVE candidates, just blindly trust the top result
+        if not matched_candidate and candidates:
+            matched_candidate = candidates[0]
+
+    return atmos_mkv, matched_candidate, chapters, duration
+
+
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str) -> None:
     """
     Rips the Atmos stream representing the main title in the specified source into the music library with the
@@ -607,60 +833,25 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
       3. CUE sheets are generated for gapless playback support
       4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible
     """
-    # 1. Fail Fast: Ensure we can actually write to the library before we start ripping
+
     lib_path = Path(library_root)
     _ensure_writable(lib_path)
-
-    # 2. Prepare Temp Directory
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        try:
-            # --- CASE A: Physical Disc (Integer Input) ---
-            drive_idx = int(src_path)
-            if drive_idx == -1:
-                res = run_command([TOOLS.MAKEMKV, "-r", "info", "disc:0"])
-                if "BD-RE" in res or "BD-ROM" in res: drive_idx = 0
+        # 1. MKV Acquisition Phase
+        atmos_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album)
 
-            source_spec = f"disc:{drive_idx}"
-            title_idx = find_primary_title(source_spec)
-            atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
+        # 2. Canonicalization & Sanitization of artist and album title
+        info = matched_candidate or {}
+        tracks = info.get('tracks', [])
+        mbid = info.get('mbid')
 
-        except (ValueError, TypeError):
-            # Input is not an integer; handle as Path
-            src_p = Path(src_path)
-
-            # --- CASE B: ISO Image ---
-            if src_p.suffix.lower() == ".iso":
-                source_spec = f"iso:{src_p.resolve()}"
-                title_idx = find_primary_title(source_spec)
-                atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
-
-            # --- CASE C: BDMV Folder ---
-            elif src_p.is_dir() and (src_p / "BDMV").exists():
-                source_spec = f"file:{src_p.resolve() / 'BDMV'}"
-                title_idx = find_primary_title(source_spec)
-                atmos_mkv = rip_stream_to_mkv(source_spec, TMP_DIR, title_idx)
-
-            # --- CASE D: Folder of Files (IAA) ---
-            elif src_p.is_dir():
-                atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR)
-
-            # --- CASE E: Direct MKV ---
-            else:
-                atmos_mkv = src_p.resolve()
-                if not atmos_mkv.exists(): raise FileNotFoundError(f"Not found: {src_path}")
-
-        # 3. Post-Rip Processing & Metadata Fetch
-        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
-        info, tracks = get_metadata_from_musicbrainz(album, artist, len(chapters))
-        if info:
-            # Canonicalize! Use the official MB names.
-            artist = info['artist']
-            album = info['title']
+        if matched_candidate:
+            artist = info.get('artist', artist)
+            album = info.get('title', album)
             logger.emit(f"[*] Canonicalized as Artist: {artist}, Album: {album}")
         else:
-            # Fallback to user input if MB fails
             logger.emit(f"[*] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
             info = {'artist': artist, 'title': album, 'year': 'Unknown'}
 
@@ -668,17 +859,15 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         clean_album = _sanitize_filename(album)
         logger.emit(f"[*] Sanitized as Artist: {artist}, Album: {album}")
 
-        # 4. Create Final Directory (Now that we have the clean name)
         target = lib_path / clean_artist / f"{clean_album} (Atmos)"
         target.mkdir(parents=True, exist_ok=True)
 
-        # 5. Final Assembly (Concurrent)
+        # 3. Final Assembly (Concurrent)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            # Pass the (possibly updated) artist/album to cover art search
-            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target)
+            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target, mbid)
 
             generate_cue_sheet(target / f"{clean_album} (Atmos).cue",
-                               f"{clean_album} (Atmos).m4a", info, chapters, tracks or [])
+                               f"{clean_album} (Atmos).m4a", info, chapters, tracks)
             remux_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album, duration)
 
             try:
