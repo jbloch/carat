@@ -86,13 +86,13 @@ def _sanitize_filename(name: str) -> str:
     name = name.replace(":", " -")
 
     # Zap standard illegal characters
-    return re.sub(r'[\\/*?"<>|]', '_', name).strip()
+    name = re.sub(r'[\\/*?"<>|]', '_', name).strip()
 
     # Strip all leading and trailing underscores
-    clean_name = name.strip('_')
+    name = name.strip('_')
 
     # Fallback to a single underscore if the entire string was stripped away
-    return clean_name if clean_name else "_"
+    return name if name else "_"
 
 
 def _ensure_writable(path: Path) -> None:
