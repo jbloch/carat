@@ -84,8 +84,15 @@ def _sanitize_filename(name: str) -> str:
     """
     # specific replacement for colons to make "Title: Subtitle" look nice
     name = name.replace(":", " -")
+
     # Zap standard illegal characters
     return re.sub(r'[\\/*?"<>|]', '_', name).strip()
+
+    # Strip all leading and trailing underscores
+    clean_name = name.strip('_')
+
+    # Fallback to a single underscore if the entire string was stripped away
+    return clean_name if clean_name else "_"
 
 
 def _ensure_writable(path: Path) -> None:
@@ -848,17 +855,20 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         mbid = info.get('mbid')
 
         if matched_candidate:
-            artist = info.get('artist', artist)
-            album = info.get('title', album)
-            logger.emit(f"[*] Canonicalized as Artist: {artist}, Album: {album}")
+            canonicalized_artist = info.get('artist', artist)
+            canonicalized_album = info.get('title', album)
+            if (artist != canonicalized_artist) or (album != canonicalized_album):
+                logger.emit(f"[*] Canonicalized as Artist: {canonicalized_artist}, Album: {canonicalized_album}")
+                artist = canonicalized_artist
+                album = canonicalized_album
         else:
             logger.emit(f"[*] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
             info = {'artist': artist, 'title': album, 'year': 'Unknown'}
 
         clean_artist = _sanitize_filename(artist)
         clean_album = _sanitize_filename(album)
-        logger.emit(f"[*] Sanitized as Artist: {artist}, Album: {album}")
-
+        if (clean_artist != artist) or (clean_album != album):
+            logger.emit(f"[*] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
         target = lib_path / clean_artist / f"{clean_album} (Atmos)"
         target.mkdir(parents=True, exist_ok=True)
 

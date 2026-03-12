@@ -16,7 +16,6 @@ __version__ = "1.0B"
 import itertools
 import json
 import queue
-import shutil
 import threading
 import tkinter as tk
 from pathlib import Path
@@ -248,6 +247,11 @@ class CaratGUI:
 
     def _start_rip_thread(self) -> None:
         """Collects inputs and launches the background workers."""
+
+        # 1. Clear artwork from previous rip (if any), so it doesn't linger until the new artwork arrives
+        self.lbl_art.configure(image='', text="Waiting...")
+        self.lbl_art.image = None  # Drop the reference so Python garbage collects it
+        self.lbl_art.update_idletasks()  # Force the UI to repaint immediately
 
         #Change state to State #3 - Rip in progress
         self._save_config()
