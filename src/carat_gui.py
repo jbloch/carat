@@ -18,6 +18,7 @@ import json
 import queue
 import threading
 import tkinter as tk
+from enum import Enum
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import Any
@@ -28,6 +29,26 @@ import carat
 import logger
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
+
+class OutputProfile(Enum):
+    """Output format specification."""
+    M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", ".m4a", "truehd")
+    M4A_LOSSY = ("M4A Lossy (Dolby Digital+) [Apple, Soundbars]", ".m4a", "eac3")
+    MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", ".mkv", "truehd")
+
+    def __init__(self, display_name: str, container: str, codec: str):
+        self.display_name = display_name
+        self.container = container
+        self.codec = codec
+
+    @classmethod
+    def from_display_string(cls, search_string: str):
+        """Reverse lookup to find the enum from the UI string."""
+        for profile in cls:
+            if profile.display_name == search_string:
+                return profile
+        # Safe default if the config file has an obsolete string
+        return cls.M4A_LOSSLESS
 
 class CaratGUI:
     """ Tkinter GUI for Carat """
@@ -59,7 +80,6 @@ class CaratGUI:
                     self.art_queue.put(path_str)
                 except IndexError:
                     pass
-
 
     def __init__(self, parent: tk.Tk) -> None:
         self.parent = parent
@@ -116,7 +136,8 @@ class CaratGUI:
     def _save_config(self) -> None:
         """Saves persistent data to the config file."""
         cfg = {
-            "library_root": self.dest_var.get()
+            "library_root": self.dest_var.get(),
+            "output_format": self.output_format_var.get()
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg))
@@ -154,7 +175,26 @@ class CaratGUI:
 
         self.dest_var = tk.StringVar(value=self.config.get("library_root"))
         ttk.Entry(frame_dest, textvariable=self.dest_var).pack(side="left", fill="x", expand=True, padx=(0, 5))
-        ttk.Button(frame_dest, text="Browse...", command=self._browse_dest).pack(side="right")
+        ttk.Button(frame_dest, text="Browse...", command=self._browse_dest).pack(side="left", padx=(0, 5))
+
+        # --- Format Output Profile Dropdown ---
+        self.profiles = [p.display_name for p in OutputProfile]
+        saved_profile = self.config.get("output_format", OutputProfile.M4A_LOSSLESS.display_name)
+        if saved_profile not in self.profiles:  # Safety check: if saved output format is invalid, revert to default
+            saved_profile = OutputProfile.M4A_LOSSLESS.display_name
+        self.output_format_var = tk.StringVar(value=saved_profile)
+
+        ttk.Separator(frame_dest, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Label(frame_dest, text="Format:").pack(side="left", padx=(0, 5))
+
+        self.format_dropdown = ttk.Combobox(
+            frame_dest,
+            textvariable=self.output_format_var,
+            values=self.profiles,
+            state="readonly",
+            width=48  # Expanded to fit the concise strings perfectly
+        )
+        self.format_dropdown.pack(side="left")
 
         # 2. Source Selection
         frame_src = ttk.LabelFrame(self.parent, text=f"{next(section)}. Source (Disc, ISO, or Folder)", padding=10)
@@ -248,38 +288,43 @@ class CaratGUI:
     def _start_rip_thread(self) -> None:
         """Collects inputs and launches the background workers."""
 
-        # 1. Clear artwork from previous rip (if any), so it doesn't linger until the new artwork arrives
+        # 1. Clear artwork from previous rip (if any)
         self.lbl_art.configure(image='', text="Waiting...")
-        self.lbl_art.image = None  # Drop the reference so Python garbage collects it
-        self.lbl_art.update_idletasks()  # Force the UI to repaint immediately
+        self.lbl_art.image = None
+        self.lbl_art.update_idletasks()
 
-        #Change state to State #3 - Rip in progress
+        # Change state to State #3 - Rip in progress
         self._save_config()
         self.is_ripping = True
-        self.btn_rip.config(state="disabled", text="Ripping in Progress...") # State #3 Rip in progress
+        self.btn_rip.config(state="disabled", text="Ripping in Progress...")
 
         # Collect arguments for the rip
         source = self.src_var.get().strip()
         artist = self.artist_var.get().strip()
         album = self.album_var.get().strip()
         music_lib_root = self.dest_var.get().strip()
+        selected_profile = self.output_format_var.get()
+
+        # Translate the UI Profile into orthogonal backend parameters
+        selected_string = self.output_format_var.get()
+        profile = OutputProfile.from_display_string(selected_string)
+        target_container = profile.container
+        preferred_codec = profile.codec
 
         self.progress_bar.config(mode='indeterminate')
         self.progress_bar.start(10)
 
-        # Start a worker thread to get the cover art
-        cover_path = Path(music_lib_root) / artist / f"{album} (Atmos)" / "cover.jpg"
-        cover_path.unlink(missing_ok=True)  # Remove any file that's already there, so as not to confuse the thread
-        thread = threading.Thread(target=self._run_logic, args=(source, artist, album, music_lib_root))
+        # Pass the new parameters to the thread
+        thread = threading.Thread(target=self._run_logic,
+                                  args=(source, artist, album, music_lib_root, target_container, preferred_codec))
         thread.daemon = True
         thread.start()
 
-
-    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str) -> None:
+    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str, target_container: str,
+                   preferred_codec: str) -> None:
         """The worker thread function."""
         try:
-            # Assuming carat.process_release was updated to drop the suffix argument
-            carat.rip_album_to_library(source, artist, album, music_lib_root)
+            carat.rip_album_to_library(source, artist, album, music_lib_root, target_container, preferred_codec)
             self.log_queue.put("[+] Process Complete.")
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")

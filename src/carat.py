@@ -520,10 +520,10 @@ def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
     return winner
 
 
-def find_atmos_stream(mkv_path: Path) -> int | None:
+def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | None:
     """
-    Returns the index of the highest quality Atmos stream, with TrueHD (lossless) prioritized over EAC3-JOC (lossy),
-    from the given mkv file, or None if neither are found. Emits a warning if we have to settle for EAC3-JOC.
+    Returns the index of the highest quality Atmos stream based on the preferred_codec,
+    with appropriate fallbacks and warnings.
     """
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
@@ -531,24 +531,32 @@ def find_atmos_stream(mkv_path: Path) -> int | None:
     try:
         streams = json.loads(res).get('streams', [])
 
-        # 1. Try to find Lossless TrueHD first
-        truehd_candidates = [s for s in streams if s.get('codec_name') == 'truehd']
-        if truehd_candidates:
-            return int(max(truehd_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+        # 1. Hunt for the user's explicit preference first
+        preferred_candidates = [s for s in streams if s.get('codec_name') == preferred_codec]
+        if preferred_candidates:
+            return int(max(preferred_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
-        # 2. Fall back to Lossy E-AC-3-JOC
-        eac3_candidates = [s for s in streams if s.get('codec_name') == 'eac3']
-        if eac3_candidates:
-            # Universal warning for all input formats
-            logger.emit("[!] =========================================================")
-            logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC.")
-            logger.emit("[!] =========================================================")
-            return int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+        # 2. The IAA Fallback: If caller wanted TrueHD but it's not there, grab E-AC-3
+        if preferred_codec == "truehd":
+            eac3_candidates = [s for s in streams if s.get('codec_name') == "eac3"]
+            if eac3_candidates:
+                logger.emit("[!] =========================================================")
+                logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC.")
+                logger.emit("[!] =========================================================")
+                return int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+
+        # 3. The Absolute Fallback: Basic AC-3 (5.1)
+        ac3_candidates = [s for s in streams if s.get('codec_name') == "ac3"]
+        if ac3_candidates:
+            logger.emit("[!!!] ======================================================================")
+            logger.emit("[!!!] WARNING: NO ATMOS METADATA DETECTED! Falling back to 5.1 channel AC-3.")
+            logger.emit("[!!!] ======================================================================")
+
+            return int(max(ac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
         return None
     except json.JSONDecodeError:
         return None
-
 
 def remux_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str, total_duration: float = 0) -> None:
     """Remuxes the specified mkv file into a chapterless m4a file"""
@@ -817,13 +825,19 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> 
     return atmos_mkv, matched_candidate, chapters, duration
 
 
-def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str) -> None:
+def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, target_container: str = ".m4a",
+                         preferred_codec: str = "truehd") -> None:
     """
     Rips the Atmos stream representing the main title in the specified source into the music library with the
     specified root. The artist and album title are used to obtain metadata and cover art, which are used to
-    generate the cue file and cover.jpg in the music library. The library entry consists of a chapterless m4a file
-    containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless playback of the
-    entire album, as well as access to individual tracks in Kodi version 21, and is the sole format known to do so.
+    generate the cue file and cover.jpg in the music library. The library entry consists of a chapterless audio
+    file (M4A or MKV) containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless
+    playback of the entire album, as well as access to individual tracks, and is the only format known to do so
+    on most platforms.
+
+    The output codec will be the highest quality codec consistent with the caller's preferred codec. The three
+    possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos (lossy), and AC-3
+    Surround (not Atmos!). The permitted values for preferred_codec are "truehd" (default), "eac3", and "ac3".
 
     This method offers complete ripping of Atmos sources into digital music libraries in a single call, with:
 
@@ -837,7 +851,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     The processing pipeline ensures:
       1. A temporary workspace is used for intermediate files
       2. Metadata is fetched from MusicBrainz only if the track count matches what's found on the input source
-      3. CUE sheets are generated for gapless playback support
+      3. CUE sheets are generated and internal chapters are stripped for gapless playback support
       4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible
     """
 
@@ -873,12 +887,34 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         target.mkdir(parents=True, exist_ok=True)
 
         # 3. Final Assembly (Concurrent)
+        idx = find_atmos_stream(atmos_mkv, preferred_codec)
+        if idx is None:
+            raise ValueError("No compatible audio stream (TrueHD, E-AC-3, or AC-3) found in master file.")
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target, mbid)
 
-            generate_cue_sheet(target / f"{clean_album} (Atmos).cue",
-                               f"{clean_album} (Atmos).m4a", info, chapters, tracks)
-            remux_mkv_to_m4a(atmos_mkv, target / f"{clean_album} (Atmos).m4a", album, duration)
+            # 1. Generate the cue sheet, injecting the correct target extension
+            final_audio_name = f"{clean_album} (Atmos){target_container}"
+            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
+
+            # 2. Base FFmpeg command to surgically extract ONLY the Atmos audio stream
+            cmd = [
+                TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
+                "-i", str(atmos_mkv), "-map", f"0:{idx}",
+                "-metadata", f"title={album}", "-c:a", "copy"
+            ]
+
+            # 3. Add container-specific flags
+            if target_container == ".m4a":
+                cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
+            else:
+                cmd.extend(["-f", "matroska"])
+
+            # 4. Strip internal chapters (so CUE takes over) and execute
+            cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(target / final_audio_name)])
+
+            run_command(cmd, f"Finalizing Atmos {target_container[1:].upper()}", {"ffmpeg_duration": duration})
 
             try:
                 cover_future.result(timeout=45)
