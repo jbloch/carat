@@ -101,7 +101,7 @@ def get_mb_art_url_from_releases(releases)-> str | None:
 
             if str(status.get('artwork')).lower() == 'true':
                 logger.emit(f"  [+] Found CAA art for: {mb_id}")
-                caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}").json()
+                caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}", timeout=10).json()
                 for img_entry in caa_data['images']:
                     if img_entry['front']:
                         url = img_entry['thumbnails'].get('1200') or img_entry['image']
@@ -147,7 +147,7 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
     url = "https://itunes.apple.com/search"
     params = {"term": f"{artist} {album}", "entity": "album", "limit": MAX_APPLE_ALBUM_COVERS_TO_SEARCH}
     try:
-        r = requests.get(url, params=params).json()
+        r = requests.get(url, params=params, timeout=10).json()
         results = r.get('results', [])
 
         target_album = normalize_for_fuzzy_comparison(album)
@@ -181,7 +181,7 @@ def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | No
 
     if image_url:
         logger.emit(f"[*] Downloading: {image_url}")
-        img_data = requests.get(image_url).content
+        img_data = requests.get(image_url, timeout=15).content
         img = Image.open(BytesIO(img_data))
 
         # Strip transparency layer if present, as it would cause Pillow to crash on jpeg conversion

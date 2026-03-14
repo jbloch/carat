@@ -330,7 +330,7 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
 
         # 2. Scan input using MakeMKV locally (runs concurrently with the fetch)
         res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
-                          "Surgical Atmos Scan")
+                          "Atmos Scan")
         titles = parse_makemkv_info(res)
         if not any(info.score > 0 for info in titles.values()):
             raise RuntimeError("No valid Atmos titles found on source.")
@@ -898,7 +898,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             final_audio_name = f"{clean_album} (Atmos){target_container}"
             generate_cue_sheet(target / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
 
-            # 2. Base FFmpeg command to surgically extract ONLY the Atmos audio stream
+            # 2. Base FFmpeg command to extract ONLY the Atmos audio stream
             cmd = [
                 TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
                 "-i", str(atmos_mkv), "-map", f"0:{idx}",

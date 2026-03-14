@@ -303,7 +303,6 @@ class CaratGUI:
         artist = self.artist_var.get().strip()
         album = self.album_var.get().strip()
         music_lib_root = self.dest_var.get().strip()
-        selected_profile = self.output_format_var.get()
 
         # Translate the UI Profile into orthogonal backend parameters
         selected_string = self.output_format_var.get()
@@ -312,7 +311,7 @@ class CaratGUI:
         preferred_codec = profile.codec
 
         self.progress_bar.config(mode='indeterminate')
-        self.progress_bar.start(10)
+        self.progress_bar.start(50)  # 50 ms. refresh interval
 
         # Pass the new parameters to the thread
         thread = threading.Thread(target=self._run_logic,
@@ -371,11 +370,18 @@ class CaratGUI:
 
     def _start_queue_poller(self) -> None:
         """Consumes queue events and updates the UI (must run on the main thread)."""
-        while not self.log_queue.empty():
-            msg = self.log_queue.get_nowait()
+        # Bulk log insertion for responsiveness
+        if not self.log_queue.empty():
             self.txt_log.config(state="normal")
-            self.txt_log.insert("end", f"{msg}\n")
-            self.txt_log.see("end")
+            logs = []
+            while not self.log_queue.empty():
+                try:
+                    logs.append(self.log_queue.get_nowait())
+                except queue.Empty:
+                    break
+            if logs:
+                self.txt_log.insert("end", "\n".join(logs) + "\n")
+                self.txt_log.see("end")
             self.txt_log.config(state="disabled")
 
         while not self.progress_queue.empty():
@@ -393,7 +399,7 @@ class CaratGUI:
             # ONLY switch to indeterminate (bounce) if we are remuxing WITHOUT a percentage
             if "Remuxing" in msg and "%" not in msg and self.progress_bar.cget("mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
-                self.progress_bar.start(15)
+                self.progress_bar.start(50)  # 50 ms. refresh interval
                 self.btn_rip.config(text="Remuxing...")
 
             # If we DO have a percentage (bracket style), ensure we stay Determinate
