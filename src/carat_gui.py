@@ -15,7 +15,9 @@ __version__ = "1.0B"
 
 import itertools
 import json
+import platform
 import queue
+import re
 import threading
 import tkinter as tk
 from enum import Enum
@@ -223,6 +225,14 @@ class CaratGUI:
         self.ent_album = ttk.Entry(frame_meta, textvariable=self.album_var)
         self.ent_album.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
 
+        # --- Smart Auto-Fill State ---
+        self._user_touched_metadata = False
+        self._is_autofilling = False
+
+        # Trace the variables so we know if the user manually edits them
+        self.artist_var.trace_add("write", self._on_metadata_changed)
+        self.album_var.trace_add("write", self._on_metadata_changed)
+
         frame_meta.columnconfigure(1, weight=1)
 
         # Cover Art Sub-Frame
@@ -272,13 +282,87 @@ class CaratGUI:
         # Force an initial evaluation on startup
         self._evaluate_button_state()
 
+    @staticmethod
+    def _guess_metadata(source_path: str) -> tuple[str, str]:
+        """Heuristically guesses (Artist, Album) from the source path."""
+        if not source_path:
+            return "", ""
+
+        # 0. Strip known media extensions early so they don't leak into the album title
+        p = Path(source_path)
+        if p.suffix.lower() in ('.iso', '.mkv', '.mp4'):
+            name = p.stem
+        else:
+            name = p.name
+
+        # 1. Windows Drive Root Fallback (e.g., "D:\")
+        if (not name or name.endswith(':\\')) and platform.system() == "Windows":
+            import ctypes
+            volume_buf = ctypes.create_unicode_buffer(1024)
+            # noinspection PyUnresolvedReferences
+            if ctypes.windll.kernel32.GetVolumeInformationW(str(p), volume_buf, 1024, None, None, None, None, 0):
+                name = volume_buf.value
+
+        # 2. The BDMV / Folder / File Fallbacks
+        if (name.upper() in ("BDMV", "VIDEO_TS", "CERTIFICATE") or
+                (p.is_file() and " - " not in name and " - " in p.parent.name)):
+            name = p.parent.name
+
+        # 3. Strip bracketed and parenthetical cruft (e.g., [FLAC], (2023 Mix))
+        clean_name = re.sub(r'[(\[].*?[)\]]', '', name)
+
+        # 4. Strip standalone audiophile tags that escaped brackets
+        clean_name = re.sub(r'\b(ATMOS|5\.1|7\.1|WEB|OF|TR24)\b', '', clean_name, flags=re.IGNORECASE)
+
+        # 5. Split strictly on " - " (spaces around dash protect hyphenated words like "3-D")
+        parts = [part.strip() for part in clean_name.split(" - ") if part.strip()]
+
+        if len(parts) >= 2:
+            artist = parts[0]
+            album = parts[1]
+            # Any trailing years (e.g., parts[2]) are naturally ignored!
+            return artist, album
+        else:
+            # Fallback for no " - " delimiter (e.g., Steely_Dan_Gaucho)
+            # Replace underscores with spaces, collapse multiple spaces, and capitalize
+            clean_name = clean_name.replace("_", " ")
+            album = re.sub(r'\s+', ' ', clean_name).strip().title()
+            return "", album
+
+    def _apply_autofill(self, path: str) -> None:
+        """Applies the heuristic guesser and intelligently overwrites the UI."""
+        artist_guess, album_guess = self._guess_metadata(path)
+
+        can_overwrite = (not self._user_touched_metadata) or \
+                        (not self.artist_var.get().strip() and not self.album_var.get().strip())
+
+        if can_overwrite:
+            self._is_autofilling = True
+
+            # Unconditionally replace UI state (clearing it if the guess is empty)
+            self.artist_var.set(artist_guess)
+            self.album_var.set(album_guess)
+
+            self._is_autofilling = False
+            self._user_touched_metadata = False
+
     def _browse_source_file(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Media File", "*.iso *.mkv *.mp4")])
-        if path: self.src_var.set(path)
+        if path:
+            self.src_var.set(path)
+            self._apply_autofill(path)
 
     def _browse_source_folder(self) -> None:
         path = filedialog.askdirectory(title="Folder of media files or Blu-ray Drive")
-        if path: self.src_var.set(path)
+        if path:
+            self.src_var.set(path)
+            self._apply_autofill(path)
+
+    # noinspection PyUnusedLocal
+    def _on_metadata_changed(self, *args) -> None:
+        """Marks the metadata as manually edited if the user types in the fields."""
+        if not getattr(self, '_is_autofilling', False):
+            self._user_touched_metadata = True
 
     def _browse_dest(self) -> None:
         """Prompts the user for the library root."""

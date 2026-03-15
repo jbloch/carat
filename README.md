@@ -64,7 +64,7 @@ The underlying tools (which do all the heavy lifting) are:
 ## Feedback & Bug Reports
 
 * **Found a bug?** That's not surprising, considering that this is a Beta release. Please open an issue on the [GitHub Issues](https://github.com/jbloch/carat/issues) page. Including your console log or terminal output helps immensely!
-* **Questions or feature ideas?** Join the discussion over on the [QQ Thread](link-to-your-QQ-thread).
+* **Questions or feature ideas?** Join the discussion over on the [QQ Thread](https://quadraphonicquad.com/threads/announcing-carat-beta-one-click-atmos-ripping-for-gapless-playback.38688/).
 
 
 ---
