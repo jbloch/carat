@@ -312,7 +312,7 @@ class CaratGUI:
         clean_name = re.sub(r'[(\[].*?[)\]]', '', name)
 
         # 4. Strip standalone audiophile tags that escaped brackets
-        clean_name = re.sub(r'\b(ATMOS|5\.1|7\.1|WEB|OF|TR24)\b', '', clean_name, flags=re.IGNORECASE)
+        clean_name = re.sub(r'\b(ATMOS|5\.1|7\.1|WEB|OF|TR24|TR16)\b', '', clean_name, flags=re.IGNORECASE)
 
         # 5. Split strictly on " - " (spaces around dash protect hyphenated words like "3-D")
         parts = [part.strip() for part in clean_name.split(" - ") if part.strip()]

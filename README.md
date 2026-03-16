@@ -8,12 +8,12 @@
 
 ---
 
-Carat is a lightweight, automated GUI utility designed to accept Dolby Atmos music releases from practically any format and incorporate them directly into your digital music library in a single click. 
+Carat is a lightweight, automated GUI utility designed to accept Dolby Atmos music releases in practically any format, locate the primary title in the releases, retrieve metadata and cover art from the internet, and incorporate the release directly into your digital music library in a single click. 
 
 From the moment a new Blu-ray arrives in your mailbox, Carat handles the entire pipeline—extraction, processing, metadata acquisition, and cover art—with zero friction. If your source files are already on your SSD, Carat will process an entire release in a minute or two (depending on the speed of your computer). If you are starting from a physical disc, the time is limited by the read speed of your optical drive.
 
 <div align="center">
-  <img src="docs/carat_screenshot.png" alt="Carat screenshot: Frank Zappa remux in progress" width="600"/>
+  <img src="docs/carat_screenshot.jpg" alt="Carat screenshot: Frank Zappa remux in progress" width="600"/>
 </div>
 
 ## The Universal Atmos Ingestion Tool
@@ -23,12 +23,14 @@ Carat is built to handle the chaotic, developing landscape of Atmos release form
 * [IAA](https://immersiveaudioalbum.com/)-style folders (individual MKV or MP4 files per track)
 * [Headphone Dust](https://headphonedust.store/)-style single MKV files
 
-**The Output:** Regardless of what you feed it, Carat standardizes the output into one uniform, library-ready format: **a single, chapterless `.m4a` file alongside a `.cue` sheet and a `cover.jpg`.** *Why this format?* It is currently the only format that reliably combines true gapless playback with accurate track indexing on media centers like Kodi.
+**The Output:** Regardless of what you feed it, Carat standardizes the output into one uniform, library-ready format: **a single, chapterless `.m4a` or `.mkv` file alongside a `.cue` sheet and a `cover.jpg`.** *Why this format?* It is currently the only format that reliably combines true gapless playback with accurate track indexing on media centers like Kodi. As of the second Beta release, you can choose among three variants, depending on what hardware you're using to play your music:
+* **M4A Lossless (TrueHD)** – the ideal format if you're running your media player software (e.g., Kodi) on a FireStick MAX 4K, Fire TV cube, or similar device.
+* **M4A Lossy (Dolby Digital+)** – the correct format for Mac, Apple TV, soundbars, and car audio systems.
 
 As the landscape evolves, we may extend Carat's capabilities to support more input and output formats, but it will remain laser-focused on one task: quickly incorporating Atmos albums into your digital music library.
 
 ## Intelligent Metadata
-You shouldn't have to manually tag your Atmos rips. Carat reaches out to top-tier sources—including [MusicBrainz](https://musicbrainz.org/), the [Cover Art Archive (CAA)](https://coverartarchive.org/), and [Apple/iTunes](https://www.apple.com/itunes/)—to automatically pull down high-quality cover art and pristine metadata, and applies smart heuristics to identify and correct imprecise artist or album names, ensuring your library remains perfectly organized.
+You shouldn't have to manually tag your Atmos rips. Carat does the best it can to figure out the artist and/or album names from the source you enter. You can edit Carat's guess if need be. Then Carat reaches out to top-tier sources—including [MusicBrainz](https://musicbrainz.org/), the [Cover Art Archive (CAA)](https://coverartarchive.org/), and [Apple/iTunes](https://www.apple.com/itunes/)—to automatically pull down high-quality cover art and pristine metadata. Carat applies smart heuristics to identify and correct imprecise artist or album names, ensuring your library remains perfectly organized. Heuristics for identifying the main title in the release, and for correcting artist and album names have been substantially improved beyond the primitive heuristics in the first Beta release.
 
 ## Installation (The Near-Zero-Touch Launcher)
 Carat uses a highly robust, idempotent launcher script that handles both installation and execution. It is designed to never make a mess of your system. 
