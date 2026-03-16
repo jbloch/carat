@@ -13,7 +13,7 @@ supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B"
+__version__ = "1.0B2"
 
 __all__ = ['rip_album_to_library']
 
