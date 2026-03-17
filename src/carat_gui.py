@@ -11,7 +11,7 @@ selection. (See carat.py for details.)
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B"
+__version__ = "1.0B2.1"
 
 import itertools
 import json
@@ -350,12 +350,14 @@ class CaratGUI:
         path = filedialog.askopenfilename(filetypes=[("Media File", "*.iso *.mkv *.mp4")])
         if path:
             self.src_var.set(path)
+            self._user_touched_metadata = False  # Reset the manual edit lock for the new file
             self._apply_autofill(path)
 
     def _browse_source_folder(self) -> None:
         path = filedialog.askdirectory(title="Folder of media files or Blu-ray Drive")
         if path:
             self.src_var.set(path)
+            self._user_touched_metadata = False  # Reset the manual edit lock for the new folder
             self._apply_autofill(path)
 
     # noinspection PyUnusedLocal
