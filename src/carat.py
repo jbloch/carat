@@ -13,7 +13,7 @@ supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B2"
+__version__ = "1.0B2.1"
 
 __all__ = ['rip_album_to_library']
 
@@ -293,10 +293,11 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
     return titles
 
 
-def get_best_mb_candidate(chapter_count: int, candidates: list[dict]) -> dict | None:
+def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int, candidates: list[dict]) -> dict | None:
     """
-    Finds the best MusicBrainz candidate for a given number of chapters.
-    Filters for exact matches or +1 preamble matches, prioritizing exact matches.
+    Finds the best MusicBrainz candidate for a given target and chapter count.
+    Filters for exact matches or +1 preamble matches, prioritizing exact matches,
+    then string similarity to the target artist and album.
     """
     if not candidates:
         return None
@@ -305,10 +306,25 @@ def get_best_mb_candidate(chapter_count: int, candidates: list[dict]) -> dict | 
     matched = [c for c in candidates if 0 <= (chapter_count - len(c['tracks'])) <= 1]
 
     if matched:
-        # Sort so exact matches (diff=0) win.
-        # Python's stable sort automatically preserves the original MB relevance rank for ties!
-        matched.sort(key=lambda c: chapter_count - len(c['tracks']))
-        return matched[0]
+        safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
+
+        def get_similarity(c: dict) -> float:
+            """Similarity scorer function for album and artist titles"""
+            safe_cand = normalize_for_fuzzy_comparison(f"{c['artist']} {c['title']}").replace(" ", "")
+            return difflib.SequenceMatcher(None, safe_target, safe_cand).ratio()
+
+        # Sort by: 1. Track diff (ascending), 2. Similarity (descending)
+        matched.sort(key=lambda c: (chapter_count - len(c['tracks']), -get_similarity(c)))
+
+        logger.emit(f"    [*] MB Candidate Scoreboard for {chapter_count} tracks:")
+        for c in matched:
+            diff = chapter_count - len(c['tracks'])
+            sim = get_similarity(c)
+            logger.emit(f"        -> [Δ={diff}, Sim={sim:.2f}] {c['artist']} - {c['title']}")
+
+        winner = matched[0]
+        logger.emit(f"    [+] Selected MB Candidate: {winner['artist']} - {winner['title']}")
+        return winner
 
     return None
 
@@ -349,7 +365,7 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
             if info.score <= 0:
                 logger.emit(f"    [-] Rejected Title {t_idx} (No Atmos stream detected)")
                 continue
-            best_candidate = get_best_mb_candidate(info.chapters, candidates)
+            best_candidate = get_best_mb_candidate(artist, album, info.chapters, candidates)
 
             # Keep the title if it matched a candidate, OR if MB is entirely offline
             if best_candidate or not candidates:
@@ -816,7 +832,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> 
         # Intersect local MKV chapters with MusicBrainz candidates
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
         candidates = fetch_candidate_metadata(artist, album)
-        matched_candidate = get_best_mb_candidate(len(chapters), candidates)
+        matched_candidate = get_best_mb_candidate(artist, album, len(chapters), candidates)
 
         # Fallback: if no strict match was found but we HAVE candidates, just blindly trust the top result
         if not matched_candidate and candidates:
