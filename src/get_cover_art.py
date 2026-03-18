@@ -11,7 +11,7 @@ and MusicBrainz as sources, but this does not affect the contract between this m
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B"
+__version__ = "1.0B2.1"
 
 import re
 import sys
@@ -30,7 +30,7 @@ __all__ = ['download_cover_art']
 # We search multiple albums on Apple Music to give us a buffer against Apple's fuzzy search
 MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5
 
-mb.set_useragent("CoverArtRetrievalTool", "0.1", "josh@bloch.us")
+mb.set_useragent("Carat CoverArtRetrievalTool", __version__, "josh@bloch.us")
 
 MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB Cap
 MIN_DIMENSION = 1000  # Minimum pixels for 'High Res'
@@ -39,8 +39,8 @@ MIN_DIMENSION = 1000  # Minimum pixels for 'High Res'
 def is_valid_image(url: str) -> tuple[bool, int, int]:
     """ Returns true and the image dimensions if the image at the given URL has an appropriate shape for cover art. """
     try:
-        # If it's a known CAA thumbnail, we trust the size and skip the HEAD request
-        is_thumbnail = "/thumbnails/" in url or "itunes.apple.com" in url
+        # 1. Broaden the check to skip fragile HEAD requests for CAA and iTunes CDNs
+        is_thumbnail = "coverartarchive.org" in url or "mzstatic.com" in url or "itunes.apple.com" in url
 
         if not is_thumbnail:
             head = requests.head(url, allow_redirects=True, timeout=5)
@@ -48,12 +48,16 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
             if size > MAX_FILE_SIZE:
                 return False, 0, 0
 
-        # We use stream=True to check the Aspect Ratio/Dimensions because we only need the first few KB of the header.
-        with requests.get(url, stream=True, timeout=10) as resp:
-            img = Image.open(resp.raw)
-            w, h = img.size
+        # 2. Add custom User-Agent to prevent Archive.org from dropping the connection
+        headers = {"User-Agent": "carat/1.0B ( josh@bloch.us )"}
 
-        # Validation logic...
+        # 3. Load fully into BytesIO. PIL requires seek() for Progressive JPEGs, which resp.raw lacks.
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+
+        img = Image.open(BytesIO(resp.content))
+        w, h = img.size
+
         aspect_ratio = w / h
         if 0.95 < aspect_ratio < 1.05 and w >= MIN_DIMENSION:  #Square-ish
             return True, w, h
