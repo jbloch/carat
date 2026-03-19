@@ -11,13 +11,13 @@ if %errorlevel% neq 0 (
     pause
 )
 exit /b %errorlevel%
-:MAIN
-shift
 
 REM ----------------------------------------------------
 REM 0. FIX NETWORK/UNC PATHS
 REM ----------------------------------------------------
+:MAIN
 pushd "%~dp0"
+shift
 set REQUIRES_RESTART=0
 
 REM ----------------------------------------------------
@@ -106,7 +106,7 @@ REM ----------------------------------------------------
 REM A. Check for 'py' launcher (Always preferred)
 where py >nul 2>nul
 if %errorlevel% equ 0 set PYTHON_CMD=py
-if %errorlevel% equ 0 goto :FOUND_PYTHON
+if %errorlevel% equ 0 goto :DO_RESTART
 
 REM B. Check for 'python' executable
 where python >nul 2>nul
@@ -118,7 +118,7 @@ if %errorlevel% neq 0 goto :INSTALL_PYTHON
 
 REM If we passed both checks, it is a real Python.
 set PYTHON_CMD=python
-goto :FOUND_PYTHON
+goto :DO_RESTART
 
 :INSTALL_PYTHON
 echo [*] Python not found - Auto-installing Python 3.12 via Winget...
