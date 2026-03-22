@@ -32,7 +32,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
@@ -256,7 +256,10 @@ class TitleInfo:
     score: int = 0
     chapters: int = 0
     size: int = 0
-
+    file_name: str = "Unknown"
+    duration: str = "Unknown"
+    size_str: str = "Unknown"
+    streams: list[str] = field(default_factory=list)
 
 def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
     """Parses the raw text output of 'makemkvcon info' into a dictionary of TitleInfo objects."""
@@ -275,23 +278,61 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
         if line.startswith("TINFO:"):
             attr_id = parts[1]
             code = parts[2]
+            val = parts[3].strip('"') if len(parts) > 3 else ""
 
             if code == "0":
                 if attr_id == "8":
-                    titles[t_idx].chapters = int(parts[3].strip('"'))
+                    titles[t_idx].chapters = int(val)
+                elif attr_id == "9":
+                    titles[t_idx].duration = val
+                elif attr_id == "10":
+                    titles[t_idx].size_str = val
                 elif attr_id == "11":
-                    titles[t_idx].size = int(parts[3].strip('"'))
+                    titles[t_idx].size = int(val)
+                elif attr_id == "27":
+                    titles[t_idx].file_name = val
 
         # MakeMKV SINFO Format: SINFO:title_idx,stream_idx,attribute_id,code,"value"
         if line.startswith("SINFO:"):
+            if len(parts) >= 5:
+                attr_id = parts[2]
+                val = parts[4].strip('"')
+                if attr_id == "30":
+                    titles[t_idx].streams.append(val)
+
+            # Keep existing score logic (removed redundant inline logging)
             if "A_TRUEHD" in line or "TrueHD Atmos" in line:
                 titles[t_idx].score = max(titles[t_idx].score, 1000)
-                logger.emit(f"    [*] Title {t_idx}: Found Lossless Atmos (+1000)")
             elif "A_EAC3" in line and "Atmos" in line:
                 titles[t_idx].score = max(titles[t_idx].score, 500)
-                logger.emit(f"    [*] Title {t_idx}: Found Lossy Atmos (+500)")
 
     return titles
+
+
+def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
+    """Pretty-prints the disc topology parsed from MakeMKV."""
+    logger.emit("\n[*] === DISC TOPOLOGY SCAN ===")
+
+    if not titles:
+        logger.emit("    [!] No valid titles found during scan.")
+        return
+
+    # Sort by integer title ID for clean output
+    for t_idx, info in sorted(titles.items(), key=lambda x: int(x[0])):
+        logger.emit(f"    [Title {t_idx}] {info.file_name}")
+        logger.emit(f"      - Duration: {info.duration} ({info.chapters} Chapters)")
+        logger.emit(f"      - Size: {info.size_str}")
+
+        if info.streams:
+            logger.emit("      - Streams:")
+            for i, stream in enumerate(info.streams, start=1):
+                # Add a visual star for the Atmos streams so they pop in the log
+                marker = "★" if "Atmos" in stream or "TrueHD" in stream else "->"
+                logger.emit(f"          {marker} Stream {i}: {stream}")
+        else:
+            logger.emit("      - Streams: None detected")
+
+        logger.emit("")  # Blank line between titles
 
 
 def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int,
@@ -350,6 +391,7 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
         res = run_command([TOOLS.MAKEMKV, "--progress=-stdout", "-r", "info", source_spec, "--minlength=600"],
                           "Atmos Scan")
         titles = parse_makemkv_info(res)
+        log_disc_topology(titles)
         if not any(info.score > 0 for info in titles.values()):
             raise RuntimeError("No valid Atmos titles found on source.")
 
@@ -626,7 +668,10 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
         logger.emit("    [-] No matching release group found. Aborting metadata fetch.")
         return []
 
-    releases = find_releases_and_dates_for_release_group(rg_id)
+    releases = find_releases_and_dates_for_release_group(rg_id, rg_title)
+    logger.emit(
+        f"    [+] Found {len(releases)} matching releases for {rg_artist} - {rg_title} (RG ID: {rg_id})."
+    )
     if not releases:
         logger.emit("    [-] No matching releases found. Aborting metadata fetch.")
         return []
@@ -665,40 +710,55 @@ def find_release_group(album: str, artist: str) -> tuple[str | None, str | None,
     return rg_id, rg_artist, rg_title
 
 
-def find_releases_and_dates_for_release_group(rg_id: str) -> list[tuple[str, str]]:
+def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
     """
     Returns release IDs and dates of editions of the given release group corresponding to all possible track-counts.
-    If multiple releases share a track-count, the first release encountered with each unique track count is returned.
-    (The assumption is that all members of a release group with the same track-count will have the same track sequence,
-    so we only need one release per track count, and it doesn't matter which one.)
+    Evaluates mediums individually to strictly match physical disc topology.
     """
-    logger.emit(f"    [*] Fetching all editions and media for Release Group: {rg_id}")
+    logger.emit(f"[*] Fetching all editions and media for Release Group: {rg_title}")
+
+    releases = []
+    limit = 100
+    offset = 0
+
+    # 1. Fetch ALL editions by paginating through the browse_releases endpoint
     try:
-        # includes=['releases', 'media'] forces the API to expose the track counts!
-        rg_info = mb.get_release_group_by_id(rg_id, includes=['releases', 'media'])
-        releases = rg_info.get('release-group', {}).get('release-list', [])
-        logger.emit(f"    [+] API returned {len(releases)} editions in this group.")
+        while True:
+            result = mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)
+            batch = result.get('release-list', [])
+            releases.extend(batch)
+
+            if len(batch) < limit:
+                break  # We've reached the end of the list
+            offset += limit
+
+        logger.emit(f"[+] API returned {len(releases)} editions for '{rg_title}'.")
     except mb.WebServiceError as e:
-        logger.emit(f"    [!] Error fetching releases: {e}")
+        logger.emit(f"[!] Error fetching releases: {e}")
         return []
 
-    release_ids = []
+    unique_releases = {}
     seen_counts = set()
 
+    # 2. Map the physical mediums to find unique track counts
     for r in releases:
-        # Sum the track counts across all physical discs (mediums) in this edition
-        t_count = sum(int(m.get('track-count', 0)) for m in r.get('medium-list', []))
+        mediums = r.get('medium-list', [])
 
-        # Fallback just in case MB formats it strangely
-        if t_count == 0:
+        if not mediums:
             t_count = int(r.get('medium-track-count', r.get('track-count', 0)))
+            if t_count > 0 and t_count not in seen_counts:
+                seen_counts.add(t_count)
+                unique_releases[r['id']] = r.get('date', '')[:4]
+            continue
 
-        if t_count > 0 and t_count not in seen_counts:
-            seen_counts.add(t_count)
-            release_ids.append((r['id'], r.get('date', '')[:4]))
+        for m in mediums:
+            m_count = int(m.get('track-count', 0))
+            if m_count > 0 and m_count not in seen_counts:
+                seen_counts.add(m_count)
+                unique_releases[r['id']] = r.get('date', '')[:4]
 
-    logger.emit(f"    [+] Identified unique track counts: {sorted(list(seen_counts))}")
-    return release_ids
+    logger.emit(f"[+] Identified unique track counts: {sorted(list(seen_counts))}")
+    return [(r_id, date) for r_id, date in unique_releases.items()]
 
 
 def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
@@ -709,21 +769,24 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
     for rel_id, year in release_ids_and_dates:
         try:
             rel_info = mb.get_release_by_id(rel_id, includes=['recordings'])
-            all_tracks = []
+
+            # Treat EVERY medium as its own independent candidate
             for medium in rel_info.get('release', {}).get('medium-list', []):
+                medium_tracks = []
                 for track in medium.get('track-list', []):
-                    all_tracks.append({
+                    medium_tracks.append({
                         'title': track.get('recording', {}).get('title', 'Unknown Track'),
                         'duration': track.get('recording', {}).get('length', 0)
                     })
-            if all_tracks:
-                candidates.append({
-                    'title': rg_title,
-                    'artist': rg_artist,
-                    'year': year or 'Unknown',
-                    'mbid': rg_id,
-                    'tracks': all_tracks
-                })
+
+                if medium_tracks:
+                    candidates.append({
+                        'title': rg_title,
+                        'artist': rg_artist,
+                        'year': year or 'Unknown',
+                        'mbid': rg_id,
+                        'tracks': medium_tracks
+                    })
         except mb.WebServiceError:
             continue
     return candidates
@@ -996,6 +1059,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             # 2. Base FFmpeg command to extract ONLY the Atmos audio stream
             cmd = [
                 TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
+                "-probesize", "100M", "-analyzeduration", "100M",
                 "-i", str(atmos_mkv), "-map", f"0:{idx}",
                 "-metadata", f"title={album}", "-c:a", "copy"
             ]
