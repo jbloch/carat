@@ -1056,23 +1056,52 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 chapters = chapters[:len(tracks)]   # Eliminate final "ghost chapter" if it exists
             generate_cue_sheet(target / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
 
-            # 2. Base FFmpeg command to extract ONLY the Atmos audio stream
-            cmd = [
-                TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
-                "-probesize", "100M", "-analyzeduration", "100M",
-                "-i", str(atmos_mkv), "-map", f"0:{idx}",
-                "-metadata", f"title={album}", "-c:a", "copy"
-            ]
+            # 2. If we are building a video file for a car, wait for the cover art now
+            has_cover_art = False
+            if target_container == ".mp4":
+                logger.emit("    [*] Checking cover art status for video stream...")
+                try:
+                    # Give it a 5-second grace period if it hasn't finished during the MakeMKV scan
+                    cover_future.result(timeout=5)
+                    has_cover_art = (target / "cover.jpg").exists()
+                    if has_cover_art:
+                        logger.emit("    [+] Cover art ready. Building visual audio track.")
+                except concurrent.futures.TimeoutError:
+                    logger.emit("    [!] Cover art fetch timed out. Falling back to black screen.")
+                except Exception as e:
+                    logger.emit(f"    [!] Cover art fetch failed ({type(e).__name__}). Falling back to black screen.")
 
-            # 3. Add container-specific flags
-            if target_container == ".m4a":
-                cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
-            else:
-                cmd.extend(["-f", "matroska"])
+            # 3. Build container-specific FFmpeg remuxing command and execute it
+            if target_container == ".mp4": # Nominal video, and appropriate "branding" to satisfy hardware decoders
+                cmd = [TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats"]
 
-            # 4. Strip internal chapters (so CUE takes over) and execute
+                if has_cover_art:
+                    cmd.extend(["-loop", "1", "-framerate", "1", "-i", str(target / "cover.jpg")])
+                else:
+                    cmd.extend(["-f", "lavfi", "-i", "color=c=black:s=720x480:r=1"])
+
+                cmd.extend([
+                    "-probesize", "100M", "-analyzeduration", "100M",
+                    "-i", str(atmos_mkv),
+                    "-map", "0:v", "-map", f"1:{idx}",
+                    "-metadata", f"title={album}",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-pix_fmt", "yuv420p",
+                    "-c:a", "copy", "-shortest",
+                    "-brand", "mp42", "-f", "mp4", "-movflags", "+faststart", "-strict", "-2"
+                ])
+            else:  # m4a or mkv; audio only
+                cmd = [
+                    TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
+                    "-probesize", "100M", "-analyzeduration", "100M",
+                    "-i", str(atmos_mkv), "-map", f"0:{idx}",
+                    "-metadata", f"title={album}", "-c:a", "copy"
+                ]
+                if target_container == ".m4a":
+                    cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
+                else:
+                    cmd.extend(["-f", "matroska"])
+
             cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(target / final_audio_name)])
-
             run_command(cmd, f"Finalizing Atmos {target_container[1:].upper()}", {"ffmpeg_duration": duration})
 
             try:
