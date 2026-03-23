@@ -981,7 +981,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> 
     return atmos_mkv, matched_candidate, chapters, duration
 
 
-def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, target_container: str = ".m4a",
+def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, output_container: str = ".m4a",
                          preferred_codec: str = "truehd") -> None:
     """
     Rips the Atmos stream representing the main title in the specified source into the music library with the
@@ -1039,8 +1039,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         clean_album = _sanitize_filename(album)
         if (clean_artist != artist) or (clean_album != album):
             logger.emit(f"[*] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
-        target = lib_path / clean_artist / f"{clean_album} (Atmos)"
-        target.mkdir(parents=True, exist_ok=True)
+        dest = lib_path / clean_artist / f"{clean_album} (Atmos)"
+        dest.mkdir(parents=True, exist_ok=True)
 
         # 3. Final Assembly (Concurrent)
         idx = find_atmos_stream(atmos_mkv, preferred_codec)
@@ -1048,22 +1048,22 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             raise ValueError("No compatible audio stream (TrueHD, E-AC-3, or AC-3) found in master file.")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, target, mbid)
+            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, mbid)
 
             # 1. Generate the cue sheet, injecting the correct target extension
-            final_audio_name = f"{clean_album} (Atmos){target_container}"
+            final_audio_name = f"{clean_album} (Atmos){output_container}"
             if info and (tracks := info.get('tracks')):
                 chapters = chapters[:len(tracks)]   # Eliminate final "ghost chapter" if it exists
-            generate_cue_sheet(target / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
+            generate_cue_sheet(dest / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
 
             # 2. If we are building a video file for a car, wait for the cover art now
             has_cover_art = False
-            if target_container == ".mp4":
+            if output_container == ".mp4":
                 logger.emit("    [*] Checking cover art status for video stream...")
                 try:
                     # Give it a 5-second grace period if it hasn't finished during the MakeMKV scan
                     cover_future.result(timeout=5)
-                    has_cover_art = (target / "cover.jpg").exists()
+                    has_cover_art = (dest / "cover.jpg").exists()
                     if has_cover_art:
                         logger.emit("    [+] Cover art ready. Building visual audio track.")
                 except concurrent.futures.TimeoutError:
@@ -1072,11 +1072,11 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     logger.emit(f"    [!] Cover art fetch failed ({type(e).__name__}). Falling back to black screen.")
 
             # 3. Build container-specific FFmpeg remuxing command and execute it
-            if target_container == ".mp4": # Nominal video, and appropriate "branding" to satisfy hardware decoders
+            if output_container == ".mp4": # Nominal video, and appropriate "branding" to satisfy hardware decoders
                 cmd = [TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats"]
 
                 if has_cover_art:
-                    cmd.extend(["-loop", "1", "-framerate", "1", "-i", str(target / "cover.jpg")])
+                    cmd.extend(["-loop", "1", "-framerate", "1", "-i", str(dest / "cover.jpg")])
                 else:
                     cmd.extend(["-f", "lavfi", "-i", "color=c=black:s=720x480:r=1"])
 
@@ -1096,13 +1096,13 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     "-i", str(atmos_mkv), "-map", f"0:{idx}",
                     "-metadata", f"title={album}", "-c:a", "copy"
                 ]
-                if target_container == ".m4a":
+                if output_container == ".m4a":
                     cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
                 else:
                     cmd.extend(["-f", "matroska"])
 
-            cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(target / final_audio_name)])
-            run_command(cmd, f"Finalizing Atmos {target_container[1:].upper()}", {"ffmpeg_duration": duration})
+            cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
+            run_command(cmd, f"Finalizing Atmos {output_container[1:].upper()}", {"ffmpeg_duration": duration})
 
             try:
                 cover_future.result(timeout=45)
@@ -1121,18 +1121,31 @@ def _clean_path_arg(arg: str) -> str:
 
 def main():
     """Simple command line tool for carat"""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("source")
-    parser.add_argument("artist")
-    parser.add_argument("album")
-    parser.add_argument("library_root")
+    parser = argparse.ArgumentParser(description="Rip and remux Dolby Atmos albums.")
+    parser.add_argument("source", help="Source (Disc index, ISO, or Folder)")
+    parser.add_argument("artist", help="Album artist")
+    parser.add_argument("album", help="Album title")
+    parser.add_argument("library_root", help="Destination music library root")
+
+    # Optional flags for format selection
+    parser.add_argument("--output-container", choices=["m4a", "mp4", "mkv"], default="m4a",
+                        help="Output container format (default: m4a)")
+    parser.add_argument("--preferred-codec", choices=["truehd", "eac3", "ac3"], default="truehd",
+                        help="Preferred Atmos audio codec (default: truehd)")
+
     args = parser.parse_args()
 
     # Initialize for CLI (no UI handler)
     init()
 
-    rip_album_to_library(_clean_path_arg(args.source), args.artist, args.album, _clean_path_arg(args.library_root))
-
+    rip_album_to_library(
+        _clean_path_arg(args.source),
+        args.artist,
+        args.album,
+        _clean_path_arg(args.library_root),
+        output_container=f".{args.output_container}",
+        preferred_codec=args.preferred_codec
+    )
 
 if __name__ == "__main__":
     main()

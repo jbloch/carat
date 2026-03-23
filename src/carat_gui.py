@@ -36,7 +36,7 @@ class OutputProfile(Enum):
     """Output format specification."""
     M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", ".m4a", "truehd")
     M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", ".m4a", "eac3")
-    MP4_LOSSY = ("MP4 Lossy Video (Dolby Digital+) [Auto Sound, Soundbars]", ".mp4", "eac3")
+    MP4_LOSSY = ("MP4 Lossy Video (Dolby Digital+) [Cars, Soundbars]", ".mp4", "eac3")
     MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", ".mkv", "truehd")
 
     def __init__(self, display_name: str, container: str, codec: str):
@@ -279,6 +279,7 @@ class CaratGUI:
         self.dest_var.trace_add("write", self._evaluate_button_state)
         self.artist_var.trace_add("write", self._evaluate_button_state)
         self.album_var.trace_add("write", self._evaluate_button_state)
+        self.output_format_var.trace_add("write", self._evaluate_button_state)
 
         # Force an initial evaluation on startup
         self._evaluate_button_state()
@@ -394,7 +395,7 @@ class CaratGUI:
         # Translate the UI Profile into orthogonal backend parameters
         selected_string = self.output_format_var.get()
         profile = OutputProfile.from_display_string(selected_string)
-        target_container = profile.container
+        output_container = profile.container
         preferred_codec = profile.codec
 
         self.progress_bar.config(mode='indeterminate')
@@ -402,15 +403,15 @@ class CaratGUI:
 
         # Pass the new parameters to the thread
         thread = threading.Thread(target=self._run_logic,
-                                  args=(source, artist, album, music_lib_root, target_container, preferred_codec))
+                                  args=(source, artist, album, music_lib_root, output_container, preferred_codec))
         thread.daemon = True
         thread.start()
 
-    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str, target_container: str,
+    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str, output_container: str,
                    preferred_codec: str) -> None:
         """The worker thread function."""
         try:
-            carat.rip_album_to_library(source, artist, album, music_lib_root, target_container, preferred_codec)
+            carat.rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
             self.log_queue.put("[+] Process Complete.")
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
