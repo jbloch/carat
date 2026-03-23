@@ -183,7 +183,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
         msg = _parse_makemkv_msg(line)
         if msg:
             logger.emit(f"[*] {msg}")
-        elif not line.startswith(("DRV:", "TDRV:", "CIDC:", "SINFO:", "TINFO:", "CINFO:")):
+        elif not line.startswith(("DRV:", "TDRV:", "CIDC:", "SINFO:", "TINFO:", "CINFO:", "TCOUNT:")):
             logger.emit(line)
 
         env["last_was_progress"] = False
@@ -359,14 +359,18 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
         # Sort by: 1. Track diff (ascending), 2. Similarity (descending)
         matched.sort(key=lambda c: (chapter_count - len(c['tracks']), -get_similarity(c)))
 
-        logger.emit(f"    [*] MB Candidate Scoreboard for {chapter_count} tracks:")
+        logger.emit(f"\n[*] Evaluating Candidates (Target: {chapter_count} tracks)...")
+        eliminated = len(candidates) - len(matched)
+        if eliminated > 0:
+            logger.emit(f"    -> Eliminated {eliminated} candidates (Track count Δ exceeded tolerance).")
+
         for c in matched:
             diff = chapter_count - len(c['tracks'])
             sim = get_similarity(c)
-            logger.emit(f"        -> [Δ={diff}, Sim={sim:.2f}] {c['artist']} - {c['title']}")
+            logger.emit(f"        -> [Δ={diff}, Sim={sim:.2f}] {c['title']} ({c.get('year', 'Unknown')}) [MBID: {c.get('mbid', 'Unknown')}]")
 
         winner = matched[0]
-        logger.emit(f"    [+] Selected MB Candidate: {winner['artist']} - {winner['title']}")
+        logger.emit(f"    [+] Selected Winner: {winner['title']} ({winner.get('year', 'Unknown')}) [MBID: {winner.get('mbid', 'Unknown')}]")
         return winner
 
     return None
@@ -587,36 +591,39 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
     Returns the index of the highest quality Atmos stream based on the preferred_codec,
     with appropriate fallbacks and warnings.
     """
+    logger.emit("\n[*] === AUDIO STREAM ANALYSIS ===")
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for Atmos Stream")
     try:
         streams = json.loads(res).get('streams', [])
+        idx = None
 
         # 1. Hunt for the user's explicit preference first
         preferred_candidates = [s for s in streams if s.get('codec_name') == preferred_codec]
         if preferred_candidates:
-            return int(max(preferred_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+            idx = int(max(preferred_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
         # 2. The IAA Fallback: If caller wanted TrueHD but it's not there, grab E-AC-3
-        if preferred_codec == "truehd":
+        elif preferred_codec == "truehd":
             eac3_candidates = [s for s in streams if s.get('codec_name') == "eac3"]
             if eac3_candidates:
-                logger.emit("[!] =========================================================")
-                logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC.")
-                logger.emit("[!] =========================================================")
-                return int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+                logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC!")
+                idx = int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
         # 3. The Absolute Fallback: Basic AC-3 (5.1)
-        ac3_candidates = [s for s in streams if s.get('codec_name') == "ac3"]
-        if ac3_candidates:
-            logger.emit("[!!!] ======================================================================")
-            logger.emit("[!!!] WARNING: NO ATMOS METADATA DETECTED! Falling back to 5.1 channel AC-3.")
-            logger.emit("[!!!] ======================================================================")
+        if idx is None:
+            ac3_candidates = [s for s in streams if s.get('codec_name') == "ac3"]
+            if ac3_candidates:
+                logger.emit("[!] WARNING: NO ATMOS METADATA DETECTED! Falling back to 5.1 channel AC-3!")
+                idx = int(max(ac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
-            return int(max(ac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+        if idx is not None:
+            selected = next((s for s in streams if int(s.get('index', -1)) == idx), None)
+            if selected:
+                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name')}, {selected.get('channels')} channels)")
 
-        return None
+        return idx
     except json.JSONDecodeError:
         return None
 
@@ -661,7 +668,7 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
     from the others. (The assumption is that all members of a release group with the same track-count will
     have the same track sequence, so we only need one release per track count, and it doesn't matter which one.)
     """
-    logger.emit("\n[*] === STARTING METADATA FETCH (MULTI-EDITION SEARCH) ===")
+    logger.emit("\n[*] === STARTING METADATA FETCH ===")
 
     rg_id, rg_artist, rg_title = find_release_group(album, artist)
     if not rg_id:
@@ -669,15 +676,13 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
         return []
 
     releases = find_releases_and_dates_for_release_group(rg_id, rg_title)
-    logger.emit(
-        f"    [+] Found {len(releases)} matching releases for {rg_artist} - {rg_title} (RG ID: {rg_id})."
-    )
+    logger.emit(f"    -> Filtered down to {len(releases)} matching releases.")
+
     if not releases:
         logger.emit("    [-] No matching releases found. Aborting metadata fetch.")
         return []
 
     candidates = fetch_tracklists_for_releases(releases, rg_id, rg_artist, rg_title)
-    logger.emit(f"    [+] Metadata fetch complete. Returning {len(candidates)} candidates.")
     return candidates
 
 
@@ -691,7 +696,7 @@ def find_release_group(album: str, artist: str) -> tuple[str | None, str | None,
 
     for is_strict in [True, False]:
         query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
-        logger.emit(f"    [*] Executing Query: {query}")
+        logger.emit(f"[*] Executing Query: {query}")
         try:
             res = mb.search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
             for r in res.get('release-list', []):
@@ -732,9 +737,9 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
                 break  # We've reached the end of the list
             offset += limit
 
-        logger.emit(f"[+] API returned {len(releases)} editions for '{rg_title}'.")
+        logger.emit(f"    -> API returned {len(releases)} editions in this group.")
     except mb.WebServiceError as e:
-        logger.emit(f"[!] Error fetching releases: {e}")
+        logger.emit(f"    [!] Error fetching releases: {e}")
         return []
 
     unique_releases = {}
@@ -757,14 +762,14 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
                 seen_counts.add(m_count)
                 unique_releases[r['id']] = r.get('date', '')[:4]
 
-    logger.emit(f"[+] Identified unique track counts: {sorted(list(seen_counts))}")
+    logger.emit(f"    -> Identified unique track counts: {sorted(list(seen_counts))}")
     return [(r_id, date) for r_id, date in unique_releases.items()]
 
 
 def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                                   rg_id: str, rg_artist: str, rg_title: str) -> list[dict[str, Any]]:
     """Fetch the tracklists for the given release ids (and dates), which pertain to the given release group metadata"""
-    logger.emit(f"    [*] Fetching tracklists for {len(release_ids_and_dates)} editions...")
+    logger.emit(f"\n[*] Fetching tracklists for {len(release_ids_and_dates)} matching editions in release group {rg_id}...")
     candidates = []
     for rel_id, year in release_ids_and_dates:
         try:
@@ -784,13 +789,13 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                         'title': rg_title,
                         'artist': rg_artist,
                         'year': year or 'Unknown',
-                        'mbid': rg_id,
+                        'mbid': rel_id,  # Specific edition MBID instead of the Release Group ID
                         'tracks': medium_tracks
                     })
         except mb.WebServiceError:
             continue
+    logger.emit(f"    [+] Metadata fetch complete. Built {len(candidates)} total candidates.")
     return candidates
-
 
 def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
     """
@@ -1028,17 +1033,17 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             canonicalized_artist = info.get('artist', artist)
             canonicalized_album = info.get('title', album)
             if (artist != canonicalized_artist) or (album != canonicalized_album):
-                logger.emit(f"[*] Canonicalized as Artist: {canonicalized_artist}, Album: {canonicalized_album}")
+                logger.emit(f"    [+] Canonicalized as Artist: {canonicalized_artist}, Album: {canonicalized_album}")
                 artist = canonicalized_artist
                 album = canonicalized_album
         else:
-            logger.emit(f"[*] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
+            logger.emit(f"    [!] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
             info = {'artist': artist, 'title': album, 'year': 'Unknown'}
 
         clean_artist = _sanitize_filename(artist)
         clean_album = _sanitize_filename(album)
         if (clean_artist != artist) or (clean_album != album):
-            logger.emit(f"[*] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
+            logger.emit(f"    [+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
         dest = lib_path / clean_artist / f"{clean_album} (Atmos)"
         dest.mkdir(parents=True, exist_ok=True)
 
