@@ -13,7 +13,7 @@ supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B2.1"
+__version__ = "1.0B2.2"
 
 __all__ = ['rip_album_to_library']
 
@@ -1048,6 +1048,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         dest.mkdir(parents=True, exist_ok=True)
 
         # 3. Final Assembly (Concurrent)
+
         idx = find_atmos_stream(atmos_mkv, preferred_codec)
         if idx is None:
             raise ValueError("No compatible audio stream (TrueHD, E-AC-3, or AC-3) found in master file.")
@@ -1077,22 +1078,49 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     logger.emit(f"    [!] Cover art fetch failed ({type(e).__name__}). Falling back to black screen.")
 
             # 3. Build container-specific FFmpeg remuxing command and execute it
-            if output_container == ".mp4": # Nominal video, and appropriate "branding" to satisfy hardware decoders
+            if output_container == ".mp4":
+                # This code meticulously duplicates the details of a file known to work on a Mercedes MBUX audio system
                 cmd = [TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats"]
 
+                # INPUT HANDLING: Read at 1 fps to eliminate the software scaling bottleneck
                 if has_cover_art:
                     cmd.extend(["-loop", "1", "-framerate", "1", "-i", str(dest / "cover.jpg")])
                 else:
-                    cmd.extend(["-f", "lavfi", "-i", "color=c=black:s=720x480:r=1"])
+                    cmd.extend(["-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=1"])
 
                 cmd.extend([
                     "-probesize", "100M", "-analyzeduration", "100M",
                     "-i", str(atmos_mkv),
                     "-map", "0:v", "-map", f"1:{idx}",
                     "-metadata", f"title={album}",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-tune", "stillimage", "-pix_fmt", "yuv420p",
-                    "-c:a", "copy", "-shortest",
-                    "-brand", "mp42", "-f", "mp4", "-movflags", "+faststart", "-strict", "-2"
+
+                    # VIDEO ENCODING: Pure software, deterministic output
+                    "-c:v", "libx264",
+                    "-preset", "superfast", "-tune", "stillimage",
+                    "-crf", "30",  # Maintain high visual quality while keeping file size low
+
+                    # VIDEO FORMATTING: Strict MBUX-compatible standard (1080p, 23.976fps, High Profile)
+                    "-vf",
+                    "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                    "-r", "24000/1001",
+                    "-profile:v", "high", "-level", "4.1",
+                    "-pix_fmt", "yuv420p",
+
+                    # COLOR SPACE: Force HD Broadcast Standard (BT.709)
+                    "-color_primaries", "bt709",
+                    "-color_trc", "bt709",
+                    "-colorspace", "bt709",
+                    "-color_range", "tv",
+
+                    # GOP: Standard Broadcast (2 seconds at 24fps)
+                    "-g", "48",
+                    "-keyint_min", "24",
+
+                    # AUDIO & CONTAINER
+                    "-c:a", "copy",
+                    "-shortest",
+                    "-brand", "mp42",  # Critical MBUX handshake
+                    "-f", "mp4", "-movflags", "+faststart", "-strict", "-2"
                 ])
             else:  # m4a or mkv; audio only
                 cmd = [
