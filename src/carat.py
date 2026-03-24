@@ -1094,19 +1094,20 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     "-map", "0:v", "-map", f"1:{idx}",
                     "-metadata", f"title={album}",
 
-                    # VIDEO ENCODING: Pure software, deterministic output
+                    # VIDEO ENCODING: Strict Constant Bitrate (CBR) and 4 Slices
                     "-c:v", "libx264",
                     "-preset", "superfast", "-tune", "stillimage",
-                    "-crf", "30",  # Maintain high visual quality while keeping file size low
+                    "-x264-params", "slices=4",
+                    "-b:v", "2000k", "-maxrate", "2000k", "-minrate", "2000k", "-bufsize", "4000k",
 
-                    # VIDEO FORMATTING: Strict MBUX-compatible standard (1080p, 23.976fps, High Profile)
+                    # VIDEO FORMATTING: Strict MBUX-compatible standard
                     "-vf",
                     "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
                     "-r", "24000/1001",
                     "-profile:v", "high", "-level", "4.1",
                     "-pix_fmt", "yuv420p",
 
-                    # COLOR SPACE: Force HD Broadcast Standard (BT.709)
+                    # COLOR SPACE: Force HD Broadcast Standard
                     "-color_primaries", "bt709",
                     "-color_trc", "bt709",
                     "-colorspace", "bt709",
@@ -1116,10 +1117,14 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     "-g", "48",
                     "-keyint_min", "24",
 
+                    # STRIP DEFAULT TRACK ROUTING
+                    "-disposition:v", "0",
+                    "-disposition:a", "0",
+
                     # AUDIO & CONTAINER
                     "-c:a", "copy",
                     "-shortest",
-                    "-brand", "mp42",  # Critical MBUX handshake
+                    "-brand", "mp42",
                     "-f", "mp4", "-movflags", "+faststart", "-strict", "-2"
                 ])
             else:  # m4a or mkv; audio only
