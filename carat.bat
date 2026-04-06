@@ -58,14 +58,45 @@ REM ----------------------------------------------------
 where ffmpeg >nul 2>nul
 if %errorlevel% equ 0 goto :CHECK_MKVTOOLNIX
 
-echo [*] FFmpeg not found. Auto-installing via Winget...
+echo [*] FFmpeg not found.
+
+REM Detect ARM64 architecture to avoid installing an emulated x64 version
+if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" goto :INSTALL_FFMPEG_ARM64
+if /i "%PROCESSOR_ARCHITEW6432%"=="ARM64" goto :INSTALL_FFMPEG_ARM64
+
+echo [*] Auto-installing x64 FFmpeg via Winget...
 winget install -e --id Gyan.FFmpeg --accept-source-agreements --accept-package-agreements
 if %errorlevel% neq 0 goto :MANUAL_FFMPEG
 set REQUIRES_RESTART=1
 goto :CHECK_MKVTOOLNIX
 
+:INSTALL_FFMPEG_ARM64
+echo [*] Windows ARM64 detected! Bypassing Winget to fetch native ARM64 build...
+if not exist "%~dp0tools" mkdir "%~dp0tools"
+
+REM Skip download if we already extracted it in a previous run
+if exist "%~dp0tools\ffmpeg-arm64\bin\ffmpeg.exe" goto :ADD_ARM64_FFMPEG
+
+echo [*] Downloading BtbN FFmpeg ARM64 from GitHub...
+curl -L -o "%~dp0tools\ffmpeg-arm64.zip" "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-arm64-gpl.zip"
+if %errorlevel% neq 0 goto :MANUAL_FFMPEG
+
+echo [*] Extracting FFmpeg...
+tar -xf "%~dp0tools\ffmpeg-arm64.zip" -C "%~dp0tools"
+if %errorlevel% neq 0 goto :MANUAL_FFMPEG
+
+REM Rename the extracted folder to a predictable, clean path and clean up the zip
+move /Y "%~dp0tools\ffmpeg-master-latest-win64-arm64-gpl" "%~dp0tools\ffmpeg-arm64" >nul
+del "%~dp0tools\ffmpeg-arm64.zip"
+
+:ADD_ARM64_FFMPEG
+REM Add the local ARM64 bin folder to the session PATH so python's shutil.which() finds it
+set "PATH=%~dp0tools\ffmpeg-arm64\bin;%PATH%"
+goto :CHECK_MKVTOOLNIX
+
 :MANUAL_FFMPEG
-echo [!] Winget install failed. Install FFmpeg manually and restart this script.
+echo [!] Install failed.
+echo Please install FFmpeg manually and restart this script.
 pause
 exit /b 1
 
