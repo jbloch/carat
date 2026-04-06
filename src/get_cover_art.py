@@ -69,15 +69,22 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
 def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> str | None:
     """ Returns the URL of acceptable album art from MusicBrainz, or None if not found. """
     logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...")
-    image_url = None
     try:
         if mbid:
-            rg_id = mbid
-        else:
+            # 1. We have the exact Release ID! Check it directly first.
+            exact_url = get_mb_art_url_from_releases([{'id': mbid}])
+            if exact_url:
+                return exact_url
+
+            # 2. If the exact release has no art, grab its parent Release Group ID to check siblings
+            release_info = mb.get_release_by_id(mbid, includes=["release-groups"])
+            rg_id = release_info['release']['release-group']['id']
+        else: # 3 No Release ID given, get a release group ID from the artist and album names
             release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
             if release_groups['release-group-count'] == 0: return None
             rg_id = release_groups['release-group-list'][0]['id']
 
+        # Fallback: Search all official releases in the release group
         releases = mb.get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
 
         # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
@@ -86,9 +93,12 @@ def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> 
         if not image_url:
             official = [r for r in releases if r.get('status') == 'Official']
             image_url = get_mb_art_url_from_releases(official)
-    except (mb.MusicBrainzError, KeyError, IndexError):
+
+        return image_url
+    except (mb.MusicBrainzError, KeyError, IndexError) as e:
+        logger.emit(f"  [!] MusicBrainz API Error: {e}")
         pass
-    return image_url
+    return None
 
 
 def get_mb_art_url_from_releases(releases)-> str | None:

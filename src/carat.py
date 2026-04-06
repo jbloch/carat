@@ -703,11 +703,19 @@ def find_release_group(album: str, artist: str) -> tuple[str | None, str | None,
                 found_artist = extract_artist_from_musicbrainz_metadata(r)
                 found_album = r.get('title', 'Unknown')
 
-                if _is_safe_match(artist, found_artist) and _is_safe_match(album, found_album):
+                # Evaluate matches for plausibility, with "substring leniency"
+                artist_match = _is_safe_match(artist, found_artist)
+                album_match = _is_safe_match(album, found_album)
+
+                if artist_match and album_match:
                     rg_id = r.get('release-group', {}).get('id')
                     rg_title, rg_artist = found_album, found_artist
                     logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})")
                     break
+                else:
+                    logger.emit(
+                        f"    [-] Rejected Candidate: {found_artist} - {found_album} (Artist Match: {artist_match}, Album Match: {album_match})")
+
         except mb.WebServiceError as e:
             logger.emit(f"    [!] API Error: {e}")
         if rg_id:
@@ -825,9 +833,14 @@ def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
 def _is_safe_match(expected: str, found: str) -> bool:
     """
     Compares two strings for similarity after stripping all spaces and punctuation.
-    Prevents false negatives from stylized acronyms (e.g., 'REM' vs. 'R.E.M.') while
-    guarding against completely mismatched albums.
+    Acts as a lenient gatekeeper: allows pure substrings (for truncated titles or
+    collaborations) or highly similar strings (for typos/acronyms).
     """
+    # Universal substring safety valve for messy artist collaborations or truncated titles
+    # (e.g., "Scary Monsters" in "Scary Monsters (and Super Creeps)")
+    if expected.lower() in found.lower():
+        return True
+
     safe_expected = normalize_for_fuzzy_comparison(expected).replace(" ", "")
     safe_found = normalize_for_fuzzy_comparison(found).replace(" ", "")
 
@@ -1058,8 +1071,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
             # 1. Generate the cue sheet, injecting the correct target extension
             final_audio_name = f"{clean_album} (Atmos){output_container}"
-            if info and (tracks := info.get('tracks')):
-                chapters = chapters[:len(tracks)]   # Eliminate final "ghost chapter" if it exists
+            if tracks:
+                chapters = chapters[:len(tracks)]  # Eliminate final "ghost chapter" if it exists
             generate_cue_sheet(dest / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
 
             # 2. If we are building a video file for a car, wait for the cover art now
