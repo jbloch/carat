@@ -628,21 +628,6 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
         return None
 
 
-def remux_mkv_to_m4a(mkv_path: Path, m4a_path: Path, album_title: str, total_duration: float = 0) -> None:
-    """Remuxes the specified mkv file into a chapterless m4a file"""
-    idx = find_atmos_stream(mkv_path)
-    if idx is None: raise ValueError("No TrueHD stream found.")
-
-    cmd = [
-        TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
-        "-i", str(mkv_path), "-map", f"0:{idx}",
-        "-metadata", f"title={album_title}", "-c:a", "copy",
-        "-f", "mp4", "-movflags", "+faststart", "-strict", "-2",
-        "-fflags", "+genpts", "-map_chapters", "-1", "-y", str(m4a_path)
-    ]
-    run_command(cmd, "Finalizing Atmos M4A", {"ffmpeg_duration": total_duration})
-
-
 def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], float]:
     """Returns a list of chapters and the total duration in seconds from the given mkv file."""
     # We add -show_format to get the duration
@@ -1034,7 +1019,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     TMP_DIR.mkdir(parents=True, exist_ok=True)
 
     try:
-        # 1. MKV Acquisition Phase
+        # 1. Acquire Master MKV
         atmos_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album)
 
         # 2. Canonicalization & Sanitization of artist and album title
@@ -1075,82 +1060,17 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 chapters = chapters[:len(tracks)]  # Eliminate final "ghost chapter" if it exists
             generate_cue_sheet(dest / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
 
-            # 2. If we are building a video file for a car, wait for the cover art now
-            has_cover_art = False
-            if output_container == ".mp4":
-                logger.emit("    [*] Checking cover art status for video stream...")
-                try:
-                    # Give it a 5-second grace period if it hasn't finished during the MakeMKV scan
-                    cover_future.result(timeout=5)
-                    has_cover_art = (dest / "cover.jpg").exists()
-                    if has_cover_art:
-                        logger.emit("    [+] Cover art ready. Building visual audio track.")
-                except concurrent.futures.TimeoutError:
-                    logger.emit("    [!] Cover art fetch timed out. Falling back to black screen.")
-                except Exception as e:
-                    logger.emit(f"    [!] Cover art fetch failed ({type(e).__name__}). Falling back to black screen.")
-
-            # 3. Build container-specific FFmpeg remuxing command and execute it
-            if output_container == ".mp4":
-                # This code meticulously duplicates the details of a file known to work on a Mercedes MBUX audio system
-                cmd = [TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats"]
-
-                # INPUT HANDLING: Read at 1 fps to eliminate the software scaling bottleneck
-                if has_cover_art:
-                    cmd.extend(["-loop", "1", "-framerate", "1", "-i", str(dest / "cover.jpg")])
-                else:
-                    cmd.extend(["-f", "lavfi", "-i", "color=c=black:s=1920x1080:r=1"])
-
-                cmd.extend([
-                    "-probesize", "100M", "-analyzeduration", "100M",
-                    "-i", str(atmos_mkv),
-                    "-map", "0:v", "-map", f"1:{idx}",
-                    "-metadata", f"title={album}",
-
-                    # VIDEO ENCODING: Strict Constant Bitrate (CBR) and 4 Slices
-                    "-c:v", "libx264",
-                    "-preset", "superfast", "-tune", "stillimage",
-                    "-x264-params", "slices=4",
-                    "-b:v", "2000k", "-maxrate", "2000k", "-minrate", "2000k", "-bufsize", "4000k",
-
-                    # VIDEO FORMATTING: Strict MBUX-compatible standard
-                    "-vf",
-                    "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-                    "-r", "24000/1001",
-                    "-profile:v", "high", "-level", "4.1",
-                    "-pix_fmt", "yuv420p",
-
-                    # COLOR SPACE: Force HD Broadcast Standard
-                    "-color_primaries", "bt709",
-                    "-color_trc", "bt709",
-                    "-colorspace", "bt709",
-                    "-color_range", "tv",
-
-                    # GOP: Standard Broadcast (2 seconds at 24fps)
-                    "-g", "48",
-                    "-keyint_min", "24",
-
-                    # STRIP DEFAULT TRACK ROUTING
-                    "-disposition:v", "0",
-                    "-disposition:a", "0",
-
-                    # AUDIO & CONTAINER
-                    "-c:a", "copy",
-                    "-shortest",
-                    "-brand", "mp42",
-                    "-f", "mp4", "-movflags", "+faststart", "-strict", "-2"
-                ])
-            else:  # m4a or mkv; audio only
-                cmd = [
-                    TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
-                    "-probesize", "100M", "-analyzeduration", "100M",
-                    "-i", str(atmos_mkv), "-map", f"0:{idx}",
-                    "-metadata", f"title={album}", "-c:a", "copy"
-                ]
-                if output_container == ".m4a":
-                    cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
-                else:
-                    cmd.extend(["-f", "matroska"])
+            # Remux Master MKV into requested output format
+            cmd = [
+                TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
+                "-probesize", "100M", "-analyzeduration", "100M",
+                "-i", str(atmos_mkv), "-map", f"0:{idx}",
+                "-metadata", f"title={album}", "-c:a", "copy"
+            ]
+            if output_container == ".m4a":
+                cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
+            else:
+                cmd.extend(["-f", "matroska"])
 
             cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
             run_command(cmd, f"Finalizing Atmos {output_container[1:].upper()}", {"ffmpeg_duration": duration})
@@ -1179,10 +1099,10 @@ def main():
     parser.add_argument("library_root", help="Destination music library root")
 
     # Optional flags for format selection
-    parser.add_argument("--output-container", choices=["m4a", "mp4", "mkv"], default="m4a",
+    parser.add_argument("--output-container", choices=["m4a", "mkv"], default="m4a",
                         help="Output container format (default: m4a)")
     parser.add_argument("--preferred-codec", choices=["truehd", "eac3", "ac3"], default="truehd",
-                        help="Preferred Atmos audio codec (default: truehd)")
+                        help="Preferred audio codec (default: truehd)")
 
     args = parser.parse_args()
 

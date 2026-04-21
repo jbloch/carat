@@ -36,7 +36,6 @@ class OutputProfile(Enum):
     """Output format specification."""
     M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", ".m4a", "truehd")
     M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", ".m4a", "eac3")
-    MP4_LOSSY = ("MP4 Lossy Video (Dolby Digital+) [Cars, Soundbars]", ".mp4", "eac3")
     MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", ".mkv", "truehd")
 
     def __init__(self, display_name: str, container: str, codec: str):
