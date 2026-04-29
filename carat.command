@@ -100,6 +100,12 @@ if [ ! -d ".venv" ]; then
     python3 -m venv .venv
 fi
 
+# Homebrew's python does not include tkinter by default!!!
+if ! python3 -c "import tkinter" &>/dev/null; then
+    echo "[*] Python Tkinter missing. Installing via Homebrew..."
+    brew install python-tk
+fi
+
 # Activate
 source .venv/bin/activate
 
@@ -123,8 +129,8 @@ fi
 # ---------------------------------------------------------
 echo "[*] Launching Carat..."
 
-# Launch in background, suppressing output
-nohup python3 src/carat_gui.py >/dev/null 2>&1 &
+# Launch in background, redirecting output to a debug log, so failure post-mortem is possible
+nohup python3 src/carat_gui.py > .venv/carat_crash.log 2>&1 &
 
 # Force Terminal.app to close the active window, ignoring errors
 # (in case they somehow launched this from iTerm2)
