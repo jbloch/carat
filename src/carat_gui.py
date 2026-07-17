@@ -37,6 +37,7 @@ class OutputProfile(Enum):
     M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", ".m4a", "truehd")
     M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", ".m4a", "eac3")
     MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", ".mkv", "truehd")
+    FLAC = ("FLAC (Legacy non-Atmos surround) [All Devices]", ".flac", "highest_lossless")
 
     def __init__(self, display_name: str, container: str, codec: str):
         self.display_name = display_name
@@ -65,7 +66,7 @@ class CaratGUI:
                     self.progress_queue.put(val)
                 except ValueError:
                     pass
-            elif ("Remuxing:" in msg or "Merging:" in msg) and "[" in msg and "%]" in msg:
+            elif ("Remuxing:" in msg or "Merging:" in msg or "Slicing:" in msg) and "[" in msg and "%]" in msg:
                 try:
                     start = msg.find("[") + 1
                     end = msg.find("%]")
@@ -160,7 +161,7 @@ class CaratGUI:
             self.btn_rip.config(state="disabled", text="Fill in Blank Fields (above)")
         else:
             # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
-            self.btn_rip.config(state="normal", text="Rip Atmos")
+            self.btn_rip.config(state="normal", text="Rip")
 
     def _init_ui(self) -> None:
         """Constructs the GUI."""
@@ -252,7 +253,7 @@ class CaratGUI:
         frame_actions = ttk.Frame(self.parent)
         frame_actions.pack(fill="x", padx=15, pady=10)
 
-        self.btn_rip = ttk.Button(frame_actions, text="RIP ATMOS", command=self._start_rip_thread)
+        self.btn_rip = ttk.Button(frame_actions, text="Rip", command=self._start_rip_thread)
         self.btn_rip.pack(side="left", fill="x", expand=True, padx=(0, 5))
 
         self.btn_clear = ttk.Button(frame_actions, text="Clear Console", command=self._clear_console)
@@ -411,7 +412,7 @@ class CaratGUI:
         """The worker thread function."""
         try:
             carat.rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
-            self.log_queue.put("[+] Process Complete.")
+            # self.log_queue.put("[+] Process Complete.")
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
         finally:
@@ -485,21 +486,24 @@ class CaratGUI:
                 continue
             self.lbl_status.config(text=msg)
 
-            # ONLY switch to indeterminate (bounce) if we are remuxing WITHOUT a percentage
-            if "Remuxing" in msg and "%" not in msg and self.progress_bar.cget("mode") != "indeterminate":
+            # ONLY switch to indeterminate (bounce) if we are processing WITHOUT a percentage
+            if ("Remuxing" in msg or "Slicing" in msg) and "%" not in msg and self.progress_bar.cget(
+                    "mode") != "indeterminate":
                 self.progress_bar.config(mode="indeterminate")
                 self.progress_bar.start(50)  # 50 ms. refresh interval
-                self.btn_rip.config(text="Remuxing...")
+                self.btn_rip.config(text="Processing...")
 
             # If we DO have a percentage (bracket style), ensure we stay Determinate
-            # --- PATCH: Also catch "Merging" for mkvmerge ---
-            elif ("Remuxing" in msg or "Merging" in msg) and "[" in msg and "%]" in msg:
+            # --- PATCH: Catch Remuxing, Merging, and Slicing ---
+            elif ("Remuxing" in msg or "Merging" in msg or "Slicing" in msg) and "[" in msg and "%]" in msg:
                 if self.progress_bar.cget("mode") != "determinate":
                     self.progress_bar.stop()
                     self.progress_bar.config(mode="determinate")
 
                 if "Merging" in msg:
                     self.btn_rip.config(text="Merging Audio Files...")
+                elif "Slicing" in msg:
+                    self.btn_rip.config(text="Slicing Tracks...")
                 else:
                     self.btn_rip.config(text="Remuxing...")
 

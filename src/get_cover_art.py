@@ -202,7 +202,7 @@ def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | No
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
 
-        # Save as high-quality JPEG for Kodi
+        # Save as high-quality JPEG
         save_path = target_dir / "cover.jpg"
         img.save(save_path, "JPEG", quality=95)
         logger.emit(f"[+] Success: Saved {img.width}x{img.height} cover to {save_path}")

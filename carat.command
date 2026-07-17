@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Carat Launcher for macOS - inlcudes intaller, which runs to the extent necessary for a successful launch
+# Carat Launcher for macOS - includes installer, which runs to the extent necessary for a successful launch
 # 1. Checks for Homebrew (The "Package Manager")
 # 2. Checks for Dependencies (ffmpeg, mkvmerge, python3)
 # 3. Sets up virtual environment

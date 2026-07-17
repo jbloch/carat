@@ -33,6 +33,8 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+# noinspection PyProtectedMember
+from mutagen.flac import FLAC, Picture
 from pathlib import Path
 from typing import Any, Callable, NoReturn
 
@@ -116,7 +118,7 @@ def _ensure_writable(path: Path) -> None:
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
 def _process_output_line(line: str, output_acc: list[str], env: dict):
-    """Process the given line of output from a MakeMKV subprocess and emit the processed output to the logger."""
+    """Process the given line of output from a subprocess and emit the processed output to the logger."""
     line = line.rstrip('\r\n')
     if not line: return
 
@@ -136,7 +138,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
                 if max_val > 0 and env.get("is_extracting"):
                     pct = (current / max_val) * 100
                     if 0 <= pct <= 100:
-                        logger.emit(f"    Atmos Extraction: {pct:.1f}%", is_progress=True)
+                        logger.emit(f"    Extraction: {pct:.1f}%", is_progress=True)
             except (IndexError, ValueError):
                 pass
 
@@ -154,11 +156,18 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
             clean_stats = line.strip().replace("frame=", "")
 
             total = env.get("ffmpeg_duration", 0)
+            offset = env.get("ffmpeg_time_offset", 0.0)
+
             if total > 0:
-                pct = (current_seconds / total) * 100
-                logger.emit(f"Remuxing: [{pct:.1f}%] {clean_stats}", is_progress=True)
+                pct = ((current_seconds + offset) / total) * 100
+                pct = min(pct, 100.0)  # Clamp to 100% just in case
+
+                # Allow dynamic prefix for different stages (Slicing vs. Remuxing)
+                prefix = env.get("ffmpeg_prefix", "Remuxing")
+                logger.emit(f"{prefix}: [{pct:.1f}%] {clean_stats}", is_progress=True)
             else:
-                logger.emit(f"Remuxing: {clean_stats}", is_progress=True)
+                prefix = env.get("ffmpeg_prefix", "Remuxing")
+                logger.emit(f"{prefix}: {clean_stats}", is_progress=True)
         except (ValueError, IndexError):
             pass
 
@@ -229,23 +238,25 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
 
     if process.returncode != 0:
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
-    emit_summary_log(output_acc, start_time)
+    emit_summary_log(output_acc, start_time, env)
     return "\n".join(output_acc)
 
 
-def emit_summary_log(entire_log: list[Any], start_time: float):
-    """Emits to the logger a summary of a completed rip based on the given log and start time."""
+def emit_summary_log(entire_log: list[Any], start_time: float, env: dict | None = None):
+    """Emits to the logger a summary of a completed task based on the given log and start time."""
     elapsed = time.time() - start_time
     # 1. Search backwards through the accumulated log for ffmpeg's final stats
     final_stats = next((line for line in reversed(entire_log) if "size=" in line and "time=" in line), None)
 
     if final_stats:
         clean_stats = final_stats.strip().replace("frame=", " ")
-        summary = f"[+] Remux finished in {elapsed:.1f}s -> {clean_stats}"
+        action = "Slice" if env and env.get("ffmpeg_prefix") == "Slicing" else "Remux"
+        summary = f"[+] {action} finished in {elapsed:.1f}s -> {clean_stats}"
     else:
         summary = f"[+] Task finished in {elapsed:.1f} seconds."
 
     logger.emit(summary)
+    logger.emit("") # Blank line visually separates tasks
 
 
 # --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
@@ -260,6 +271,7 @@ class TitleInfo:
     duration: str = "Unknown"
     size_str: str = "Unknown"
     streams: list[str] = field(default_factory=list)
+
 
 def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
     """Parses the raw text output of 'makemkvcon info' into a dictionary of TitleInfo objects."""
@@ -297,10 +309,24 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
             if len(parts) >= 5:
                 attr_id = parts[2]
                 val = parts[4].strip('"')
+
+                # Attribute 30 is the human-readable stream description
+                # (e.g., "DTS-HD Master Audio Surround 5.1 English")
                 if attr_id == "30":
                     titles[t_idx].streams.append(val)
 
-            # Keep existing score logic (removed redundant inline logging)
+                    # --- LEGACY (non-Atmos) Priorities (based on channel count) ---
+                    match = re.search(r'(\d)\.(\d)', val)
+                    if match:
+                        # 5.1 -> 60, 7.1 -> 80
+                        channels = int(match.group(1)) + int(match.group(2))
+                        titles[t_idx].score = max(titles[t_idx].score, channels * 10)
+                    elif "Surround" in val or "Multichannel" in val:
+                        titles[t_idx].score = max(titles[t_idx].score, 50)
+                    elif "Stereo" in val or "2.0" in val:
+                        titles[t_idx].score = max(titles[t_idx].score, 20)
+
+            # ---  ATMOS Priorities (based on lossiness) ---
             if "A_TRUEHD" in line or "TrueHD Atmos" in line:
                 titles[t_idx].score = max(titles[t_idx].score, 1000)
             elif "A_EAC3" in line and "Atmos" in line:
@@ -376,16 +402,11 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
     return None
 
 
-def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, dict | None]:
+def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[
+    str, dict | None]:
     """
-    Identifies the (likely) main Atmos title by "intersecting" MakeMKV and MusicBrainz metadata.
+    Identifies the (likely) main audio title by "intersecting" MakeMKV and MusicBrainz metadata.
     Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
-
-    Returns:
-        A tuple containing:
-        - winner_idx (str): The MakeMKV title index of the correct Atmos track (e.g., "0").
-        - matched_candidate (dict | None): The exact MusicBrainz metadata dictionary that validated
-          the winning title, or None if the network fetch failed/timed out.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
         # 1. Fire off the network fetch in the background
@@ -406,12 +427,12 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
         except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
             logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
 
-    # Find all Atmos input titles with the same track count as a candidate MusicBrainz releases
+    # Find all input titles with the same track count as a candidate MusicBrainz releases
     if candidates:
         valid_titles = []
         for t_idx, info in titles.items():
             if info.score <= 0:
-                logger.emit(f"    [-] Rejected Title {t_idx} (No Atmos stream detected)")
+                logger.emit(f"    [-] Rejected Title {t_idx} (No valid audio stream detected)")
                 continue
             best_candidate = get_best_mb_candidate(artist, album, info.chapters, candidates)
 
@@ -425,8 +446,8 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
         raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
 
     # noinspection PyShadowingNames
-    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int]:
-        """Sort criterion to rank multiple matches: (MB Relevance Rank, track-count difference, -Size)"""
+    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int, int]:
+        """Sort criterion to rank multiple matches: (MB Relevance Rank, track-count difference, Format Penalty, -Size)"""
         t_idx, matched_candidate = item
 
         # 1. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
@@ -435,24 +456,34 @@ def find_primary_title(source_spec: str, artist: str, album: str) -> tuple[str, 
         # 2. Track-count accuracy: How close is the physical chapter count to the logical track count? (0 or 1)
         diff = abs(titles[t_idx].chapters - len(matched_candidate['tracks'])) if matched_candidate else 0
 
-        # 3. Size: Negated so that larger files sort first when using min()
+        # 3. Format Penalty: Score titles based on user intent (Atmos vs. FLAC)
+        streams_text = " ".join(titles[t_idx].streams).lower()
+        has_atmos = 1 if ("atmos" in streams_text or "truehd" in streams_text) else 0
+
+        if prefer_legacy:
+            format_penalty = has_atmos  # Penalize Atmos titles if user explicitly wants FLAC
+        else:
+            format_penalty = 0 if has_atmos else 1  # Penalize non-Atmos titles if user wants Atmos
+
+        # 4. Size: Negated so that larger files sort first when using min()
         size = titles[t_idx].size
 
-        return rank, diff, -size
+        return rank, diff, format_penalty, -size
 
-    logger.emit("[*] Evaluated Heuristic Scores (MusicBrainz Rank, Track Count Accuracy, File Size):")
+    logger.emit("[*] Evaluated Heuristic Scores (MusicBrainz Rank, Track Count Accuracy, Format Penalty, File Size):")
     for vt in valid_titles:
-        rank, diff, neg_size = sort_key(vt)
-        logger.emit(f"    [-] Title {vt[0]}: MB Rank={rank}, Track Count Δ={diff}, Size={-neg_size} bytes")
+        rank, diff, penalty, neg_size = sort_key(vt)
+        logger.emit(
+            f"    [-] Title {vt[0]}: MB Rank={rank}, Track Count Δ={diff}, Format Penalty={penalty}, Size={-neg_size} bytes")
 
-    # Pick the winner that scores lowest (best) across the 3-tier hierarchy
+    # Pick the winner that scores lowest (best) across the hierarchy
     winner_tuple = min(valid_titles, key=sort_key)
     winner_idx = winner_tuple[0]
     matched_candidate = winner_tuple[1]
 
-    w_rank, w_diff, w_neg_size = sort_key(winner_tuple)
+    w_rank, w_diff, w_penalty, w_neg_size = sort_key(winner_tuple)
     logger.emit(
-        f"[*] Winner: Title {winner_idx} (Rank: {w_rank}, Track count Δ: {w_diff}, Size: {-w_neg_size} bytes, Score: {titles[winner_idx].score})")
+        f"[*] Winner: Title {winner_idx} (Rank: {w_rank}, Track count Δ: {w_diff}, Format Penalty: {w_penalty}, Size: {-w_neg_size} bytes)")
 
     return winner_idx, matched_candidate
 
@@ -628,6 +659,103 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
         return None
 
 
+def get_stream_codec(mkv_path: Path, stream_idx: int) -> str:
+    """Returns the codec name of the specified stream index."""
+    cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=index,codec_name", "-of", "json", str(mkv_path)]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        streams = json.loads(res.stdout).get('streams', [])
+        for s in streams:
+            if int(s.get('index', -1)) == stream_idx:
+                return s.get('codec_name', '').lower()
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
+        pass
+    return ""
+
+
+def sort_key(s):
+    """
+    Sort the valid streams to prioritize:
+    1. Multichannel (>= 4 channels) over Stereo/Mono (< 4 channels)
+    2. Dedicated legacy mixes (non-Atmos) over Atmos mixes
+    3. Channel count descending
+    4. Stream size in bytes descending (advantages 5.1 over Quad when tied on previous criteria)
+    """
+
+    profile = s.get('profile', '').lower()
+    channels = int(s.get('channels', 0))
+
+    # Safely extract the byte size if it exists in the stream tags
+    tags = s.get('tags', {})
+    try:
+        num_bytes = int(tags.get('NUMBER_OF_BYTES', 0))
+    except ValueError:
+        num_bytes = 0
+
+    is_multichannel = 1 if channels >= 4 else 0
+
+    # Penalize Atmos explicitly so standard 5.1/Quad streams bubble to the top
+    is_atmos = 1 if "atmos" in profile else 0
+
+    return -is_multichannel, is_atmos, -channels, -num_bytes
+
+
+def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
+    """
+    Returns a tuple of (stream_index, channel_count) for the best lossless multichannel stream
+    (e.g., LPCM, DTS-HD MA, TrueHD), ignoring lossy streams.
+    Prioritizes dedicated legacy mixes (non-TrueHD) over TrueHD (Atmos).
+    """
+    logger.emit("\n[*] === LOSSLESS MULTICHANNEL STREAM ANALYSIS ===")
+
+    # Add 'tags' to show_entries so we can read the NUMBER_OF_BYTES metadata written by MakeMKV
+    cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=index,channels,codec_name,profile,tags",
+           "-of", "json", str(mkv_path)]
+
+    res = run_command(cmd, "Scanning for Lossless Multichannel Stream")
+    try:
+        streams = json.loads(res).get('streams', [])
+
+        # Valid lossless codecs to look for
+        lossless_codecs = {'truehd', 'pcm_s16le', 'pcm_s24le', 'pcm_s24be', 'mlp', 'alac', 'flac'}
+        valid_streams = []
+
+        for s in streams:
+            codec = s.get('codec_name', '').lower()
+            profile = s.get('profile', '').lower()
+
+            # It's lossless if it's in our set, OR if it's DTS and the profile indicates Master Audio
+            is_lossless = (codec in lossless_codecs) or (
+                        codec == 'dts' and ('master audio' in profile or 'ma' in profile))
+            if is_lossless:
+                valid_streams.append(s)
+
+        if not valid_streams:
+            logger.emit("[!] ERROR: No valid lossless multichannel streams found on disc!")
+            return None
+
+        valid_streams.sort(key=sort_key)
+        best_stream = valid_streams[0]
+
+        idx = int(best_stream.get('index'))
+        channels = int(best_stream.get('channels', 0))
+
+        # Format the size for the logger if available
+        best_tags = best_stream.get('tags', {})
+        size_mb = int(best_tags.get('NUMBER_OF_BYTES', 0)) / (1024 * 1024) if 'NUMBER_OF_BYTES' in best_tags else 0
+        size_str = f", {size_mb:.1f} MB" if size_mb > 0 else ""
+
+        logger.emit(
+            f"[+] Selected Lossless Stream: Index {idx} ({best_stream.get('codec_name')}, {channels} channels{size_str})")
+
+        return idx, channels
+
+    except json.JSONDecodeError:
+        return None
+
+
 def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], float]:
     """Returns a list of chapters and the total duration in seconds from the given mkv file."""
     # We add -show_format to get the duration
@@ -688,7 +816,7 @@ def find_release_group(album: str, artist: str) -> tuple[str | None, str | None,
                 found_artist = extract_artist_from_musicbrainz_metadata(r)
                 found_album = r.get('title', 'Unknown')
 
-                # Evaluate matches for plausibility, with "substring leniency"
+                # Evaluate matches for plausibility with "substring leniency"
                 artist_match = _is_safe_match(artist, found_artist)
                 album_match = _is_safe_match(album, found_album)
 
@@ -936,7 +1064,7 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             pass  # Silent failure for cleanup to prevent app startup crashes
 
 
-def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> tuple[
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[
     Path, dict[str, Any] | None, list[dict[str, Any]], float]:
     """
     Acquires the master MKV file, extracts its chapters/duration, and fetches the matching MusicBrainz metadata.
@@ -960,7 +1088,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> 
     # 2. Execute Source-Specific Acquisition
     if source_spec:
         # --- Handle MakeMKV Supported Formats: Blu-ray, Blu-ray iso, and BDMV folder ---
-        title_idx, matched_candidate = find_primary_title(source_spec, artist, album)
+        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, prefer_legacy)
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
@@ -982,6 +1110,42 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str) -> 
             matched_candidate = candidates[0]
 
     return atmos_mkv, matched_candidate, chapters, duration
+
+
+def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str,
+                    cover_path: Path):
+    """Injects metadata and cover art into the sliced FLAC files."""
+    logger.emit("[*] Applying metadata and embedded artwork to FLAC files...")
+
+    # Preload cover art if it exists
+    pic = None
+    if cover_path.exists():
+        pic = Picture()
+        with open(cover_path, "rb") as f:
+            pic.data = f.read()
+        pic.type = 3  # Front Cover
+        pic.mime = "image/jpeg"
+        pic.desc = "Front Cover"
+
+    for filepath, track_data, track_num in flac_files:
+        audio = FLAC(filepath)
+
+        # Clear existing tags just in case FFmpeg pulled garbage from the MKV
+        audio.delete()
+
+        # Inject standard tags
+        audio['title'] = track_data['title']
+        audio['artist'] = track_data.get('artist', album_artist)
+        audio['albumartist'] = album_artist
+        audio['album'] = album
+        audio['date'] = str(year)
+        audio['tracknumber'] = str(track_num)
+        audio['totaltracks'] = str(len(flac_files))
+
+        if pic:
+            audio.add_picture(pic)
+
+        audio.save()
 
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, output_container: str = ".m4a",
@@ -1014,13 +1178,16 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
       4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible
     """
 
+    ingestion_start_time = time.time()
     lib_path = Path(library_root)
     _ensure_writable(lib_path)
     TMP_DIR.mkdir(parents=True, exist_ok=True)
+    prefer_legacy = (output_container == ".flac")
 
     try:
         # 1. Acquire Master MKV
-        atmos_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album)
+        master_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album,
+                                                                                             prefer_legacy)
 
         # 2. Canonicalization & Sanitization of artist and album title
         info = matched_candidate or {}
@@ -1042,47 +1209,118 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         clean_album = _sanitize_filename(album)
         if (clean_artist != artist) or (clean_album != album):
             logger.emit(f"    [+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
-        dest = lib_path / clean_artist / f"{clean_album} (Atmos)"
-        dest.mkdir(parents=True, exist_ok=True)
+
+        # --- STREAM INTERCEPTION & ROUTING LOGIC ---
+        atmos_idx = None
+        legacy_idx = None
+
+        if output_container != ".flac":
+            atmos_idx = find_atmos_stream(master_mkv, preferred_codec)
+            if atmos_idx is None:
+                logger.emit("\n[!] No Dolby Atmos stream found on source.")
+                logger.emit("[*] Automatically switching to FLAC slicing for legacy lossless surround...")
+                output_container = ".flac"
+
+        # Dynamically set the naming suffix based on the final format and channel count
+        if output_container == ".flac":
+            # We must find the fallback stream now to determine its channel count
+            legacy_info = find_multichannel_stream(master_mkv)
+            if legacy_info is None:
+                raise ValueError(
+                    "No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
+
+            legacy_idx, legacy_channels = legacy_info
+
+            if legacy_channels == 4:
+                suffix = "(Quad)"
+            elif legacy_channels <= 2:
+                suffix = "(Stereo)"  # Just in case a user rips a stereo-only legacy disc
+            else:
+                suffix = "(Surround)"
+        else:
+            suffix = "(Atmos)"
 
         # 3. Final Assembly (Concurrent)
-
-        idx = find_atmos_stream(atmos_mkv, preferred_codec)
-        if idx is None:
-            raise ValueError("No compatible audio stream (TrueHD, E-AC-3, or AC-3) found in master file.")
+        dest = lib_path / clean_artist / f"{clean_album} {suffix}"
+        dest.mkdir(parents=True, exist_ok=True)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, mbid)
 
-            # 1. Generate the cue sheet, injecting the correct target extension
-            final_audio_name = f"{clean_album} (Atmos){output_container}"
-            if tracks:
-                chapters = chapters[:len(tracks)]  # Eliminate final "ghost chapter" if it exists
-            generate_cue_sheet(dest / f"{clean_album} (Atmos).cue", final_audio_name, info, chapters, tracks)
+            if output_container != ".flac":
+                # Atmos M4A / MKV Path (Single Gapless File)
+                idx = atmos_idx
 
-            # Remux Master MKV into requested output format
-            cmd = [
-                TOOLS.FFMPEG, "-hide_banner", "-loglevel", "warning", "-stats",
-                "-probesize", "100M", "-analyzeduration", "100M",
-                "-i", str(atmos_mkv), "-map", f"0:{idx}",
-                "-metadata", f"title={album}", "-c:a", "copy"
-            ]
-            if output_container == ".m4a":
-                cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
-            else:
-                cmd.extend(["-f", "matroska"])
+                # Generate the cue sheet, injecting the correct target extension
+                final_audio_name = f"{clean_album} {suffix}{output_container}"
+                if tracks:
+                    chapters = chapters[:len(tracks)]  # Eliminate final "ghost chapter" if it exists
+                generate_cue_sheet(dest / f"{clean_album} {suffix}.cue", final_audio_name, info, chapters, tracks)
 
-            cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
-            run_command(cmd, f"Finalizing Atmos {output_container[1:].upper()}", {"ffmpeg_duration": duration})
+                # Remux Master MKV into requested output format
+                cmd = [
+                    TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
+                    "-probesize", "100M", "-analyzeduration", "100M",
+                    "-i", str(master_mkv), "-map", f"0:{idx}",
+                    "-metadata", f"title={album}", "-c:a", "copy"
+                ]
+                if output_container == ".m4a":
+                    cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
+                else:
+                    cmd.extend(["-f", "matroska"])
 
+                cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
+                run_command(cmd, f"Finalizing {suffix[1:-1]} {output_container[1:].upper()}",
+                            {"ffmpeg_duration": duration})
+            else: # Rip legacy (non-Atmos) surround to individual (per-track) flac files
+                logger.emit(f"[*] Slicing tracks to FLAC {suffix}...")
+                stream_idx = legacy_idx  # We already queried MakeMKV for this index in the routing block!
+                if stream_idx is None:
+                    raise ValueError(
+                        "No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
+
+                # Pair up the MusicBrainz track data with the FFprobe chapter data
+                flac_files = []
+                for i, (track, chapter) in enumerate(zip(tracks, chapters)):
+                    track_num = i + 1
+                    safe_title = _sanitize_filename(track['title'])
+                    out_filename = f"{track_num:02d} {safe_title}.flac"
+                    out_path = dest / out_filename
+                    flac_files.append((out_path, track, track_num))
+
+                    # Pull timing from the MKV chapter data, not the MusicBrainz track data
+                    start_time = float(chapter['start_time'])
+                    end_time = float(chapter['end_time'])
+
+                    cmd = [
+                        TOOLS.FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y',
+                        '-ss', str(start_time), '-to', str(end_time),  # -ss must precede -i, or loop will go quadratic!
+                        '-i', str(master_mkv),
+                        '-map', f"0:{stream_idx}",
+                        # NOTE: Ensure this variable matches whatever you named it in your interception routing!
+                        '-c:a', 'flac',
+                        str(out_path)
+                    ]
+
+                    env = {
+                        "ffmpeg_duration": duration,
+                        "ffmpeg_time_offset": start_time,
+                        "ffmpeg_prefix": "Slicing"
+                    }
+                    run_command(cmd, f"Extracting track {track_num} from MKV master ({track['title']})", env)
             try:
                 cover_future.result(timeout=45)
             except (concurrent.futures.TimeoutError, Exception):
                 pass
+
+            if output_container == ".flac":
+                _tag_flac_files(flac_files, album, artist, info['year'], dest / "cover.jpg")
+
     finally:
         clean_up()
 
-    logger.emit(f"\n[+] Library Entry Complete: {album}")
+    logger.emit(f"\n[+] Ingestion Complete: {album}")
+    logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
 
 
 def _clean_path_arg(arg: str) -> str:

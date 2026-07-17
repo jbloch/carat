@@ -1,3 +1,4 @@
-musicbrainzngs>=0.7.1
-requests>=2.31.0
-Pillow>=10.2.0
+musicbrainzngs==0.7.1
+mutagen==1.47.0
+pillow==12.2.0
+requests==2.33.1
