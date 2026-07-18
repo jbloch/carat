@@ -198,7 +198,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
         env["last_was_progress"] = False
 
 
-def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None) -> str:
+def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None, suppress_summary: bool = False) -> str:
     """
     Executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
@@ -237,8 +237,13 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
         _active_subprocess = None  # Whether it succeeded or failed, it's gone
 
     if process.returncode != 0:
+        out_str = "\n".join(output_acc).lower()
+        if "disk full" in out_str or "no space left" in out_str:
+            raise RuntimeError("The process failed because a drive ran out of disk space. Please free up space.")
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
-    emit_summary_log(output_acc, start_time, env)
+
+    if not suppress_summary:
+        emit_summary_log(output_acc, start_time, env)
     return "\n".join(output_acc)
 
 
@@ -599,20 +604,23 @@ def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
     cmd = [TOOLS.MAKEMKV, "--progress=-stdout", "-r", "mkv", src_spec, title_idx, clean_output_path, "--minlength=600"]
 
     start_time = time.time()
-    run_command(cmd, f"Ripping Title {title_idx}")
+    res = run_command(cmd, f"Ripping Title {title_idx}", suppress_summary=True)
     elapsed = time.time() - start_time
 
     mkv_files = list(out_path.glob("*.mkv"))
     if not mkv_files:
+        # Catch MakeMKV's silent failure when the disk fills up
+        if "disk full" in res.lower() or "disk was full" in res.lower() or "no space left" in res.lower():
+            raise RuntimeError(
+                "Extraction failed because your temporary drive ran out of disk space. Please free up space.")
         raise RuntimeError("MakeMKV produced no output.")
-    if len(mkv_files) > 1:
-        # This shouldn't happen in a clean temp dir, but it's good to know if it does!
-        logger.emit(f"[!] Warning: MakeMKV produced {len(mkv_files)} files. Using the first one.")
+
     winner = mkv_files[0]
 
     size_mb = winner.stat().st_size / (1024 * 1024)
     logger.emit(
         f"[+] Title extraction complete: {size_mb:.1f} MB in {elapsed:.1f} seconds (Avg: {size_mb / elapsed:.1f} MB/s)")
+    logger.emit("")
 
     return winner
 

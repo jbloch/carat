@@ -410,23 +410,30 @@ class CaratGUI:
     def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str, output_container: str,
                    preferred_codec: str) -> None:
         """The worker thread function."""
+        success = False
         try:
             carat.rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
-            # self.log_queue.put("[+] Process Complete.")
+            success = True
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
         finally:
+            # Pass the success state back to the main thread
             # noinspection PyTypeChecker
-            self.parent.after(0, self._finalize_ui)
+            self.parent.after(0, lambda: self._finalize_ui(success))
 
-    def _finalize_ui(self):
+    def _finalize_ui(self, success: bool):
         self.progress_bar.stop()
         self.progress_bar.config(mode='determinate')
-        self.progress_var.set(100)
-        self.lbl_status.config(text="Idle")
 
         self.is_ripping = False
-        self.btn_rip.config(state="disabled", text="Rip Complete")  # State 4: Complete
+
+        if success:
+            self.progress_var.set(100)
+            self.lbl_status.config(text="Idle")
+            self.btn_rip.config(state="disabled", text="Rip Complete")  # State 4: Complete
+        else:
+            self.lbl_status.config(text="Failed")
+            self.btn_rip.config(state="disabled", text="Rip Failed!")  # State 5: Failed
 
 
     def _display_cover(self, path: Path) -> None:
