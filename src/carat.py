@@ -1192,6 +1192,21 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     prefer_legacy = (output_container == ".flac")
 
+    # Initialize logging destination state
+    dest = None
+    temp_log = TMP_DIR / "carat_rip.log"
+    logger.open_log_file(temp_log)
+
+    # --- LOG PROLOGUE ---
+    start_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ingestion_start_time))
+    logger.emit("=== Carat Rip Log ===")
+    logger.emit(f"Date/Time : {start_time_str}")
+    logger.emit(f"Source    : {src_path}")
+    logger.emit(f"Artist    : {artist}")
+    logger.emit(f"Album     : {album}")
+    logger.emit(f"Format    : {output_container.upper()} (Codec: {preferred_codec})")
+    logger.emit("=====================\n")
+
     try:
         # 1. Acquire Master MKV
         master_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album,
@@ -1231,7 +1246,6 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
         # Dynamically set the naming suffix based on the final format and channel count
         if output_container == ".flac":
-            # We must find the fallback stream now to determine its channel count
             legacy_info = find_multichannel_stream(master_mkv)
             if legacy_info is None:
                 raise ValueError(
@@ -1242,7 +1256,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             if legacy_channels == 4:
                 suffix = "(Quad)"
             elif legacy_channels <= 2:
-                suffix = "(Stereo)"  # Just in case a user rips a stereo-only legacy disc
+                suffix = "(Stereo)"
             else:
                 suffix = "(Surround)"
         else:
@@ -1259,13 +1273,11 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 # Atmos M4A / MKV Path (Single Gapless File)
                 idx = atmos_idx
 
-                # Generate the cue sheet, injecting the correct target extension
                 final_audio_name = f"{clean_album} {suffix}{output_container}"
                 if tracks:
-                    chapters = chapters[:len(tracks)]  # Eliminate final "ghost chapter" if it exists
+                    chapters = chapters[:len(tracks)]
                 generate_cue_sheet(dest / f"{clean_album} {suffix}.cue", final_audio_name, info, chapters, tracks)
 
-                # Remux Master MKV into requested output format
                 cmd = [
                     TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
                     "-probesize", "100M", "-analyzeduration", "100M",
@@ -1280,14 +1292,14 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
                 run_command(cmd, f"Finalizing {suffix[1:-1]} {output_container[1:].upper()}",
                             {"ffmpeg_duration": duration})
-            else: # Rip legacy (non-Atmos) surround to individual (per-track) flac files
+            else:
+                # Legacy Surround FLAC Path (Sliced Tracks)
                 logger.emit(f"[*] Slicing tracks to FLAC {suffix}...")
-                stream_idx = legacy_idx  # We already queried MakeMKV for this index in the routing block!
+                stream_idx = legacy_idx
                 if stream_idx is None:
                     raise ValueError(
                         "No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
 
-                # Pair up the MusicBrainz track data with the FFprobe chapter data
                 flac_files = []
                 for i, (track, chapter) in enumerate(zip(tracks, chapters)):
                     track_num = i + 1
@@ -1296,16 +1308,14 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     out_path = dest / out_filename
                     flac_files.append((out_path, track, track_num))
 
-                    # Pull timing from the MKV chapter data, not the MusicBrainz track data
                     start_time = float(chapter['start_time'])
                     end_time = float(chapter['end_time'])
 
                     cmd = [
                         TOOLS.FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y',
-                        '-ss', str(start_time), '-to', str(end_time),  # -ss must precede -i, or loop will go quadratic!
+                        '-ss', str(start_time), '-to', str(end_time),
                         '-i', str(master_mkv),
                         '-map', f"0:{stream_idx}",
-                        # NOTE: Ensure this variable matches whatever you named it in your interception routing!
                         '-c:a', 'flac',
                         str(out_path)
                     ]
@@ -1324,12 +1334,31 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             if output_container == ".flac":
                 _tag_flac_files(flac_files, album, artist, info['year'], dest / "cover.jpg")
 
+        # Log success before closing the file handle
+        logger.emit(f"\n[+] Ingestion Complete: {album}")
+        logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
+
     finally:
+        logger.close_log_file()
+
+        # Safely resolve names in case the rip crashed early in the process
+        final_artist = clean_artist if 'clean_artist' in locals() else _sanitize_filename(artist)
+        final_album = clean_album if 'clean_album' in locals() else _sanitize_filename(album)
+        final_suffix = suffix if 'suffix' in locals() else ""
+
+        final_log_dir = dest if 'dest' in locals() and dest else (lib_path / final_artist / final_album)
+
+        # Build the EAC-style log name, collapsing any double spaces if suffix is empty
+        log_name = f"{final_artist} - {final_album} {final_suffix}.log".replace("  ", " ").strip()
+
+        try:
+            final_log_dir.mkdir(parents=True, exist_ok=True)
+            if temp_log.exists():
+                shutil.copy(temp_log, final_log_dir / log_name)
+        except OSError:
+            pass
+
         clean_up()
-
-    logger.emit(f"\n[+] Ingestion Complete: {album}")
-    logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
-
 
 def _clean_path_arg(arg: str) -> str:
     """Strips rogue literal quotes caused by Windows shell path escaping (e.g., \\")."""

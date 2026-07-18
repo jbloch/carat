@@ -17,8 +17,9 @@ __version__ = "1.0B"
 import sys
 import threading
 from collections.abc import Callable
+from pathlib import Path
 
-__all__ = ['init', 'emit']
+__all__ = ['init', 'emit', 'open_log_file', 'close_log_file']
 
 # Global lock to prevent threads from garbling the console
 _print_lock = threading.Lock()
@@ -30,6 +31,10 @@ _in_progress: bool = False
 # This variable is set by init_log_callback. If it has not been set, we log to stdout.
 _log_callback: Callable[[str, bool], None] | None = None
 
+# Active file handle for writing persistent logs
+_log_file = None
+
+
 def init(log_callback: Callable[[str, bool], None] | None) -> None:
     """
     Initializes the logger to use the specified callback. If this method is not called, or None is passed in,
@@ -40,13 +45,43 @@ def init(log_callback: Callable[[str, bool], None] | None) -> None:
     _log_callback = log_callback
 
 
+def open_log_file(filepath: Path) -> None:
+    """Opens a log file for writing. Closes any previously opened log file."""
+    global _log_file
+    close_log_file()
+    try:
+        _log_file = open(filepath, 'w', encoding='utf-8')
+    except OSError:
+        pass
+
+
+def close_log_file() -> None:
+    """Closes the active log file if one exists."""
+    global _log_file
+    if _log_file:
+        try:
+            _log_file.close()
+        except OSError:
+            pass
+        _log_file = None
+
+
 def emit(line: str, is_progress: bool = False) -> None:
     """
     Emits the given line to the log_callback, if provided, or to stdout if it is not. If is_progress is true, then
-    the line represents progress, and should overwrite the previously logged string.
+    the line represents progress, and should overwrite the previously logged string. Also writes non-progress lines
+    to the active log file.
     """
-    global _print_lock, _log_callback
+    global _print_lock, _log_callback, _log_file
     with _print_lock:
+        # File logging: capture only permanent log lines to keep the file clean
+        if _log_file and not is_progress:
+            try:
+                _log_file.write(line + '\n')
+                _log_file.flush()
+            except OSError:
+                pass
+
         if _log_callback:
             _log_callback(line, is_progress)
         else:

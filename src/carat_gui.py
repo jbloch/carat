@@ -254,12 +254,9 @@ class CaratGUI:
         frame_actions.pack(fill="x", padx=15, pady=10)
 
         self.btn_rip = ttk.Button(frame_actions, text="Rip", command=self._start_rip_thread)
-        self.btn_rip.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        self.btn_rip.pack(side="left", fill="x", expand=True)  # expand=True allows it to stretch
 
-        self.btn_clear = ttk.Button(frame_actions, text="Clear Console", command=self._clear_console)
-        self.btn_clear.pack(side="right")
-
-        # Progress & Status
+        #5.  Progress & Status
         frame_prog = ttk.Frame(self.parent, padding=(10, 0, 10, 0))
         frame_prog.pack(fill="x", padx=10)
         self.progress_var = tk.DoubleVar()
@@ -268,7 +265,7 @@ class CaratGUI:
         self.lbl_status = ttk.Label(frame_prog, text="Ready", font=('Segoe UI', 9, 'italic'), foreground="gray")
         self.lbl_status.pack(anchor="w", pady=(2, 0))
 
-        # Console Output
+        # 6. Console Output
         frame_log = ttk.LabelFrame(self.parent, text="Console Output", padding=10)
         frame_log.pack(fill="both", expand=True, padx=10, pady=10)
         self.txt_log = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9))
@@ -376,7 +373,10 @@ class CaratGUI:
     def _start_rip_thread(self) -> None:
         """Collects inputs and launches the background workers."""
 
-        # 1. Clear artwork from previous rip (if any)
+        # Auto-clear the console on new rip
+        self._clear_console()
+
+        # Clear artwork from previous rip (if any)
         self.lbl_art.configure(image='', text="Waiting...")
         self.lbl_art.image = None
         self.lbl_art.update_idletasks()
