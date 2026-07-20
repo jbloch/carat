@@ -57,12 +57,13 @@ def seconds_to_cue(seconds: float) -> str:
 def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
     """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
-        f.write(
-            f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
+        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\n')
+        if "mbid" in info:
+            f.write(f'REM MUSICBRAINZ_ALBUMID "{info["mbid"]}"\n')
+        f.write(f'FILE "{file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
-            f.write(
-                f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
+            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
 
 
 def _parse_makemkv_msg(line: str) -> str | None:
@@ -1121,7 +1122,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, pre
 
 
 def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str,
-                    cover_path: Path):
+                    cover_path: Path, mbid: str):
     """Injects metadata and cover art into the sliced FLAC files."""
     logger.emit("[*] Applying metadata and embedded artwork to FLAC files...")
 
@@ -1149,6 +1150,9 @@ def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_
         audio['date'] = str(year)
         audio['tracknumber'] = str(track_num)
         audio['totaltracks'] = str(len(flac_files))
+
+        if mbid:
+            audio['musicbrainz_albumid'] = mbid
 
         if pic:
             audio.add_picture(pic)
@@ -1209,8 +1213,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
     try:
         # 1. Acquire Master MKV
-        master_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album,
-                                                                                             prefer_legacy)
+        master_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album, prefer_legacy)
 
         # 2. Canonicalization & Sanitization of artist and album title
         info = matched_candidate or {}
@@ -1244,7 +1247,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 logger.emit("[*] Automatically switching to FLAC slicing for legacy lossless surround...")
                 output_container = ".flac"
 
-        # Dynamically set the naming suffix based on the final format and channel count
+        # Set the naming suffix based on the final format and channel count
         if output_container == ".flac":
             legacy_info = find_multichannel_stream(master_mkv)
             if legacy_info is None:
@@ -1284,6 +1287,10 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                     "-i", str(master_mkv), "-map", f"0:{idx}",
                     "-metadata", f"title={album}", "-c:a", "copy"
                 ]
+
+                if mbid:
+                    cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
+
                 if output_container == ".m4a":
                     cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
                 else:
@@ -1332,7 +1339,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 pass
 
             if output_container == ".flac":
-                _tag_flac_files(flac_files, album, artist, info['year'], dest / "cover.jpg")
+                _tag_flac_files(flac_files, album, artist, info['year'], dest / "cover.jpg", mbid)
 
         # Log success before closing the file handle
         logger.emit(f"\n[+] Ingestion Complete: {album}")
