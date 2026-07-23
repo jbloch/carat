@@ -14,6 +14,8 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B"
 
+import io
+import shutil
 import sys
 import threading
 from collections.abc import Callable
@@ -32,7 +34,7 @@ _in_progress: bool = False
 _log_callback: Callable[[str, bool], None] | None = None
 
 # Active file handle for writing persistent logs
-_log_file = None
+_log_file: io.TextIOWrapper | None = None
 
 
 def init(log_callback: Callable[[str, bool], None] | None) -> None:
@@ -55,15 +57,22 @@ def open_log_file(filepath: Path) -> None:
         pass
 
 
-def close_log_file() -> None:
-    """Closes the active log file if one exists."""
+def close_log_file(dest: Path = None):
+    """Closes the active log file if one exists, and copies it to the specified destination, if provided. """
     global _log_file
     if _log_file:
         try:
-            _log_file.close()
-        except OSError:
-            pass
-        _log_file = None
+            _log_file.flush()  # Ensure all pending writes go to disk
+            log_path = Path(_log_file.name)  # Get the file path
+            _log_file.close()  # Now close it
+
+            if dest:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(log_path, dest)  # Use copy2 to preserve timestamps
+        except OSError as e:
+            print(f"Failed to copy or close log: {e}")
+        finally:
+            _log_file = None
 
 
 def emit(line: str, is_progress: bool = False) -> None:

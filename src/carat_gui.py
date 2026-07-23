@@ -213,7 +213,7 @@ class CaratGUI:
         frame_meta_cont.pack(fill="x", padx=10, pady=5)
 
         # Metadata Sub-Frame
-        frame_meta = ttk.LabelFrame(frame_meta_cont, text=f"{next(section)} Metadata", padding=10)
+        frame_meta = ttk.LabelFrame(frame_meta_cont, text=f"{next(section)}. Metadata", padding=10)
         frame_meta.pack(side="left", fill="both", expand=True, padx=(0, 5))
 
         ttk.Label(frame_meta, text="Artist:").grid(row=0, column=0, sticky="w", pady=2)

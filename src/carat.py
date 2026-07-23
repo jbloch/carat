@@ -33,12 +33,12 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-# noinspection PyProtectedMember
-from mutagen.flac import FLAC, Picture
 from pathlib import Path
-from typing import Any, Callable, NoReturn
+from typing import Any, Callable, NoReturn, NamedTuple
 
 import musicbrainzngs as mb
+# noinspection PyProtectedMember
+from mutagen.flac import FLAC, Picture
 
 import get_cover_art
 import logger
@@ -57,10 +57,7 @@ def seconds_to_cue(seconds: float) -> str:
 def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
     """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
-        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\n')
-        if "mbid" in info:
-            f.write(f'REM MUSICBRAINZ_ALBUMID "{info["mbid"]}"\n')
-        f.write(f'FILE "{file_name}" WAVE\n')
+        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
@@ -201,7 +198,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
 
 def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None, suppress_summary: bool = False) -> str:
     """
-    Executes command with live progress updates.
+    Synchronously executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
     Accepts an optional environment dict to pass state (such as album duration) to the output parser.
     This method is aggressively single-threaded. Don't even think about running it in multiple threads.
@@ -263,9 +260,6 @@ def emit_summary_log(entire_log: list[Any], start_time: float, env: dict | None 
 
     logger.emit(summary)
     logger.emit("") # Blank line visually separates tasks
-
-
-# --- (3) Atmos ripping (rips *only* the Atmos stream, fails if there is none ---
 
 @dataclass
 class TitleInfo:
@@ -1073,7 +1067,7 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             pass  # Silent failure for cleanup to prevent app startup crashes
 
 
-def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str) -> tuple[
     Path, dict[str, Any] | None, list[dict[str, Any]], float]:
     """
     Acquires the master MKV file, extracts its chapters/duration, and fetches the matching MusicBrainz metadata.
@@ -1097,7 +1091,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, pre
     # 2. Execute Source-Specific Acquisition
     if source_spec:
         # --- Handle MakeMKV Supported Formats: Blu-ray, Blu-ray iso, and BDMV folder ---
-        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, prefer_legacy)
+        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, output_container == "flac")
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
@@ -1121,8 +1115,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, pre
     return atmos_mkv, matched_candidate, chapters, duration
 
 
-def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str,
-                    cover_path: Path, mbid: str):
+def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str, cover_path: Path):
     """Injects metadata and cover art into the sliced FLAC files."""
     logger.emit("[*] Applying metadata and embedded artwork to FLAC files...")
 
@@ -1150,14 +1143,155 @@ def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_
         audio['date'] = str(year)
         audio['tracknumber'] = str(track_num)
         audio['totaltracks'] = str(len(flac_files))
-
-        if mbid:
-            audio['musicbrainz_albumid'] = mbid
-
         if pic:
             audio.add_picture(pic)
 
         audio.save()
+
+
+
+def _log_prologue(album: str, artist: str, output_container: str, preferred_codec: str, src_path: str):
+    """Emit rip prologue to logger (to enhance readability of log file in isolation)"""
+    logger.emit("=== Carat Rip Log ===")
+    start_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+    logger.emit(f"Date/Time : {start_time_str}")
+    logger.emit(f"Source    : {src_path}")
+    logger.emit(f"Artist    : {artist}")
+    logger.emit(f"Album     : {album}")
+    logger.emit(f"Format    : {output_container.upper()} (Codec: {preferred_codec})")
+    logger.emit("=====================\n")
+
+
+class AudioProfile(NamedTuple):
+    """
+    The resolved audio stream and destination formatting for a ripping job.
+
+    Attributes:
+        idx (int): The FFmpeg stream index of the selected audio track in the master file.
+        container (str): The target file extension for the output (e.g., '.m4a', '.flac').
+        suffix (str): The descriptive tag appended to the final filename (e.g., '(Atmos)', '(Surround)').
+    """
+    idx: int
+    container: str
+    suffix: str
+
+
+def resolve_audio_profile(master_mkv: Path, requested_container: str, preferred_codec: str) -> AudioProfile:
+    """
+    Scans the master MKV and determines the optimal audio stream and output format.
+    Will automatically fall back to lossless FLAC slicing if Atmos is requested but unavailable.
+    """
+
+    # 1. Attempt Atmos (if permitted by the user)
+    if requested_container != ".flac":
+        idx = find_atmos_stream(master_mkv, preferred_codec)
+        if idx is not None:
+            return AudioProfile(idx=idx, container=requested_container, suffix="(Atmos)")
+
+        logger.emit("\n[!] No Dolby Atmos stream found on source.")
+        logger.emit("[*] Automatically switching to FLAC slicing for legacy lossless surround...")
+
+    # 2. Fallback to Legacy Multichannel (or proceed if FLAC was explicitly requested)
+    legacy_info = find_multichannel_stream(master_mkv)
+    if legacy_info is None:
+        raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
+
+    idx, channels = legacy_info
+
+    if channels == 4:
+        suffix = "(Quad)"
+    elif channels <= 2:
+        suffix = "(Stereo)"
+    else:
+        suffix = "(Surround)"
+
+    return AudioProfile(idx=idx, container=".flac", suffix=suffix)
+
+
+@dataclass
+class RipContext:
+    """Encapsulates all state and metadata required for the final AV assembly phase."""
+    master_mkv: Path  # The source MKV file containing the audio stream
+    dest: Path  # The destination directory for the final audio files
+    artist: str  # The canonicalized artist name
+    album: str  # The canonicalized album title
+    clean_album: str  # The sanitized album title used for file naming
+    profile: AudioProfile # The resolved audio stream index and destination formatting
+    duration: float  # The total duration of the source in seconds
+    info: dict[str, Any]  # The matched MusicBrainz release metadata
+    chapters: list[dict]  # The extracted chapter markers
+    tracks: list[dict]  # The tracklist metadata from MusicBrainz
+
+
+def _assemble_gapless_album(ctx: RipContext) -> None:
+    """Handles the FFmpeg remuxing for gapless M4A or MKV containers."""
+    final_audio_name = f"{ctx.clean_album} {ctx.profile.suffix}{ctx.profile.container}"
+
+    if ctx.tracks:
+        ctx.chapters = ctx.chapters[:len(ctx.tracks)]
+
+    generate_cue_sheet(ctx.dest / f"{ctx.clean_album} {ctx.profile.suffix}.cue", final_audio_name, ctx.info,
+                       ctx.chapters, ctx.tracks)
+
+    cmd = [
+        TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
+        "-probesize", "100M", "-analyzeduration", "100M",
+
+        # FIX 3: Change ctx.idx to ctx.profile.idx
+        "-i", str(ctx.master_mkv), "-map", f"0:{ctx.profile.idx}",
+        "-metadata", f"title={ctx.album}", "-c:a", "copy"
+    ]
+
+    mbid = ctx.info.get('mbid')
+    if mbid:
+        cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
+
+    # FIX 4: Change ctx.output_container to ctx.profile.container
+    if ctx.profile.container == ".m4a":
+        cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
+    else:
+        cmd.extend(["-f", "matroska"])
+
+    cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(ctx.dest / final_audio_name)])
+
+    # FIX 5: Change ctx.suffix/output_container here as well
+    run_command(cmd, f"Finalizing {ctx.profile.suffix[1:-1]} {ctx.profile.container[1:].upper()}",
+                {"ffmpeg_duration": ctx.duration})
+
+def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
+    """Handles slicing the master MKV into individual FLAC tracks."""
+    logger.emit(f"[*] Slicing tracks to FLAC {ctx.profile.suffix}...")
+    if ctx.profile.idx is None:
+        raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
+
+    flac_files = []
+    for i, (track, chapter) in enumerate(zip(ctx.tracks, ctx.chapters)):
+        track_num = i + 1
+        safe_title = _sanitize_filename(track['title'])
+        out_filename = f"{track_num:02d} {safe_title}.flac"
+        out_path = ctx.dest / out_filename
+        flac_files.append((out_path, track, track_num))
+
+        start_time = float(chapter['start_time'])
+        end_time = float(chapter['end_time'])
+
+        cmd = [
+            TOOLS.FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y',
+            '-ss', str(start_time), '-to', str(end_time),
+            '-i', str(ctx.master_mkv),
+            '-map', f"0:{ctx.profile.idx}",
+            '-c:a', 'flac',
+            str(out_path)
+        ]
+
+        env = {
+            "ffmpeg_duration": ctx.duration,
+            "ffmpeg_time_offset": start_time,
+            "ffmpeg_prefix": "Slicing"
+        }
+        run_command(cmd, f"Extracting track {track_num} from MKV master ({track['title']})", env)
+
+    return flac_files
 
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, output_container: str = ".m4a",
@@ -1165,8 +1299,8 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     """
     Rips the Atmos stream representing the main title in the specified source into the music library with the
     specified root. The artist and album title are used to obtain metadata and cover art, which are used to
-    generate the cue file and cover.jpg in the music library. The library entry consists of a chapterless audio
-    file (M4A or MKV) containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless
+    generate the cue file and cover.jpg in the music library. The library entry generally consists of a chapterless
+    audio file (M4A or MKV) containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless
     playback of the entire album, as well as access to individual tracks, and is the only format known to do so
     on most platforms.
 
@@ -1174,7 +1308,12 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos (lossy), and AC-3
     Surround (not Atmos!). The permitted values for preferred_codec are "truehd" (default), "eac3", and "ac3".
 
-    This method offers complete ripping of Atmos sources into digital music libraries in a single call, with:
+    If output_container is "flac", or it's another value but the input does not contain an Atmos stream, carat
+    will find the "best" lossless stream and rip it into a collection of flac files (with tags and no cue sheet).
+    By "best," we mean the stream with the most channels or if there is a tie, the one with the most bytes (total length).
+
+    This method offers complete ripping of Atmos (or legacy multichannel) sources into digital music libraries in a
+    single call, with:
 
     Polymorphic Input Handling:
       - Integers (e.g. "0", "-1") are Treated as Physical Optical Disc indices
@@ -1191,181 +1330,78 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     """
 
     ingestion_start_time = time.time()
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
     lib_path = Path(library_root)
     _ensure_writable(lib_path)
-    TMP_DIR.mkdir(parents=True, exist_ok=True)
-    prefer_legacy = (output_container == ".flac")
+    logger.open_log_file(TMP_DIR / "carat_rip.log") # We log to tmp dir because we don't yet know the final destination
+    _log_prologue(album, artist, output_container, preferred_codec, src_path)
 
-    # Initialize logging destination state
-    dest = None
-    temp_log = TMP_DIR / "carat_rip.log"
-    logger.open_log_file(temp_log)
-
-    # --- LOG PROLOGUE ---
-    start_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ingestion_start_time))
-    logger.emit("=== Carat Rip Log ===")
-    logger.emit(f"Date/Time : {start_time_str}")
-    logger.emit(f"Source    : {src_path}")
-    logger.emit(f"Artist    : {artist}")
-    logger.emit(f"Album     : {album}")
-    logger.emit(f"Format    : {output_container.upper()} (Codec: {preferred_codec})")
-    logger.emit("=====================\n")
+    # This log_dest value is tentative. It will be used only if the rip fails early on; otherwise it will be overwritten
+    clean_artist = _sanitize_filename(artist)
+    clean_album = _sanitize_filename(album)
+    log_name = f"{clean_artist} - {clean_album}.log".replace("  ", " ").strip()
+    log_dest = lib_path / clean_artist / clean_album / log_name
 
     try:
-        # 1. Acquire Master MKV
-        master_mkv, matched_candidate, chapters, duration = get_mkv_master_file_and_metadata(src_path, artist, album, prefer_legacy)
+        # Extract master mkv and metadata from input file (or disc) and web metadata resources
+        master_mkv, matched_candidate, chapters, duration =\
+            get_mkv_master_file_and_metadata(src_path, artist, album, output_container)
 
-        # 2. Canonicalization & Sanitization of artist and album title
-        info = matched_candidate or {}
-        tracks = info.get('tracks', [])
-        mbid = info.get('mbid')
-
+        # Canonicalize artist and album title
         if matched_candidate:
-            canonicalized_artist = info.get('artist', artist)
-            canonicalized_album = info.get('title', album)
+            canonicalized_artist = matched_candidate.get('artist', artist)
+            canonicalized_album = matched_candidate.get('title', album)
             if (artist != canonicalized_artist) or (album != canonicalized_album):
-                logger.emit(f"    [+] Canonicalized as Artist: {canonicalized_artist}, Album: {canonicalized_album}")
                 artist = canonicalized_artist
                 album = canonicalized_album
+                logger.emit(f"[+] Canonicalized as Artist: {artist}, Album: {album}")
+            info = matched_candidate
         else:
-            logger.emit(f"    [!] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
+            logger.emit(f"[!] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
             info = {'artist': artist, 'title': album, 'year': 'Unknown'}
 
+        # Sanitize artist and album title
         clean_artist = _sanitize_filename(artist)
         clean_album = _sanitize_filename(album)
         if (clean_artist != artist) or (clean_album != album):
-            logger.emit(f"    [+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
+            logger.emit(f"[+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
 
-        # --- STREAM INTERCEPTION & ROUTING LOGIC ---
-        atmos_idx = None
-        legacy_idx = None
-
-        if output_container != ".flac":
-            atmos_idx = find_atmos_stream(master_mkv, preferred_codec)
-            if atmos_idx is None:
-                logger.emit("\n[!] No Dolby Atmos stream found on source.")
-                logger.emit("[*] Automatically switching to FLAC slicing for legacy lossless surround...")
-                output_container = ".flac"
-
-        # Set the naming suffix based on the final format and channel count
-        if output_container == ".flac":
-            legacy_info = find_multichannel_stream(master_mkv)
-            if legacy_info is None:
-                raise ValueError(
-                    "No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
-
-            legacy_idx, legacy_channels = legacy_info
-
-            if legacy_channels == 4:
-                suffix = "(Quad)"
-            elif legacy_channels <= 2:
-                suffix = "(Stereo)"
-            else:
-                suffix = "(Surround)"
-        else:
-            suffix = "(Atmos)"
-
-        # 3. Final Assembly (Concurrent)
-        dest = lib_path / clean_artist / f"{clean_album} {suffix}"
+        # Perform pre-assembly tasks
+        profile = resolve_audio_profile(master_mkv, output_container, preferred_codec)
+        dest = lib_path / clean_artist / f"{clean_album} {profile.suffix}"
+        log_dest = dest / f"{clean_artist} - {clean_album} {profile.suffix}.log"
         dest.mkdir(parents=True, exist_ok=True)
 
+        # Build the immutable state context
+        ctx = RipContext(
+            master_mkv=master_mkv, dest=dest, artist=artist, album=album,
+            clean_album=clean_album, profile=profile, duration=duration,
+            info=info, chapters=chapters, tracks=(info.get('tracks', []))
+        )
+
+        # Execute Assembly (Concurrent)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, mbid)
+            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, info.get('mbid'))
 
-            if output_container != ".flac":
-                # Atmos M4A / MKV Path (Single Gapless File)
-                idx = atmos_idx
-
-                final_audio_name = f"{clean_album} {suffix}{output_container}"
-                if tracks:
-                    chapters = chapters[:len(tracks)]
-                generate_cue_sheet(dest / f"{clean_album} {suffix}.cue", final_audio_name, info, chapters, tracks)
-
-                cmd = [
-                    TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
-                    "-probesize", "100M", "-analyzeduration", "100M",
-                    "-i", str(master_mkv), "-map", f"0:{idx}",
-                    "-metadata", f"title={album}", "-c:a", "copy"
-                ]
-
-                if mbid:
-                    cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
-
-                if output_container == ".m4a":
-                    cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
-                else:
-                    cmd.extend(["-f", "matroska"])
-
-                cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(dest / final_audio_name)])
-                run_command(cmd, f"Finalizing {suffix[1:-1]} {output_container[1:].upper()}",
-                            {"ffmpeg_duration": duration})
+            if profile.container != ".flac":
+                _assemble_gapless_album(ctx)
             else:
-                # Legacy Surround FLAC Path (Sliced Tracks)
-                logger.emit(f"[*] Slicing tracks to FLAC {suffix}...")
-                stream_idx = legacy_idx
-                if stream_idx is None:
-                    raise ValueError(
-                        "No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
+                flac_files = _extract_flac_tracks(ctx)
 
-                flac_files = []
-                for i, (track, chapter) in enumerate(zip(tracks, chapters)):
-                    track_num = i + 1
-                    safe_title = _sanitize_filename(track['title'])
-                    out_filename = f"{track_num:02d} {safe_title}.flac"
-                    out_path = dest / out_filename
-                    flac_files.append((out_path, track, track_num))
-
-                    start_time = float(chapter['start_time'])
-                    end_time = float(chapter['end_time'])
-
-                    cmd = [
-                        TOOLS.FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y',
-                        '-ss', str(start_time), '-to', str(end_time),
-                        '-i', str(master_mkv),
-                        '-map', f"0:{stream_idx}",
-                        '-c:a', 'flac',
-                        str(out_path)
-                    ]
-
-                    env = {
-                        "ffmpeg_duration": duration,
-                        "ffmpeg_time_offset": start_time,
-                        "ffmpeg_prefix": "Slicing"
-                    }
-                    run_command(cmd, f"Extracting track {track_num} from MKV master ({track['title']})", env)
             try:
                 cover_future.result(timeout=45)
             except (concurrent.futures.TimeoutError, Exception):
                 pass
 
-            if output_container == ".flac":
-                _tag_flac_files(flac_files, album, artist, info['year'], dest / "cover.jpg", mbid)
+            if profile.container == ".flac":
+                _tag_flac_files(flac_files, album, artist, info.get('year', 'Unknown'), dest / "cover.jpg")
 
-        # Log success before closing the file handle
         logger.emit(f"\n[+] Ingestion Complete: {album}")
         logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
-
     finally:
-        logger.close_log_file()
+        logger.close_log_file(log_dest)
+    clean_up()
 
-        # Safely resolve names in case the rip crashed early in the process
-        final_artist = clean_artist if 'clean_artist' in locals() else _sanitize_filename(artist)
-        final_album = clean_album if 'clean_album' in locals() else _sanitize_filename(album)
-        final_suffix = suffix if 'suffix' in locals() else ""
-
-        final_log_dir = dest if 'dest' in locals() and dest else (lib_path / final_artist / final_album)
-
-        # Build the EAC-style log name, collapsing any double spaces if suffix is empty
-        log_name = f"{final_artist} - {final_album} {final_suffix}.log".replace("  ", " ").strip()
-
-        try:
-            final_log_dir.mkdir(parents=True, exist_ok=True)
-            if temp_log.exists():
-                shutil.copy(temp_log, final_log_dir / log_name)
-        except OSError:
-            pass
-
-        clean_up()
 
 def _clean_path_arg(arg: str) -> str:
     """Strips rogue literal quotes caused by Windows shell path escaping (e.g., \\")."""
