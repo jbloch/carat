@@ -57,7 +57,7 @@ def open_log_file(filepath: Path) -> None:
         pass
 
 
-def close_log_file(dest: Path = None):
+def close_log_file(dest: Path | None = None):
     """Closes the active log file if one exists, and copies it to the specified destination, if provided. """
     global _log_file
     if _log_file:

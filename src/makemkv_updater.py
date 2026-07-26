@@ -32,7 +32,7 @@ def load_config() -> Dict[str, Any]:
     """Loads the Carat configuration dictionary from disk; returns an empty dict if not found."""
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE) as f:
                 return json.load(f)
         except (OSError, json.JSONDecodeError):
             return {}
@@ -63,7 +63,7 @@ def has_permanent_key() -> bool:
     else:
         conf_file = os.path.expanduser("~/.MakeMKV/settings.conf")
         if os.path.exists(conf_file):
-            with open(conf_file, "r") as f:
+            with open(conf_file) as f:
                 for line in f:
                     if line.strip().startswith("app_Key"):
                         parts = line.split("=")
@@ -101,7 +101,7 @@ def fetch_and_apply_beta_key() -> bool:
 
             lines = []
             if os.path.exists(conf_file):
-                with open(conf_file, "r") as f:
+                with open(conf_file) as f:
                     lines = f.readlines()
 
             with open(conf_file, "w") as f:

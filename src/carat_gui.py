@@ -29,17 +29,18 @@ from PIL import Image, ImageTk
 
 import carat
 import logger
+from carat import Codec, Container
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
 class OutputProfile(Enum):
     """Output format specification."""
-    M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", ".m4a", "truehd")
-    M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", ".m4a", "eac3")
-    MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", ".mkv", "truehd")
-    FLAC = ("FLAC (Legacy non-Atmos surround) [All Devices]", ".flac", "highest_lossless")
+    M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", Container.M4A, Codec.TRUEHD)
+    M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", Container.M4A, Codec.EAC3)
+    MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", Container.MKV, Codec.TRUEHD)
+    FLAC = ("FLAC (Legacy non-Atmos surround) [All Devices]", Container.FLAC, Codec.FLAC)
 
-    def __init__(self, display_name: str, container: str, codec: str):
+    def __init__(self, display_name: str, container: Container, codec: Codec):
         self.display_name = display_name
         self.container = container
         self.codec = codec
@@ -127,7 +128,7 @@ class CaratGUI:
         self.parent.destroy()
 
     @staticmethod
-    def _load_config() -> dict[Any, Any] | None:
+    def _load_config() -> dict[Any, Any]:
         """Loads user preferences from the home directory."""
         if CONFIG_FILE.exists():
             try:
@@ -148,7 +149,7 @@ class CaratGUI:
             pass
 
     # noinspection PyUnusedLocal
-    def _evaluate_button_state(self, *args: object) -> None:
+    def _evaluate_button_state(self, *_args: object) -> None:
         """Instantly updates the RIP button based on current inputs and state."""
         # State 3 Guard: If we are actively ripping, ignore typing
         if self.is_ripping:
@@ -360,7 +361,7 @@ class CaratGUI:
             self._apply_autofill(path)
 
     # noinspection PyUnusedLocal
-    def _on_metadata_changed(self, *args) -> None:
+    def _on_metadata_changed(self, *_args) -> None:
         """Marks the metadata as manually edited if the user types in the fields."""
         if not getattr(self, '_is_autofilling', False):
             self._user_touched_metadata = True
@@ -378,7 +379,7 @@ class CaratGUI:
 
         # Clear artwork from previous rip (if any)
         self.lbl_art.configure(image='', text="Waiting...")
-        self.lbl_art.image = None
+        self.lbl_art.image = None  # type: ignore
         self.lbl_art.update_idletasks()
 
         # Change state to State #3 - Rip in progress
@@ -407,8 +408,8 @@ class CaratGUI:
         thread.daemon = True
         thread.start()
 
-    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str, output_container: str,
-                   preferred_codec: str) -> None:
+    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str,
+                   output_container: str, preferred_codec: carat.Codec) -> None:
         """The worker thread function."""
         success = False
         try:
@@ -444,12 +445,12 @@ class CaratGUI:
             pil_img.thumbnail((200, 200))
             img = ImageTk.PhotoImage(pil_img)
             self.lbl_art.config(image=img, text="")
-            self.lbl_art.image = img
+            self.lbl_art.image = img  # type: ignore
         except (OSError, tk.TclError):
             self.lbl_art.config(text="[Image Error]", image="")
 
     # noinspection PyUnusedLocal
-    def _change_cover_art(self, event: object) -> None:
+    def _change_cover_art(self, _event: object) -> None:
         """Allows user to click and replace the cover art manually."""
         if not self.current_cover_path: return
         new_path = filedialog.askopenfilename(filetypes=[("Images", "*.jpg *.png")])

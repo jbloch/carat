@@ -15,7 +15,7 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B2.2"
 
-__all__ = ['rip_album_to_library']
+__all__ = ['rip_album_to_library', 'Container', 'Codec']
 
 import argparse
 import atexit
@@ -33,8 +33,9 @@ import tempfile
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, NoReturn, NamedTuple
+from typing import Any, Callable, NoReturn, NamedTuple, cast
 
 import musicbrainzngs as mb
 # noinspection PyProtectedMember
@@ -222,8 +223,9 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
 
     try:
         output_acc = []
-        for line in process.stdout:
-            _process_output_line(line, output_acc, env)
+        if process.stdout:  # Will always be satisfied, but PyCharm doesn't know it
+            for line in process.stdout:
+                _process_output_line(line, output_acc, env)
 
         process.wait()
     except:
@@ -245,7 +247,7 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
     return "\n".join(output_acc)
 
 
-def emit_summary_log(entire_log: list[Any], start_time: float, env: dict | None = None):
+def emit_summary_log(entire_log: list[str], start_time: float, env: dict | None = None):
     """Emits to the logger a summary of a completed task based on the given log and start time."""
     elapsed = time.time() - start_time
     # 1. Search backwards through the accumulated log for ffmpeg's final stats
@@ -501,17 +503,17 @@ class Toolset:
         self.IS_WIN = platform.system() == "Windows"
 
         self.FFMPEG = self._find("ffmpeg",
-                                 [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"])
+                                 [r"C:\ffmpeg\bin\ffmpeg.exe", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]) or ""
         self.FFPROBE = self._find("ffprobe",
-                                  [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"])
+                                  [r"C:\ffmpeg\bin\ffprobe.exe", "/usr/local/bin/ffprobe", "/opt/homebrew/bin/ffprobe"]) or ""
         self.MKVMERGE = self._find("mkvmerge",
                                    [r"C:\Program Files\MKVToolNix\mkvmerge.exe", "/usr/local/bin/mkvmerge",
-                                    "/opt/homebrew/bin/mkvmerge"])
+                                    "/opt/homebrew/bin/mkvmerge"]) or ""
         self.MAKEMKV = self._find("makemkvcon64" if self.IS_WIN else "makemkvcon", [
             r"C:\Program Files (x86)\MakeMKV\makemkvcon64.exe",
             "/Applications/MakeMKV.app/Contents/MacOS/makemkvcon",
             "/usr/bin/makemkvcon"
-        ])
+        ]) or ""
 
         self._validate(fatal_error_handler)
 
@@ -576,7 +578,7 @@ class Toolset:
 
 
 # Global singleton placeholder
-TOOLS: Toolset | None = None
+TOOLS: Toolset = cast(Toolset, cast(Any, None)) # Whatever it takes...
 
 
 def init(fatal_error_handler: Callable[[str], None] | None = None) -> None:
@@ -630,7 +632,7 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for Atmos Stream")
     try:
-        streams = json.loads(res).get('streams', [])
+        streams: list[dict[str, Any]] = json.loads(res).get('streams', [])
         idx = None
 
         # 1. Hunt for the user's explicit preference first
@@ -638,7 +640,7 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
         if preferred_candidates:
             idx = int(max(preferred_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
 
-        # 2. The IAA Fallback: If caller wanted TrueHD but it's not there, grab E-AC-3
+        # 2. Fallback: If caller wanted TrueHD but it's not there, grab E-AC-3
         elif preferred_codec == "truehd":
             eac3_candidates = [s for s in streams if s.get('codec_name') == "eac3"]
             if eac3_candidates:
@@ -654,8 +656,8 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
 
         if idx is not None:
             selected = next((s for s in streams if int(s.get('index', -1)) == idx), None)
-            if selected:
-                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name')}, {selected.get('channels')} channels)")
+            if selected is not None:
+                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name', "unknown")},{selected.get('channels', "unknown")} channels)")
 
         return idx
     except json.JSONDecodeError:
@@ -786,10 +788,11 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
     """
     logger.emit("\n[*] === STARTING METADATA FETCH ===")
 
-    rg_id, rg_artist, rg_title = find_release_group(album, artist)
-    if not rg_id:
+    rg = find_release_group(album, artist)
+    if not rg:
         logger.emit("    [-] No matching release group found. Aborting metadata fetch.")
         return []
+    rg_id, rg_artist, rg_title = rg
 
     releases = find_releases_and_dates_for_release_group(rg_id, rg_title)
     logger.emit(f"    -> Filtered down to {len(releases)} matching releases.")
@@ -802,14 +805,14 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
     return candidates
 
 
-def find_release_group(album: str, artist: str) -> tuple[str | None, str | None, str | None]:
+def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
     """
-        Finds the release group corresponding to the given album and artist name (which may be inexact).
-        Searches by release rather than release group to bypass strict artist indexing. Returns the release group id,
-        followed by the artist, followed by the title (or None, None, None if no matching release group could be found).
-    """
-    rg_id, rg_title, rg_artist = None, None, None
+    Finds the release group corresponding to the given album and artist name (which may be inexact).
+    Searches by release rather than release group to bypass strict artist indexing.
 
+    Returns:
+        A tuple containing (release_group_id, artist, title) if found, otherwise None.
+    """
     for is_strict in [True, False]:
         query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
         logger.emit(f"[*] Executing Query: {query}")
@@ -827,16 +830,17 @@ def find_release_group(album: str, artist: str) -> tuple[str | None, str | None,
                     rg_id = r.get('release-group', {}).get('id')
                     rg_title, rg_artist = found_album, found_artist
                     logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})")
-                    break
+
+                    # Ensure rg_id actually exists to satisfy the strict return type!
+                    if rg_id:
+                        return str(rg_id), rg_artist, rg_title
                 else:
                     logger.emit(
                         f"    [-] Rejected Candidate: {found_artist} - {found_album} (Artist Match: {artist_match}, Album Match: {album_match})")
-
         except mb.WebServiceError as e:
             logger.emit(f"    [!] API Error: {e}")
-        if rg_id:
-            break
-    return rg_id, rg_artist, rg_title
+
+    return None
 
 
 def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
@@ -1004,7 +1008,7 @@ _active_subprocess: subprocess.Popen[str] | None = None  # Tracks the currently 
 
 
 def _nuke_dir(path: Path) -> None:
-    """ Deletes the given directory with extreme prejudice, even other processes have it locked. """
+    """ Deletes the given directory with extreme prejudice, even if other processes have it locked. """
     for attempt in range(5):  # If at first you don't succeed, try a few more times because Windows is like that
         try:
             shutil.rmtree(path, ignore_errors=True)
@@ -1037,7 +1041,7 @@ atexit.register(clean_up)  # Ensure _clean_up gets called for all but the most a
 
 # Catch OS-level interruptions (Ctrl+C, normal termination signals)
 # noinspection PyUnusedLocal
-def _signal_handler(signum: object, frame: object) -> NoReturn:
+def _signal_handler(_signum: object, _frame: object) -> NoReturn:
     clean_up()
     os._exit(1)
 
@@ -1091,7 +1095,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
     # 2. Execute Source-Specific Acquisition
     if source_spec:
         # --- Handle MakeMKV Supported Formats: Blu-ray, Blu-ray iso, and BDMV folder ---
-        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, output_container == "flac")
+        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, output_container == ".flac")
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
@@ -1236,17 +1240,14 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
     cmd = [
         TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
         "-probesize", "100M", "-analyzeduration", "100M",
-
-        # FIX 3: Change ctx.idx to ctx.profile.idx
         "-i", str(ctx.master_mkv), "-map", f"0:{ctx.profile.idx}",
         "-metadata", f"title={ctx.album}", "-c:a", "copy"
     ]
 
-    mbid = ctx.info.get('mbid')
+    mbid = ctx.info.get('mbid', "unknown")
     if mbid:
         cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
 
-    # FIX 4: Change ctx.output_container to ctx.profile.container
     if ctx.profile.container == ".m4a":
         cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
     else:
@@ -1254,7 +1255,6 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
 
     cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(ctx.dest / final_audio_name)])
 
-    # FIX 5: Change ctx.suffix/output_container here as well
     run_command(cmd, f"Finalizing {ctx.profile.suffix[1:-1]} {ctx.profile.container[1:].upper()}",
                 {"ffmpeg_duration": ctx.duration})
 
@@ -1294,8 +1294,41 @@ def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
     return flac_files
 
 
-def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str, output_container: str = ".m4a",
-                         preferred_codec: str = "truehd") -> None:
+class Container(StrEnum):
+    """
+    Container formats supported by Carat.
+
+    Attributes:
+        M4A: The standard MPEG-4 audio container (typically used for Atmos/MP4).
+        MKV: The Matroska multimedia container (typically used for pure lossless extraction).
+        FLAC: The Free Lossless Audio Codec container (used only for legacy, non-Atmos recordings).
+    """
+    M4A = ".m4a"
+    MKV = ".mkv"
+    FLAC = ".flac"
+
+
+class Codec(StrEnum):
+    """
+    Preferred audio codecs for extraction, ordered by descending quality.
+
+    Attributes:
+        TRUEHD: Dolby TrueHD. The highest quality, lossless codec.
+                This is the preferred format for pure Atmos extraction.
+        EAC3: Dolby Digital Plus (E-AC-3-JOC). A high-quality but lossy codec
+              that can carry Atmos metadata. Used as a primary fallback.
+        AC3: Dolby Digital (AC-3). A legacy, lossy surround codec (typically 5.1).
+             Critically, this codec does NOT support Dolby Atmos.
+        FLAC: The Free Lossless Audio Codec. The only valid encoding for Container.flac.
+    """
+    TRUEHD = "truehd"
+    EAC3 = "eac3"
+    AC3 = "ac3"
+    FLAC = "flac"
+
+
+def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str,
+                         output_container: Container = Container.M4A, preferred_codec: Codec = Codec.TRUEHD) -> None:
     """
     Rips the Atmos stream representing the main title in the specified source into the music library with the
     specified root. The artist and album title are used to obtain metadata and cover art, which are used to
@@ -1308,7 +1341,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos (lossy), and AC-3
     Surround (not Atmos!). The permitted values for preferred_codec are "truehd" (default), "eac3", and "ac3".
 
-    If output_container is "flac", or it's another value but the input does not contain an Atmos stream, carat
+    If output_container is ".flac", or it's another value but the input does not contain an Atmos stream, carat
     will find the "best" lossless stream and rip it into a collection of flac files (with tags and no cue sheet).
     By "best," we mean the stream with the most channels or if there is a tie, the one with the most bytes (total length).
 
