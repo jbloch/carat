@@ -8,7 +8,7 @@
 
 ---
 
-Carat is a lightweight, automated GUI utility designed to accept Dolby Atmos music releases in practically any format, locate the primary title in the releases, retrieve metadata and cover art from the internet, and incorporate the release directly into your digital music library in a single click. 
+Carat is a lightweight, automated GUI utility designed to accept Dolby Atmos music releases in practically any format, locate the primary title in the release, retrieve metadata and cover art from the internet, and incorporate the release directly into your digital music library in a single click. 
 
 From the moment a new Blu-ray arrives in your mailbox, Carat handles the entire pipeline—extraction, processing, metadata acquisition, and cover art—with zero friction. If your source files are already on your SSD, Carat will process an entire release in a minute or two (depending on the speed of your computer). If you are starting from a physical disc, the time is limited by the read speed of your optical drive (expect five to ten minutes).
 
@@ -26,11 +26,15 @@ Carat is built to handle the chaotic, developing landscape of Atmos release form
 **The Output:** Regardless of what you feed it, Carat standardizes the output into one uniform, library-ready format: **a single, chapterless `.m4a` or `.mkv` file alongside a `.cue` sheet and a `cover.jpg`.** *Why this format?* It is currently the only format that reliably combines true gapless playback with accurate track indexing on media centers like Kodi. You can choose among three variants, depending on what hardware you're using to play your music:
 * **M4A Lossless (TrueHD)** – the ideal format if you're running your media player software (e.g., Kodi) on a FireStick MAX 4K, Fire TV cube, or similar device.
 * **M4A Lossy (Dolby Digital+)** – the correct format for Mac, Apple TV, soundbars, and car audio systems.
+* **MKV Lossless (TrueHD)** – the ideal format for PC playback or Nvidia Shield.
 
 As the landscape evolves, we may extend Carat's capabilities to support more input and output formats, but it will remain laser-focused on one task: quickly incorporating Atmos albums into your digital music library. Well, OK, maybe not _so_ laser-focused: All of this machinery is equally applicable to legacy surround formats, and Carat will happily rip them into flac files for you. It will do this automatically on releases that don't contain an Atmos stream, and you can manually choose this behavior for releases that contain Atmos and lossless 5.1, quad, or stereo.
 
 ## Intelligent Metadata
-You shouldn't have to manually tag your Atmos rips. Carat does the best it can to figure out the artist and/or album names from the source you enter. You can edit Carat's guess if need be. Then Carat reaches out to top-tier sources—including [MusicBrainz](https://musicbrainz.org/), the [Cover Art Archive (CAA)](https://coverartarchive.org/), and [Apple/iTunes](https://www.apple.com/itunes/)—to automatically pull down high-quality cover art and pristine metadata. Carat applies smart heuristics to identify and correct imprecise artist or album names, ensuring your library remains perfectly organized.
+You shouldn't have to manually tag your Atmos rips. Carat does the best it can to figure out the artist and/or album names from the source you enter. You can edit Carat's guess if need be. Then Carat reaches out to top-tier sources—including [MusicBrainz](https://musicbrainz.org/), the [Cover Art Archive (CAA)](https://coverartarchive.org/), and [Apple/iTunes](https://www.apple.com/itunes/)—to automatically pull down high-quality cover art and pristine metadata. Carat’s network layer features automatic retries and backoffs, ensuring a momentary server timeout doesn't ruin your metadata ingestion. Carat applies smart heuristics to identify and correct imprecise artist or album names, ensuring your library remains perfectly organized.
+
+## Legacy Release Compatibility
+While the focus of Carat remains Atmos, it seemed a shame that its single-click goodness couldn't be applied to legacy 5.1 channel and quad releases, so as of Beta 3, it can! Just select **FLAC** from the **Format** dropdown, and Carat will select the best legacy format on the release and rip individual flac files for each song, with tags for all metadata including cover art. If you select any other output format, but the release doesn't contain an Atmos stream, Carat will fall back to ripping the best non-Atmos audio stream.
 
 ## Installation (The Near-Zero-Touch Launcher)
 Carat uses a highly robust, idempotent launcher script that handles both installation and execution. It is designed to never make a mess of your system. 
@@ -47,8 +51,8 @@ Feel free to move the entire Carat-Beta directory anywhere you like, or to renam
 ## Usage
 1. Insert your disc or locate your source files.
 2. Launch Carat.
-3. Select your input (and library root, if this is the first time you've run Carat), enter the artist and the album title, and click **Rip Atmos**.
-4. Keep going. Carat is built for batch processing. You can leave the app open and rip multiple albums in a single session without ever needing to restart. You can press Clear Console between albums if you like, but it's up to you.
+3. Select your input (and library root, if this is the first time you've run Carat), enter the artist and the album title, and click **Rip**.
+4. Keep going. Carat is built for batch processing. You can leave the app open and rip multiple albums in a single session without ever needing to restart; the console will automatically reset for the next disc or download.
 
 ## Advanced Usage (CLI & Programmatic)
 While Carat features a fully automated GUI, the core engine is completely decoupled. Power users can:
@@ -56,7 +60,7 @@ While Carat features a fully automated GUI, the core engine is completely decoup
 * **Get Cover Art:** The `get_cover_art` module can be used in isolation, to scrape top-tier artwork from MusicBrainz/CAA and Apple/iTunes to upgrade your existing digital library.
 
 ## Under the Hood
-Carat acts as an elegant conductor for the community's best open-source media tools. The entire program consists of fewer than 1,000 lines of Python (taking up just 1/10 the space of its 400x400 icon). The entire distribution, including the icon, would fit six times on a standard floppy disk. Carat is also aggressively hygienic: it goes to great lengths to clean up after itself. Even if it is forcefully closed mid-rip, it tracks its state to ensure that it never leaves orphaned background processes running, or abandons multi-gigabyte temporary files on your drive.
+Carat acts as an elegant conductor for the community's best open-source media tools. The entire program consists of fewer than 2,000 lines of Python (taking up just 1/3 the space of its 400x400 icon). The entire distribution, including the icon, would fit six times on a standard floppy disk. Carat is also aggressively hygienic: it goes to great lengths to clean up after itself. Even if it is forcefully closed mid-rip, it tracks its state to ensure that it never leaves orphaned background processes running, or abandons multi-gigabyte temporary files on your drive.
 
 The underlying tools (which do all the heavy lifting) are:
 * **GUI:** [Python/Tkinter](https://www.python.org/) 

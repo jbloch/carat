@@ -4,7 +4,7 @@ import os
 import shutil
 
 # --- Configuration ---
-RELEASE_NAME = "Carat_Beta_2"
+RELEASE_NAME = "Carat_Beta_3"
 DIST_DIR = "dist"
 BUILD_DIR = os.path.join(DIST_DIR, RELEASE_NAME)
 

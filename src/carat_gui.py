@@ -11,7 +11,7 @@ selection. (See carat.py for details.)
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B2.1"
+__version__ = "1.0B3"
 
 import itertools
 import json
