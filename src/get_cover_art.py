@@ -15,6 +15,7 @@ __version__ = "1.0B3"
 
 import re
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
 
@@ -77,15 +78,15 @@ def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> 
                 return exact_url
 
             # 2. If the exact release has no art, grab its parent Release Group ID to check siblings
-            release_info = mb.get_release_by_id(mbid, includes=["release-groups"])
+            release_info = _get_release_by_id(mbid, includes=["release-groups"])
             rg_id = release_info['release']['release-group']['id']
         else: # 3 No Release ID given, get a release group ID from the artist and album names
-            release_groups = mb.search_release_groups(artist=artist, releasegroup=album)
+            release_groups = _search_release_groups(artist=artist, releasegroup=album)
             if release_groups['release-group-count'] == 0: return None
             rg_id = release_groups['release-group-list'][0]['id']
 
         # Fallback: Search all official releases in the release group
-        releases = mb.get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
+        releases = _get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
 
         # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
         digital = [r for r in releases if r.get('status') == 'Official' and r.get('packaging') is None]
@@ -110,7 +111,7 @@ def get_mb_art_url_from_releases(releases)-> str | None:
         # IMPORTANT: Perform a direct lookup for the release to get fresh CAA status
         # The release data inside a release-group object is often incomplete.
         try:
-            full_release = mb.get_release_by_id(mb_id)
+            full_release = _get_release_by_id(mb_id)
             status = full_release['release'].get('cover-art-archive', {})
 
             if str(status.get('artwork')).lower() == 'true':
@@ -128,6 +129,39 @@ def get_mb_art_url_from_releases(releases)-> str | None:
             logger.emit(f"  [!] Error checking release {mb_id}: {e}")
             continue
     return None
+
+def retry_mb_api(retries: int = 3, delay: float = 2.0):
+    """Decorator to retry MusicBrainz API calls on transient web errors."""
+    def decorator(func):
+        """Internal decorator to retry MusicBrainz API calls."""
+        def wrapper(*args, **kwargs):
+            """internal decorator that does the actual work"""
+            attempt = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except mb.WebServiceError:
+                    attempt += 1
+                    if attempt >= retries:
+                        raise
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+@retry_mb_api()
+def _get_release_by_id(rel_id: str, includes: list[str] | None = None) -> dict:
+    """Fetches a single release by ID with retry logic."""
+    return mb.get_release_by_id(rel_id, includes=includes or [])
+
+@retry_mb_api()
+def _search_release_groups(artist: str, releasegroup: str) -> dict:
+    """Searches for release groups with retry logic."""
+    return mb.search_release_groups(artist=artist, releasegroup=releasegroup)
+
+@retry_mb_api()
+def _get_release_group_by_id(rg_id: str, includes: list[str] | None = None) -> dict:
+    """Fetches a release group by ID with retry logic."""
+    return mb.get_release_group_by_id(rg_id, includes=includes or [])
 
 
 def normalize_for_fuzzy_comparison(s: str) -> str:

@@ -45,7 +45,7 @@ import get_cover_art
 import logger
 import makemkv_updater
 # noinspection PyProtectedMember
-from get_cover_art import normalize_for_fuzzy_comparison
+from get_cover_art import normalize_for_fuzzy_comparison, retry_mb_api
 
 
 # --- (1) Metadata & Utils ---
@@ -113,23 +113,6 @@ def _ensure_writable(path: Path) -> None:
     except OSError:
         raise PermissionError(f"Library root is not writable: {path}")
 
-def _retry_mb_api(retries: int = 3, delay: float = 2.0):
-    """Decorator to retry MusicBrainz API calls on transient web errors."""
-    def decorator(func):
-        """Internal decorator to retry MusicBrainz API calls."""
-        def wrapper(*args, **kwargs):
-            """internal decorator that does the actual work"""
-            attempt = 0
-            while True:
-                try:
-                    return func(*args, **kwargs)
-                except mb.WebServiceError:
-                    attempt += 1
-                    if attempt >= retries:
-                        raise
-                    time.sleep(delay)
-        return wrapper
-    return decorator
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
@@ -859,7 +842,7 @@ def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
     return None
 
 
-@_retry_mb_api()
+@retry_mb_api()
 def _search_releases(query: str, limit: int) -> dict:
     """Executes a release search with retry logic."""
     return mb.search_releases(query=query, limit=limit)
@@ -915,7 +898,7 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
     logger.emit(f"    -> Identified unique track counts: {sorted(list(seen_counts))}")
     return [(r_id, date) for r_id, date in unique_releases.items()]
 
-@_retry_mb_api()
+@retry_mb_api()
 def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
     """Fetches a paginated list of releases with retry logic."""
     return mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)
@@ -952,7 +935,7 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
     logger.emit(f"    [+] Metadata fetch complete. Built {len(candidates)} total candidates.")
     return candidates
 
-@_retry_mb_api()
+@retry_mb_api()
 def _fetch_release_info(rel_id: str) -> dict:
     """Fetches a single release with retry logic."""
     return mb.get_release_by_id(rel_id, includes=['recordings'])
