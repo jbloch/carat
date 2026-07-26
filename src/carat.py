@@ -113,6 +113,23 @@ def _ensure_writable(path: Path) -> None:
     except OSError:
         raise PermissionError(f"Library root is not writable: {path}")
 
+def _retry_mb_api(retries: int = 3, delay: float = 2.0):
+    """Decorator to retry MusicBrainz API calls on transient web errors."""
+    def decorator(func):
+        """Internal decorator to retry MusicBrainz API calls."""
+        def wrapper(*args, **kwargs):
+            """internal decorator that does the actual work"""
+            attempt = 0
+            while True:
+                try:
+                    return func(*args, **kwargs)
+                except mb.WebServiceError:
+                    attempt += 1
+                    if attempt >= retries:
+                        raise
+                    time.sleep(delay)
+        return wrapper
+    return decorator
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
@@ -425,7 +442,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         # 3. Synchronize: Grab the results of the background fetch
         candidates = []
         try:
-            candidates = candidates_future.result(timeout=10) or []
+            candidates = candidates_future.result(timeout=30) or []
         except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
             logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
 
@@ -657,7 +674,7 @@ def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | 
         if idx is not None:
             selected = next((s for s in streams if int(s.get('index', -1)) == idx), None)
             if selected is not None:
-                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name', "unknown")},{selected.get('channels', "unknown")} channels)")
+                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name', 'unknown')},{selected.get('channels', 'unknown')} channels)")
 
         return idx
     except json.JSONDecodeError:
@@ -756,7 +773,6 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
             f"[+] Selected Lossless Stream: Index {idx} ({best_stream.get('codec_name')}, {channels} channels{size_str})")
 
         return idx, channels
-
     except json.JSONDecodeError:
         return None
 
@@ -817,7 +833,7 @@ def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
         query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
         logger.emit(f"[*] Executing Query: {query}")
         try:
-            res = mb.search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
+            res = _search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
             for r in res.get('release-list', []):
                 found_artist = extract_artist_from_musicbrainz_metadata(r)
                 found_album = r.get('title', 'Unknown')
@@ -843,6 +859,12 @@ def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
     return None
 
 
+@_retry_mb_api()
+def _search_releases(query: str, limit: int) -> dict:
+    """Executes a release search with retry logic."""
+    return mb.search_releases(query=query, limit=limit)
+
+
 def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
     """
     Returns release IDs and dates of editions of the given release group corresponding to all possible track-counts.
@@ -857,7 +879,7 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
     # 1. Fetch ALL editions by paginating through the browse_releases endpoint
     try:
         while True:
-            result = mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)
+            result = _browse_releases(rg_id, limit, offset)
             batch = result.get('release-list', [])
             releases.extend(batch)
 
@@ -893,6 +915,11 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
     logger.emit(f"    -> Identified unique track counts: {sorted(list(seen_counts))}")
     return [(r_id, date) for r_id, date in unique_releases.items()]
 
+@_retry_mb_api()
+def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
+    """Fetches a paginated list of releases with retry logic."""
+    return mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)
+
 
 def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                                   rg_id: str, rg_artist: str, rg_title: str) -> list[dict[str, Any]]:
@@ -901,7 +928,7 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
     candidates = []
     for rel_id, year in release_ids_and_dates:
         try:
-            rel_info = mb.get_release_by_id(rel_id, includes=['recordings'])
+            rel_info = _fetch_release_info(rel_id)
 
             # Treat EVERY medium as its own independent candidate
             for medium in rel_info.get('release', {}).get('medium-list', []):
@@ -924,6 +951,11 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
             continue
     logger.emit(f"    [+] Metadata fetch complete. Built {len(candidates)} total candidates.")
     return candidates
+
+@_retry_mb_api()
+def _fetch_release_info(rel_id: str) -> dict:
+    """Fetches a single release with retry logic."""
+    return mb.get_release_by_id(rel_id, includes=['recordings'])
 
 def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
     """
@@ -1328,38 +1360,52 @@ class Codec(StrEnum):
 
 
 def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str,
-                         output_container: Container = Container.M4A, preferred_codec: Codec = Codec.TRUEHD) -> None:
+                         output_container: Container = Container.M4A, preferred_codec: Codec = Codec.TRUEHD) -> bool:
     """
-    Rips the Atmos stream representing the main title in the specified source into the music library with the
-    specified root. The artist and album title are used to obtain metadata and cover art, which are used to
-    generate the cue file and cover.jpg in the music library. The library entry generally consists of a chapterless
-    audio file (M4A or MKV) containing only the Atmos stream, a cue sheet, and a cover.jpg. This format provides gapless
-    playback of the entire album, as well as access to individual tracks, and is the only format known to do so
-    on most platforms.
+    Rips the specified Atmos or multichannel source into a digital music library.
 
-    The output codec will be the highest quality codec consistent with the caller's preferred codec. The three
-    possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos (lossy), and AC-3
-    Surround (not Atmos!). The permitted values for preferred_codec are "truehd" (default), "eac3", and "ac3".
+    The artist and album title are used to obtain metadata and cover art, which are used to
+    generate the cue file and cover.jpg in the music library. The library entry generally consists
+    of a chapterless audio file (M4A or MKV) containing only the Atmos stream, a cue sheet, and
+    a cover.jpg. This format provides gapless playback of the entire album, as well as access to
+    individual tracks, and is the only format known to do so on most platforms.
 
-    If output_container is ".flac", or it's another value but the input does not contain an Atmos stream, carat
-    will find the "best" lossless stream and rip it into a collection of flac files (with tags and no cue sheet).
-    By "best," we mean the stream with the most channels or if there is a tie, the one with the most bytes (total length).
+    If no metadata can be found (e.g., if MusicBrainz has no entry for the release, there is no
+    internet connection, or MusicBrainz is down), the album will still be ripped, but the track titles
+    will all be "Track <#>" and the artist and album names will not be canonicalized.
 
-    This method offers complete ripping of Atmos (or legacy multichannel) sources into digital music libraries in a
-    single call, with:
+    The output codec will be the highest quality codec consistent with the caller's preferences. The
+    three possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos
+    (lossy), and AC-3 Surround (not Atmos!).
+
+    If output_container is ".flac", or it's another value but the input does not contain an Atmos stream,
+    carat will find the "best" lossless stream and rip it into a collection of flac files (with tags and
+    no cue sheet). By "best," we mean the stream with the most channels or if there is a tie, the one
+    with the most bytes (total length).
 
     Polymorphic Input Handling:
-      - Integers (e.g. "0", "-1") are Treated as Physical Optical Disc indices
-      - .iso files are Mounted virtually and scanned as discs
-      - BDMV folders are Scanned as Blu-ray structures
-      - .mkv files are Treated as direct sources, bypassing MakeMKV rip (Headphone Dust release format)
-      - Standard folders are treated as collections of tracks to be merged into an album (IAA release format)
+      - Integers (e.g. "0", "-1") are Treated as Physical Optical Disc indices.
+      - .iso files are Mounted virtually and scanned as discs.
+      - BDMV folders are Scanned as Blu-ray structures.
+      - .mkv files are Treated as direct sources, bypassing MakeMKV rip (Headphone Dust release format).
+      - Standard folders are treated as collections of tracks to be merged into an album (IAA release format).
 
     The processing pipeline ensures:
-      1. A temporary workspace is used for intermediate files
-      2. Metadata is fetched from MusicBrainz only if the track count matches what's found on the input source
-      3. CUE sheets are generated and internal chapters are stripped for gapless playback support
-      4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible
+      1. A temporary workspace is used for intermediate files.
+      2. Metadata is fetched from MusicBrainz only if the track count matches what's found on the input source.
+      3. CUE sheets are generated and internal chapters are stripped for gapless playback support.
+      4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible.
+
+    Args:
+        src_path: The polymorphic source path (Disc index, ISO, BDMV folder, MKV, or IAA folder).
+        artist: The requested album artist (used for metadata fetching).
+        album: The requested album title (used for metadata fetching).
+        library_root: The destination directory for the processed album.
+        output_container: The target container format (.m4a, .mkv, or .flac).
+        preferred_codec: The target Atmos codec (truehd, eac3, or ac3).
+
+    Returns:
+        bool: True if tracklist metadata was successfully found and applied, False otherwise.
     """
 
     ingestion_start_time = time.time()
@@ -1433,7 +1479,9 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
         logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
     finally:
         logger.close_log_file(log_dest)
-    clean_up()
+        clean_up()
+
+    return bool(matched_candidate)
 
 
 def _clean_path_arg(arg: str) -> str:
@@ -1460,7 +1508,7 @@ def main():
     # Initialize for CLI (no UI handler)
     init()
 
-    rip_album_to_library(
+    got_metadata = rip_album_to_library(
         _clean_path_arg(args.source),
         args.artist,
         args.album,
@@ -1468,6 +1516,10 @@ def main():
         output_container=f".{args.output_container}",
         preferred_codec=args.preferred_codec
     )
+
+    if not got_metadata:
+        logger.emit("\n[!] Could not find metadata for this release. Please check artist and album names and internet connection.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

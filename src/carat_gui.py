@@ -29,7 +29,7 @@ from PIL import Image, ImageTk
 
 import carat
 import logger
-from carat import Codec, Container
+from carat import Codec, Container, rip_album_to_library
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
@@ -412,17 +412,18 @@ class CaratGUI:
                    output_container: str, preferred_codec: carat.Codec) -> None:
         """The worker thread function."""
         success = False
+        got_metadata = False
         try:
-            carat.rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
+            got_metadata = rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
             success = True
         except Exception as e:
             self.log_queue.put(f"CRITICAL ERROR: {e}")
         finally:
             # Pass the success state back to the main thread
             # noinspection PyTypeChecker
-            self.parent.after(0, lambda: self._finalize_ui(success))
+            self.parent.after(0, lambda: self._finalize_ui(success, got_metadata))
 
-    def _finalize_ui(self, success: bool):
+    def _finalize_ui(self, success: bool, got_metadata: bool) -> None:
         self.progress_bar.stop()
         self.progress_bar.config(mode='determinate')
 
@@ -432,10 +433,15 @@ class CaratGUI:
             self.progress_var.set(100)
             self.lbl_status.config(text="Idle")
             self.btn_rip.config(state="disabled", text="Rip Complete")  # State 4: Complete
+            if not got_metadata:
+                messagebox.showwarning(
+                    "Warning",
+                    "The rip completed successfully, but Carat was unable to fetch the tracklist metadata from MusicBrainz.\n\n"
+                    "Your files have been saved as 'Track 1', 'Track 2', etc., and you may need to edit the tags and CUE sheet manually."
+                )
         else:
             self.lbl_status.config(text="Failed")
             self.btn_rip.config(state="disabled", text="Rip Failed!")  # State 5: Failed
-
 
     def _display_cover(self, path: Path) -> None:
         """Updates the cover art label using Pillow."""
