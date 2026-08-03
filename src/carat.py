@@ -271,6 +271,7 @@ class TitleInfo:
     size: int = 0
     file_name: str = "Unknown"
     duration: str = "Unknown"
+    duration_sec: float = 0.0  # Derived from duration
     size_str: str = "Unknown"
     streams: list[str] = field(default_factory=list)
 
@@ -299,6 +300,11 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
                     titles[t_idx].chapters = int(val)
                 elif attr_id == "9":
                     titles[t_idx].duration = val
+                    try:
+                        h, m, s = val.split(':')
+                        titles[t_idx].duration_sec = int(h) * 3600 + int(m) * 60 + int(s)
+                    except ValueError:
+                        pass
                 elif attr_id == "10":
                     titles[t_idx].size_str = val
                 elif attr_id == "11":
@@ -364,11 +370,11 @@ def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
 
 
 def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int,
-                          candidates: list[dict]) -> dict | None:
+                          target_duration_sec: float, candidates: list[dict]) -> dict | None:
     """
-    Finds the best MusicBrainz candidate for a given target and chapter count.
-    Filters for exact matches or +1 preamble matches, prioritizing exact matches,
-    then string similarity to the target artist and album.
+    Finds the best MusicBrainz candidate for a given artist, name, target chapter count, and target duration.
+    Filters for exact track count matches or +1 preamble matches, prioritizing similar durations, lower MB medium index,
+    and finally string similarity to the target artist and album names.
     """
     if not candidates:
         return None
@@ -376,36 +382,45 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
     # Filter for valid matches (exact or +1 preamble)
     matched = [c for c in candidates if 0 <= (chapter_count - len(c['tracks'])) <= 1]
 
-    if matched:
-        safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
+    safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
 
-        def get_similarity(c: dict) -> float:
-            """Similarity scorer function for album and artist titles"""
-            safe_cand = normalize_for_fuzzy_comparison(f"{c['artist']} {c['title']}").replace(" ", "")
-            return difflib.SequenceMatcher(None, safe_target, safe_cand).ratio()
+    def get_similarity(c: dict) -> float:
+        """Calculates a similarity score based on string similarity to the target artist and album."""
+        safe_cand = normalize_for_fuzzy_comparison(f"{c['artist']} {c['title']}").replace(" ", "")
+        return difflib.SequenceMatcher(None, safe_target, safe_cand).ratio()
 
-        # Sort by: 1. Track diff (ascending), 2. Similarity (descending)
-        matched.sort(key=lambda c: (chapter_count - len(c['tracks']), -get_similarity(c)))
+    def get_duration_penalty(c: dict) -> int:
+        """Calculates a penalty based on total duration difference (in 120-second buckets)."""
+        mb_duration_ms = sum(t.get('duration') or 0 for t in c['tracks'])
+        if mb_duration_ms == 0 or target_duration_sec == 0:
+            return 0
+        mb_sec = mb_duration_ms / 1000.0
+        return int(abs(target_duration_sec - mb_sec) // 120)
 
-        logger.emit(f"\n[*] Evaluating Candidates (Target: {chapter_count} tracks)...")
-        eliminated = len(candidates) - len(matched)
-        if eliminated > 0:
-            logger.emit(f"    -> Eliminated {eliminated} candidates (Track count Δ exceeded tolerance).")
+    def get_medium_penalty(c: dict) -> int:
+        """Penalizes bonus discs and non-primary mediums."""
+        # Medium 1 gets 0 penalty. Medium 2 gets 1 penalty, etc.
+        return max(0, c.get('medium_index', 1) - 1)
 
-        for c in matched:
-            diff = chapter_count - len(c['tracks'])
-            sim = get_similarity(c)
-            logger.emit(f"        -> [Δ={diff}, Sim={sim:.2f}] {c['title']} ({c.get('year', 'Unknown')}) [MBID: {c.get('mbid', 'Unknown')}]")
+    # Sort Hierarchy:
+    # 1. Duration Penalty (Filters out radically different tracklists)
+    # 2. Medium Position (Prioritizes Disc 1 over Disc 2/3/4)
+    # 3. Text Similarity (Fuzzy string match for exact album/artist text)
+    matched.sort(key=lambda c: (
+        get_duration_penalty(c),
+        get_medium_penalty(c),
+        -get_similarity(c)
+    ))
 
-        winner = matched[0]
-        logger.emit(f"    [+] Selected Winner: {winner['title']} ({winner.get('year', 'Unknown')}) [MBID: {winner.get('mbid', 'Unknown')}]")
-        return winner
+    for i, c in enumerate(matched):
+        bullet = "*" if i == 0 else "-"
+        logger.emit(f"    {bullet} {c['title']} ({c.get('year', 'Unknown')}) [MBID {c.get('mbid', 'Unknown')} "
+                    f"({c.get('medium_index', 1)})] [Scores: Duration={get_duration_penalty(c)},"
+                    f" Medium={get_medium_penalty(c)}, Artist/Title={get_similarity(c) :.2f}]")
 
-    return None
+    return matched[0]
 
-
-def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[
-    str, dict | None]:
+def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[str, dict | None]:
     """
     Identifies the (likely) main audio title by "intersecting" MakeMKV and MusicBrainz metadata.
     Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
@@ -432,15 +447,17 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
     # Find all input titles with the same track count as a candidate MusicBrainz releases
     if candidates:
         valid_titles = []
-        for t_idx, info in titles.items():
+        for title_index, info in titles.items():
             if info.score <= 0:
-                logger.emit(f"    [-] Rejected Title {t_idx} (No valid audio stream detected)")
+                logger.emit(f"    [-] Rejected Title {title_index} (No valid audio stream detected)")
                 continue
-            best_candidate = get_best_mb_candidate(artist, album, info.chapters, candidates)
+
+            logger.emit(f"\n[+] Finding best candidate for Title {title_index}")
+            best_candidate = get_best_mb_candidate(artist, album, info.chapters, info.duration_sec, candidates)
 
             # Keep the title if it matched a candidate, OR if MB is entirely offline
             if best_candidate or not candidates:
-                valid_titles.append((t_idx, best_candidate))
+                valid_titles.append((title_index, best_candidate))
     else:
         # Graceful degradation if MB is down/offline
         valid_titles = [(t_idx, None) for t_idx, info in titles.items() if info.score > 0]
@@ -448,46 +465,44 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
 
     # noinspection PyShadowingNames
-    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int, int]:
-        """Sort criterion to rank multiple matches: (MB Relevance Rank, track-count difference, Format Penalty, -Size)"""
+    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int]:
+        """Sort criterion to rank multiple matches: (MB Relevance Rank, Format Penalty, -Size)"""
         t_idx, matched_candidate = item
 
         # 1. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
-        rank = candidates.index(matched_candidate) if matched_candidate in candidates else 999
+        mb_rank = candidates.index(matched_candidate) if matched_candidate in candidates else 999
 
-        # 2. Track-count accuracy: How close is the physical chapter count to the logical track count? (0 or 1)
-        diff = abs(titles[t_idx].chapters - len(matched_candidate['tracks'])) if matched_candidate else 0
-
-        # 3. Format Penalty: Score titles based on user intent (Atmos vs. FLAC)
+        # 2. Format Penalty: Score titles based on user intent (Atmos vs. FLAC)
         streams_text = " ".join(titles[t_idx].streams).lower()
         has_atmos = 1 if ("atmos" in streams_text or "truehd" in streams_text) else 0
-
         if prefer_legacy:
             format_penalty = has_atmos  # Penalize Atmos titles if user explicitly wants FLAC
         else:
             format_penalty = 0 if has_atmos else 1  # Penalize non-Atmos titles if user wants Atmos
 
-        # 4. Size: Negated so that larger files sort first when using min()
+        # 3. Size: Negated so that larger files sort first when using min()
         size = titles[t_idx].size
 
-        return rank, diff, format_penalty, -size
+        return mb_rank, format_penalty, -size
 
-    logger.emit("[*] Evaluated Heuristic Scores (MusicBrainz Rank, Track Count Accuracy, Format Penalty, File Size):")
-    for vt in valid_titles:
-        rank, diff, penalty, neg_size = sort_key(vt)
-        logger.emit(
-            f"    [-] Title {vt[0]}: MB Rank={rank}, Track Count Δ={diff}, Format Penalty={penalty}, Size={-neg_size} bytes")
+    logger.emit("\n[*] Finding best title match across all input titles:")
+    valid_titles.sort(key=sort_key)
+    for i, vt in enumerate(valid_titles):
+        title_index, matched_candidate = vt
+        mb_rank, format_penalty, neg_size = sort_key(vt)
+        bullet = "*" if i == 0 else "-"
+        if matched_candidate is not None:
+            mc = cast(dict, cast(object, matched_candidate))  # Re-anchors the type for PyCharm, whose typechecker is dumb
+            logger.emit(f"    {bullet}  Title {title_index} [{mc['title']} ({mc.get('year', 'Unknown')})]"
+                        f" [MBID {mc.get('mbid', 'None')} ({mc.get('medium_index', 1)})]"
+                        f" [Scores: Rank={mb_rank}, Format={format_penalty}, Size={-neg_size} bytes]")
+        else:
+            logger.emit(f"    {bullet}  Title {title_index} ['Unknown']"
+                        f"[Scores: Rank={mb_rank}, Format={format_penalty}, Size={-neg_size} bytes]")
+    logger.emit("")
 
-    # Pick the winner that scores lowest (best) across the hierarchy
-    winner_tuple = min(valid_titles, key=sort_key)
-    winner_idx = winner_tuple[0]
-    matched_candidate = winner_tuple[1]
-
-    w_rank, w_diff, w_penalty, w_neg_size = sort_key(winner_tuple)
-    logger.emit(
-        f"[*] Winner: Title {winner_idx} (Rank: {w_rank}, Track count Δ: {w_diff}, Format Penalty: {w_penalty}, Size: {-w_neg_size} bytes)")
-
-    return winner_idx, matched_candidate
+    winner = valid_titles[0]
+    return winner[0], winner[1]
 
 
 # --- (4) Toolset & Main ---
@@ -710,7 +725,7 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
     """
     Returns a tuple of (stream_index, channel_count) for the best lossless multichannel stream
     (e.g., LPCM, DTS-HD MA, TrueHD), ignoring lossy streams.
-    Prioritizes dedicated legacy mixes (non-TrueHD) over TrueHD (Atmos).
+    Prioritizes dedicated legacy mixes over Atmos.
     """
     logger.emit("\n[*] === LOSSLESS MULTICHANNEL STREAM ANALYSIS ===")
 
@@ -781,9 +796,7 @@ MAX_RELEASES_TO_SEARCH: int = 15
 def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
     """
     Returns the metadata for the candidate releases corresponding to the given (inexact) artist and album name.
-    All the releases returned will come from the same release group, and each will have a different track-count
-    from the others. (The assumption is that all members of a release group with the same track-count will
-    have the same track sequence, so we only need one release per track count, and it doesn't matter which one.)
+    All the releases returned will come from the same release group.
     """
     logger.emit("\n[*] === STARTING METADATA FETCH ===")
 
@@ -794,7 +807,7 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
     rg_id, rg_artist, rg_title = rg
 
     releases = find_releases_and_dates_for_release_group(rg_id, rg_title)
-    logger.emit(f"    -> Filtered down to {len(releases)} matching releases.")
+    logger.emit(f"    -> Filtered down to {len(releases)} matching release(s).")
 
     if not releases:
         logger.emit("    [-] No matching releases found. Aborting metadata fetch.")
@@ -828,14 +841,13 @@ def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
                 if artist_match and album_match:
                     rg_id = r.get('release-group', {}).get('id')
                     rg_title, rg_artist = found_album, found_artist
-                    logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})")
+                    logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})\n")
 
                     # Ensure rg_id actually exists to satisfy the strict return type!
                     if rg_id:
                         return str(rg_id), rg_artist, rg_title
                 else:
-                    logger.emit(
-                        f"    [-] Rejected Candidate: {found_artist} - {found_album} (Artist Match: {artist_match}, Album Match: {album_match})")
+                    logger.emit(f"    [-] Rejected Candidate: {found_artist} - {found_album} (Artist Match: {artist_match}, Album Match: {album_match})")
         except mb.WebServiceError as e:
             logger.emit(f"    [!] API Error: {e}")
 
@@ -850,16 +862,16 @@ def _search_releases(query: str, limit: int) -> dict:
 
 def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
     """
-    Returns release IDs and dates of editions of the given release group corresponding to all possible track-counts.
+    Returns release IDs and dates of releases of the given release group corresponding to all possible track-counts.
     Evaluates mediums individually to strictly match physical disc topology.
     """
-    logger.emit(f"[*] Fetching all editions and media for Release Group: {rg_title}")
+    logger.emit(f"[*] Fetching all releases and mediums for Release Group: {rg_id} ({rg_title})")
 
     releases = []
     limit = 100
     offset = 0
 
-    # 1. Fetch ALL editions by paginating through the browse_releases endpoint
+    # 1. Fetch all releases by paginating through the browse_releases endpoint
     try:
         while True:
             result = _browse_releases(rg_id, limit, offset)
@@ -870,7 +882,7 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
                 break  # We've reached the end of the list
             offset += limit
 
-        logger.emit(f"    -> API returned {len(releases)} editions in this group.")
+        logger.emit(f"    -> API returned {len(releases)} releases in this group.")
     except mb.WebServiceError as e:
         logger.emit(f"    [!] Error fetching releases: {e}")
         return []
@@ -878,7 +890,7 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
     unique_releases = {}
     seen_counts = set()
 
-    # 2. Map the physical mediums to find unique track counts
+    # 2. Map the mediums to find unique track counts
     for r in releases:
         mediums = r.get('medium-list', [])
 
@@ -907,19 +919,19 @@ def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
 def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                                   rg_id: str, rg_artist: str, rg_title: str) -> list[dict[str, Any]]:
     """Fetch the tracklists for the given release ids (and dates), which pertain to the given release group metadata"""
-    logger.emit(f"\n[*] Fetching tracklists for {len(release_ids_and_dates)} matching editions in release group {rg_id}...")
+    logger.emit(f"\n[*] Fetching tracklists for {len(release_ids_and_dates)} matching MB releases in release group {rg_id}...")
     candidates = []
     for rel_id, year in release_ids_and_dates:
         try:
             rel_info = _fetch_release_info(rel_id)
 
             # Treat EVERY medium as its own independent candidate
-            for medium in rel_info.get('release', {}).get('medium-list', []):
+            for pos, medium in enumerate(rel_info.get('release', {}).get('medium-list', []), start=1):
                 medium_tracks = []
                 for track in medium.get('track-list', []):
                     medium_tracks.append({
                         'title': track.get('recording', {}).get('title', 'Unknown Track'),
-                        'duration': track.get('recording', {}).get('length', 0)
+                        'duration': int(track.get('recording', {}).get('length') or 0)
                     })
 
                 if medium_tracks:
@@ -927,12 +939,13 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                         'title': rg_title,
                         'artist': rg_artist,
                         'year': year or 'Unknown',
-                        'mbid': rel_id,  # Specific edition MBID instead of the Release Group ID
+                        'mbid': rel_id,  # Specific release MBID instead of the Release Group ID
+                        'medium_index': int(medium.get('position', pos)),
                         'tracks': medium_tracks
                     })
         except mb.WebServiceError:
             continue
-    logger.emit(f"    [+] Metadata fetch complete. Built {len(candidates)} total candidates.")
+    logger.emit(f"[*] Metadata fetch complete. Found {len(candidates)} candidate MB mediums in release group.")
     return candidates
 
 @retry_mb_api()
@@ -1125,7 +1138,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
         # Intersect local MKV chapters with MusicBrainz candidates
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
         candidates = fetch_candidate_metadata(artist, album)
-        matched_candidate = get_best_mb_candidate(artist, album, len(chapters), candidates)
+        matched_candidate = get_best_mb_candidate(artist, album, len(chapters), duration, candidates)
 
         # Fallback: if no strict match was found but we HAVE candidates, just blindly trust the top result
         if not matched_candidate and candidates:
