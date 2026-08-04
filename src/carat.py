@@ -263,6 +263,7 @@ def emit_summary_log(entire_log: list[str], start_time: float, env: dict | None 
     logger.emit(summary)
     logger.emit("") # Blank line visually separates tasks
 
+
 @dataclass
 class TitleInfo:
     """Holds the parsed MakeMKV state for a single title."""
@@ -271,9 +272,10 @@ class TitleInfo:
     size: int = 0
     file_name: str = "Unknown"
     duration: str = "Unknown"
-    duration_sec: float = 0.0  # Derived from duration
+    duration_sec: float = 0.0
     size_str: str = "Unknown"
-    streams: list[str] = field(default_factory=list)
+    streams: dict[int, str] = field(default_factory=dict)
+    atmos_streams: set[int] = field(default_factory=set)
 
 
 def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
@@ -289,44 +291,37 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
         except IndexError:
             continue
 
-        # MakeMKV TINFO Format: TINFO:title_idx,attribute_id,code,"value"
         if line.startswith("TINFO:"):
             attr_id = parts[1]
             code = parts[2]
             val = parts[3].strip('"') if len(parts) > 3 else ""
-
             if code == "0":
-                if attr_id == "8":
-                    titles[t_idx].chapters = int(val)
+                if attr_id == "8": titles[t_idx].chapters = int(val)
                 elif attr_id == "9":
                     titles[t_idx].duration = val
                     try:
                         h, m, s = val.split(':')
                         titles[t_idx].duration_sec = int(h) * 3600 + int(m) * 60 + int(s)
-                    except ValueError:
-                        pass
-                elif attr_id == "10":
-                    titles[t_idx].size_str = val
-                elif attr_id == "11":
-                    titles[t_idx].size = int(val)
-                elif attr_id == "27":
-                    titles[t_idx].file_name = val
+                    except ValueError: pass
+                elif attr_id == "10": titles[t_idx].size_str = val
+                elif attr_id == "11": titles[t_idx].size = int(val)
+                elif attr_id == "27": titles[t_idx].file_name = val
 
-        # MakeMKV SINFO Format: SINFO:title_idx,stream_idx,attribute_id,code,"value"
         if line.startswith("SINFO:"):
             if len(parts) >= 5:
+                stream_idx = int(parts[1])
                 attr_id = parts[2]
                 val = parts[4].strip('"')
 
-                # Attribute 30 is the human-readable stream description
-                # (e.g., "DTS-HD Master Audio Surround 5.1 English")
-                if attr_id == "30":
-                    titles[t_idx].streams.append(val)
+                # If ANY attribute for this stream contains "atmos", flag its absolute index!
+                if "atmos" in val.lower():
+                    titles[t_idx].atmos_streams.add(stream_idx)
 
-                    # --- LEGACY (non-Atmos) Priorities (based on channel count) ---
+                # Attribute 30 is the human-readable stream description
+                if attr_id == "30":
+                    titles[t_idx].streams[stream_idx] = val
                     match = re.search(r'(\d)\.(\d)', val)
                     if match:
-                        # 5.1 -> 60, 7.1 -> 80
                         channels = int(match.group(1)) + int(match.group(2))
                         titles[t_idx].score = max(titles[t_idx].score, channels * 10)
                     elif "Surround" in val or "Multichannel" in val:
@@ -334,7 +329,7 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
                     elif "Stereo" in val or "2.0" in val:
                         titles[t_idx].score = max(titles[t_idx].score, 20)
 
-            # ---  ATMOS Priorities (based on lossiness) ---
+            # ATMOS Priorities
             if "A_TRUEHD" in line or "TrueHD Atmos" in line:
                 titles[t_idx].score = max(titles[t_idx].score, 1000)
             elif "A_EAC3" in line and "Atmos" in line:
@@ -346,12 +341,10 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
 def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
     """Pretty-prints the disc topology parsed from MakeMKV."""
     logger.emit("\n[*] === DISC TOPOLOGY SCAN ===")
-
     if not titles:
         logger.emit("    [!] No valid titles found during scan.")
         return
 
-    # Sort by integer title ID for clean output
     for t_idx, info in sorted(titles.items(), key=lambda x: int(x[0])):
         logger.emit(f"    [Title {t_idx}] {info.file_name}")
         logger.emit(f"      - Duration: {info.duration} ({info.chapters} Chapters)")
@@ -359,14 +352,13 @@ def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
 
         if info.streams:
             logger.emit("      - Streams:")
-            for i, stream in enumerate(info.streams, start=1):
-                # Add a visual star for the Atmos streams so they pop in the log
-                marker = "★" if "Atmos" in stream or "TrueHD" in stream else "->"
-                logger.emit(f"          {marker} Stream {i}: {stream}")
+            # Sort by absolute stream_idx so it prints in order
+            for s_idx, stream in sorted(info.streams.items()):
+                marker = "★" if s_idx in info.atmos_streams else "->"
+                logger.emit(f"          {marker} Stream {s_idx}: {stream}")
         else:
             logger.emit("      - Streams: None detected")
-
-        logger.emit("")  # Blank line between titles
+        logger.emit("")
 
 
 def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int,
@@ -381,6 +373,8 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 
     # Filter for valid matches (exact or +1 preamble)
     matched = [c for c in candidates if 0 <= (chapter_count - len(c['tracks'])) <= 1]
+    if not matched:
+        return None
 
     safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
 
@@ -420,10 +414,24 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 
     return matched[0]
 
-def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False) -> tuple[str, dict | None]:
-    """
-    Identifies the (likely) main audio title by "intersecting" MakeMKV and MusicBrainz metadata.
+
+def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False)\
+        -> tuple[str, dict[str, Any] | None, set[int]]:
+    """Identifies the main audio title by intersecting MakeMKV and MusicBrainz metadata.
+
     Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
+
+    Args:
+        source_spec: The physical or virtual path to the Blu-ray source.
+        artist: The canonicalized album artist.
+        album: The canonicalized album title.
+        prefer_legacy: If True, prioritizes lossless 5.1/Quad formats over Atmos.
+
+    Returns:
+        A 3-element tuple containing:
+        - title_idx: The MakeMKV index of the winning title.
+        - matched_candidate: The MusicBrainz release dictionary, or None if the API failed.
+        - makemkv_streams: A list of human-readable stream descriptors parsed by MakeMKV.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
         # 1. Fire off the network fetch in the background
@@ -465,44 +473,57 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
 
     # noinspection PyShadowingNames
-    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int]:
-        """Sort criterion to rank multiple matches: (MB Relevance Rank, Format Penalty, -Size)"""
+    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int, int]:
+        """Sort criterion: (Format Penalty, Duration Penalty, MB Rank, -Size)"""
         t_idx, matched_candidate = item
 
-        # 1. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
+        # 1. Format Penalty: Score titles based on user intent (Atmos vs. FLAC)
+        has_atmos = False
+        has_lossless_legacy = False
+        for s_idx, s in titles[t_idx].streams.items():
+            s_low = s.lower()
+            if s_idx in titles[t_idx].atmos_streams or "truehd" in s_low:
+                has_atmos = True
+            elif "surround" in s_low or "4.0" in s_low or "5.1" in s_low or "quad" in s_low:
+                if any(codec in s_low for codec in ["lpcm", "pcm", "dts-hd ma", "flac", "alac", "truehd"]):
+                    has_lossless_legacy = True
+        has_target_format: bool = has_lossless_legacy if prefer_legacy else has_atmos
+        format_penalty = int(not has_target_format)
+
+        # 2. Duration Penalty: How well does this physical title match the logical album, duration-wise?
+        duration_penalty = 0
+        if matched_candidate:
+            mb_dur_ms = sum(t.get('duration') or 0 for t in matched_candidate['tracks'])
+            title_sec = titles[t_idx].duration_sec
+            if mb_dur_ms > 0 and title_sec > 0:
+                duration_penalty = int(abs(title_sec - (mb_dur_ms / 1000.0)) // 120)
+
+        # 3. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
         mb_rank = candidates.index(matched_candidate) if matched_candidate in candidates else 999
 
-        # 2. Format Penalty: Score titles based on user intent (Atmos vs. FLAC)
-        streams_text = " ".join(titles[t_idx].streams).lower()
-        has_atmos = 1 if ("atmos" in streams_text or "truehd" in streams_text) else 0
-        if prefer_legacy:
-            format_penalty = has_atmos  # Penalize Atmos titles if user explicitly wants FLAC
-        else:
-            format_penalty = 0 if has_atmos else 1  # Penalize non-Atmos titles if user wants Atmos
-
-        # 3. Size: Negated so that larger files sort first when using min()
+        # 4. Size: Negated so that larger files sort first when using min()
         size = titles[t_idx].size
 
-        return mb_rank, format_penalty, -size
+        return format_penalty, duration_penalty, mb_rank, -size
 
     logger.emit("\n[*] Finding best title match across all input titles:")
     valid_titles.sort(key=sort_key)
     for i, vt in enumerate(valid_titles):
         title_index, matched_candidate = vt
-        mb_rank, format_penalty, neg_size = sort_key(vt)
+        format_penalty, duration_penalty, mb_rank, neg_size = sort_key(vt)
         bullet = "*" if i == 0 else "-"
         if matched_candidate is not None:
             mc = cast(dict, cast(object, matched_candidate))  # Re-anchors the type for PyCharm, whose typechecker is dumb
             logger.emit(f"    {bullet}  Title {title_index} [{mc['title']} ({mc.get('year', 'Unknown')})]"
-                        f" [MBID {mc.get('mbid', 'None')} ({mc.get('medium_index', 1)})]"
-                        f" [Scores: Rank={mb_rank}, Format={format_penalty}, Size={-neg_size} bytes]")
+                    f" [MBID {mc.get('mbid', 'None')} ({mc.get('medium_index', 1)})]"
+                    f" [Scores: Format={format_penalty}, Duration={duration_penalty}, Rank={mb_rank}, Size={neg_size}]")
         else:
             logger.emit(f"    {bullet}  Title {title_index} ['Unknown']"
                         f"[Scores: Rank={mb_rank}, Format={format_penalty}, Size={-neg_size} bytes]")
     logger.emit("")
 
     winner = valid_titles[0]
-    return winner[0], winner[1]
+    return winner[0], winner[1], titles[winner[0]].atmos_streams
 
 
 # --- (4) Toolset & Main ---
@@ -637,108 +658,89 @@ def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
     return winner
 
 
-def find_atmos_stream(mkv_path: Path, preferred_codec: str = "truehd") -> int | None:
+def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: str = "truehd") -> int | None:
     """
-    Returns the index of the highest quality Atmos stream based on the preferred_codec,
-    with appropriate fallbacks and warnings.
+        Returns the index of the highest quality Atmos stream based on the preferred_codec,
+        with appropriate fallbacks and warnings. Evaluates based on Format, Channels, and Stream Index.
     """
     logger.emit("\n[*] === AUDIO STREAM ANALYSIS ===")
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for Atmos Stream")
+
     try:
         streams: list[dict[str, Any]] = json.loads(res).get('streams', [])
-        idx = None
+        if not streams:
+            return None
 
-        # 1. Hunt for the user's explicit preference first
-        preferred_candidates = [s for s in streams if s.get('codec_name') == preferred_codec]
-        if preferred_candidates:
-            idx = int(max(preferred_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+        valid_streams = [s for s in streams if s.get('codec_name', '').lower() in [preferred_codec, "eac3", "ac3"]]
+        if not valid_streams:
+            return None
 
-        # 2. Fallback: If caller wanted TrueHD but it's not there, grab E-AC-3
-        elif preferred_codec == "truehd":
-            eac3_candidates = [s for s in streams if s.get('codec_name') == "eac3"]
-            if eac3_candidates:
-                logger.emit("[!] WARNING: No TrueHD found! Falling back to lossy EAC3-JOC!")
-                idx = int(max(eac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+        def stream_sort_key(s):
+            """Sort criterion: (Format Penalty, -Channels, Index)"""
+            idx = int(s.get('index', 999))
+            codec = s.get('codec_name', '').lower()
 
-        # 3. The Absolute Fallback: Basic AC-3 (5.1)
-        if idx is None:
-            ac3_candidates = [s for s in streams if s.get('codec_name') == "ac3"]
-            if ac3_candidates:
-                logger.emit("[!] WARNING: NO ATMOS METADATA DETECTED! Falling back to 5.1 channel AC-3!")
-                idx = int(max(ac3_candidates, key=lambda x: int(x.get('channels', 0)))['index'])
+            if codec == preferred_codec:
+                # STRICT check: Did MakeMKV explicitly flag this absolute stream index as Atmos?
+                if atmos_streams:
+                    fmt_penalty = 0 if idx in atmos_streams else 1
+                else:
+                    # Failsafe if running against a raw MKV file without MakeMKV data
+                    fmt_penalty = 0 if int(s.get('channels', 0)) >= 8 else 1
+            elif codec == "eac3":
+                fmt_penalty = 2
+            elif codec == "ac3":
+                fmt_penalty = 3
+            else:
+                fmt_penalty = 4
 
-        if idx is not None:
-            selected = next((s for s in streams if int(s.get('index', -1)) == idx), None)
-            if selected is not None:
-                logger.emit(f"[+] Selected Audio Stream: Index {idx} ({selected.get('codec_name', 'unknown')},{selected.get('channels', 'unknown')} channels)")
+            channels = int(s.get('channels', 0))
+            return fmt_penalty, -channels, idx
 
-        return idx
+        valid_streams.sort(key=stream_sort_key)
+
+        logger.emit(f"[*] Evaluating {len(valid_streams)} valid Atmos candidate streams...")
+        for i, s in enumerate(valid_streams):
+            fmt_pen, neg_chan, s_idx = stream_sort_key(s)
+            bullet = "*" if i == 0 else "-"
+            logger.emit(f"    {bullet} Index {s_idx} [Codec: {s.get('codec_name', 'unknown')}, Channels: {-neg_chan}] "
+                        f"[Scores: Format={fmt_pen}, Channels={neg_chan}, Index={s_idx}]")
+
+        best_stream = valid_streams[0]
+        best_idx = int(best_stream['index'])
+        best_codec = best_stream.get('codec_name', 'unknown')
+        best_channels = best_stream.get('channels', 'unknown')
+
+        best_fmt_pen = stream_sort_key(best_stream)[0]
+        if best_fmt_pen == 1:
+            logger.emit("    [!] WARNING: No TrueHD Atmos found! Falling back to standard TrueHD/Lossy!")
+        elif best_fmt_pen == 2:
+            logger.emit("    [!] WARNING: NO ATMOS METADATA DETECTED! Falling back to lossy EAC3-JOC!")
+
+        logger.emit(f"\n[+] Selected Primary Audio Stream: Index {best_idx} ({best_codec}, {best_channels} channels)")
+        return best_idx
+
     except json.JSONDecodeError:
         return None
-
-
-def get_stream_codec(mkv_path: Path, stream_idx: int) -> str:
-    """Returns the codec name of the specified stream index."""
-    cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=index,codec_name", "-of", "json", str(mkv_path)]
-    try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
-        streams = json.loads(res.stdout).get('streams', [])
-        for s in streams:
-            if int(s.get('index', -1)) == stream_idx:
-                return s.get('codec_name', '').lower()
-    except (OSError, subprocess.SubprocessError, json.JSONDecodeError, ValueError):
-        pass
-    return ""
-
-
-def sort_key(s):
-    """
-    Sort the valid streams to prioritize:
-    1. Multichannel (>= 4 channels) over Stereo/Mono (< 4 channels)
-    2. Dedicated legacy mixes (non-Atmos) over Atmos mixes
-    3. Channel count descending
-    4. Stream size in bytes descending (advantages 5.1 over Quad when tied on previous criteria)
-    """
-
-    profile = s.get('profile', '').lower()
-    channels = int(s.get('channels', 0))
-
-    # Safely extract the byte size if it exists in the stream tags
-    tags = s.get('tags', {})
-    try:
-        num_bytes = int(tags.get('NUMBER_OF_BYTES', 0))
-    except ValueError:
-        num_bytes = 0
-
-    is_multichannel = 1 if channels >= 4 else 0
-
-    # Penalize Atmos explicitly so standard 5.1/Quad streams bubble to the top
-    is_atmos = 1 if "atmos" in profile else 0
-
-    return -is_multichannel, is_atmos, -channels, -num_bytes
 
 
 def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
     """
     Returns a tuple of (stream_index, channel_count) for the best lossless multichannel stream
     (e.g., LPCM, DTS-HD MA, TrueHD), ignoring lossy streams.
-    Prioritizes dedicated legacy mixes over Atmos.
+    Prioritizes dedicated legacy mixes over Atmos, and breaks ties via stream index.
     """
     logger.emit("\n[*] === LOSSLESS MULTICHANNEL STREAM ANALYSIS ===")
 
-    # Add 'tags' to show_entries so we can read the NUMBER_OF_BYTES metadata written by MakeMKV
     cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a",
-           "-show_entries", "stream=index,channels,codec_name,profile,tags",
+           "-show_entries", "stream=index,channels,codec_name,profile",
            "-of", "json", str(mkv_path)]
 
     res = run_command(cmd, "Scanning for Lossless Multichannel Stream")
     try:
         streams = json.loads(res).get('streams', [])
-
-        # Valid lossless codecs to look for
         lossless_codecs = {'truehd', 'pcm_s16le', 'pcm_s24le', 'pcm_s24be', 'mlp', 'alac', 'flac'}
         valid_streams = []
 
@@ -746,31 +748,44 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
             codec = s.get('codec_name', '').lower()
             profile = s.get('profile', '').lower()
 
-            # It's lossless if it's in our set, OR if it's DTS and the profile indicates Master Audio
             is_lossless = (codec in lossless_codecs) or (
                         codec == 'dts' and ('master audio' in profile or 'ma' in profile))
             if is_lossless:
                 valid_streams.append(s)
 
         if not valid_streams:
-            logger.emit("[!] ERROR: No valid lossless multichannel streams found on disc!")
+            logger.emit("    [!] ERROR: No valid lossless multichannel streams found on disc!")
             return None
 
-        valid_streams.sort(key=sort_key)
+        # noinspection shadowing-names
+        def mc_sort_key(s):
+            """Sort criterion: (Atmos Penalty, -IsMultichannel, -Channels, Index)"""
+            profile = s.get('profile', '').lower()
+            channels = int(s.get('channels', 0))
+            idx = int(s.get('index', 999))
+
+            is_multichannel = 1 if channels >= 4 else 0
+            is_atmos = 1 if "atmos" in profile else 0
+
+            return is_atmos, -is_multichannel, -channels, idx
+
+        valid_streams.sort(key=mc_sort_key)
+
+        logger.emit(f"[*] Evaluating {len(valid_streams)} valid lossless candidate streams...")
+        for i, s in enumerate(valid_streams):
+            is_atmos, neg_multi, neg_chan, s_idx = mc_sort_key(s)
+            bullet = "*" if i == 0 else "-"
+            logger.emit(f"    {bullet} Index {s_idx} [Codec: {s.get('codec_name', 'unknown')}, Channels: {-neg_chan}] "
+                        f"[Scores: AtmosPen={is_atmos}, Multi={-neg_multi}, Channels={neg_chan}, Index={s_idx}]")
+
         best_stream = valid_streams[0]
-
-        idx = int(best_stream.get('index'))
-        channels = int(best_stream.get('channels', 0))
-
-        # Format the size for the logger if available
-        best_tags = best_stream.get('tags', {})
-        size_mb = int(best_tags.get('NUMBER_OF_BYTES', 0)) / (1024 * 1024) if 'NUMBER_OF_BYTES' in best_tags else 0
-        size_str = f", {size_mb:.1f} MB" if size_mb > 0 else ""
+        best_idx = int(best_stream['index'])
+        best_channels = int(best_stream.get('channels', 0))
 
         logger.emit(
-            f"[+] Selected Lossless Stream: Index {idx} ({best_stream.get('codec_name')}, {channels} channels{size_str})")
+            f"\n[+] Selected Lossless Stream: Index {best_idx} ({best_stream.get('codec_name')}, {best_channels} channels)")
 
-        return idx, channels
+        return best_idx, best_channels
     except json.JSONDecodeError:
         return None
 
@@ -1099,10 +1114,28 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             pass  # Silent failure for cleanup to prevent app startup crashes
 
 
-def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str) -> tuple[
-    Path, dict[str, Any] | None, list[dict[str, Any]], float]:
-    """
-    Acquires the master MKV file, extracts its chapters/duration, and fetches the matching MusicBrainz metadata.
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str)\
+        -> tuple[Path, dict[str, Any] | None, list[dict[str, Any]], float, set[int]]:
+    """Acquires the master MKV file, extracts its chapters and duration, and fetches the matching MusicBrainz metadata.
+
+    Handles polymorphic source inputs (optical disc indices, ISOs, BDMV folders, standalone MKVs,
+    or IAA folders), ripping or merging them as necessary into a single master MKV in the temporary workspace.
+
+    Args:
+        src_path: The physical or virtual path to the source material.
+        artist: The requested album artist, used for metadata querying.
+        album: The requested album title, used for metadata querying.
+        output_container: The target output file extension (e.g., ".m4a", ".flac"), used to determine
+            if a legacy lossless rip is explicitly requested.
+
+    Returns:
+        A 5-element tuple containing:
+        - master_mkv: The Path to the consolidated MKV file that is ready for audio extraction.
+        - matched_candidate: The matched MusicBrainz release dictionary, or None if the API failed or no match was found.
+        - chapters: A list of chapter dictionaries extracted from the master MKV via ffprobe.
+        - duration: The total duration of the master MKV in seconds.
+        - atmos_streams: A ints which are the indices of the streams containing Atmos audio
+          (will be empty if the source bypassed MakeMKV).
     """
     src_p = Path(src_path)
     source_spec = None
@@ -1121,9 +1154,9 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
             source_spec = f"file:{src_p.resolve() / 'BDMV'}"
 
     # 2. Execute Source-Specific Acquisition
+    atmos_streams: set[int] = set()
     if source_spec:
-        # --- Handle MakeMKV Supported Formats: Blu-ray, Blu-ray iso, and BDMV folder ---
-        title_idx, matched_candidate = find_primary_title(source_spec, artist, album, output_container == ".flac")
+        title_idx, matched_candidate, atmos_streams = find_primary_title(source_spec, artist, album, output_container == ".flac")
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
@@ -1144,7 +1177,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
         if not matched_candidate and candidates:
             matched_candidate = candidates[0]
 
-    return atmos_mkv, matched_candidate, chapters, duration
+    return atmos_mkv, matched_candidate, chapters, duration, atmos_streams
 
 
 def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str, cover_path: Path):
@@ -1208,7 +1241,7 @@ class AudioProfile(NamedTuple):
     suffix: str
 
 
-def resolve_audio_profile(master_mkv: Path, requested_container: str, preferred_codec: str) -> AudioProfile:
+def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_container: str, preferred_codec: str) -> AudioProfile:
     """
     Scans the master MKV and determines the optimal audio stream and output format.
     Will automatically fall back to lossless FLAC slicing if Atmos is requested but unavailable.
@@ -1216,7 +1249,7 @@ def resolve_audio_profile(master_mkv: Path, requested_container: str, preferred_
 
     # 1. Attempt Atmos (if permitted by the user)
     if requested_container != ".flac":
-        idx = find_atmos_stream(master_mkv, preferred_codec)
+        idx = find_atmos_stream(master_mkv, atmos_streams, preferred_codec)
         if idx is not None:
             return AudioProfile(idx=idx, container=requested_container, suffix="(Atmos)")
 
@@ -1419,7 +1452,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
 
     try:
         # Extract master mkv and metadata from input file (or disc) and web metadata resources
-        master_mkv, matched_candidate, chapters, duration =\
+        master_mkv, matched_candidate, chapters, duration, atmos_streams = \
             get_mkv_master_file_and_metadata(src_path, artist, album, output_container)
 
         # Canonicalize artist and album title
@@ -1442,7 +1475,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
             logger.emit(f"[+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
 
         # Perform pre-assembly tasks
-        profile = resolve_audio_profile(master_mkv, output_container, preferred_codec)
+        profile = resolve_audio_profile(master_mkv, atmos_streams, output_container, preferred_codec)
         dest = lib_path / clean_artist / f"{clean_album} {profile.suffix}"
         log_dest = dest / f"{clean_artist} - {clean_album} {profile.suffix}.log"
         dest.mkdir(parents=True, exist_ok=True)
