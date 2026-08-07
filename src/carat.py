@@ -1544,7 +1544,7 @@ def main():
     parser.add_argument("library_root", help="Destination music library root")
 
     # Optional flags for format selection
-    parser.add_argument("--output-container", choices=["m4a", "mkv"], default="m4a",
+    parser.add_argument("--output-container", choices=["m4a", "mkv", "flac"], default="m4a",
                         help="Output container format (default: m4a)")
     parser.add_argument("--preferred-codec", choices=["truehd", "eac3", "ac3"], default="truehd",
                         help="Preferred audio codec (default: truehd)")
