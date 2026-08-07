@@ -945,7 +945,7 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
                 medium_tracks = []
                 for track in medium.get('track-list', []):
                     medium_tracks.append({
-                        'title': track.get('recording', {}).get('title', 'Unknown Track'),
+                        'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
                         'duration': int(track.get('recording', {}).get('length') or 0)
                     })
 
@@ -962,6 +962,23 @@ def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
             continue
     logger.emit(f"[*] Metadata fetch complete. Found {len(candidates)} candidate MB mediums in release group.")
     return candidates
+
+
+def sanitize_track_title(title: str) -> str:
+    """
+    Strips Extra Title Information (MusicBrainz ETI) from track titles safely.
+    Removes parenthetical blocks ONLY if they contain known technical/mix keywords.
+    Preserves structural parentheticals like "(Don't Fear) The Reaper".
+    """
+    # A blacklist of words that strongly indicate technical metadata rather than a song title
+    eti_keywords = r'(mix|remix|remaster|master|version|edit|live|instrumental|demo|take|stereo|mono|surround|atmos|acoustic)'
+
+    # Matches " (" or "(", followed by anything, the keyword (as a whole word), anything, and ")"
+    pattern = re.compile(rf'\s*\([^)]*\b{eti_keywords}\b[^)]*\)', re.IGNORECASE)
+
+    # Strip the ETI and clean up any lingering trailing spaces
+    return pattern.sub('', title).strip()
+
 
 @retry_mb_api()
 def _fetch_release_info(rel_id: str) -> dict:
