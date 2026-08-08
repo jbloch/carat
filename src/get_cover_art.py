@@ -11,7 +11,7 @@ and MusicBrainz as sources, but this does not affect the contract between this m
 __author__ = "Joshua Bloch"
 __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
-__version__ = "1.0B3"
+__version__ = "1.0B3.1"
 
 import re
 import sys
