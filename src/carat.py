@@ -15,7 +15,7 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B3.1"
 
-__all__ = ['rip_album_to_library', 'Container', 'Codec']
+__all__ = ['rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan']
 
 import argparse
 import atexit
@@ -32,10 +32,10 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, NoReturn, NamedTuple, cast
+from typing import Any, Callable, NoReturn, NamedTuple, cast, TypedDict
 
 import musicbrainzngs as mb
 # noinspection PyProtectedMember
@@ -50,6 +50,13 @@ from get_cover_art import normalize_for_fuzzy_comparison, retry_mb_api
 
 # --- (1) Metadata & Utils ---
 
+class MkvChapter(TypedDict):
+    """Represents a physical chapter boundary parsed from the MKV file."""
+    id: int
+    start_time: float
+    end_time: float
+    title: str
+
 def seconds_to_cue(seconds: float) -> str:
     """Converts seconds to MM:SS:FF for gapless CUE sheets."""
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}:{int((seconds % 1) * 75):02d}"
@@ -61,7 +68,7 @@ def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: lis
         f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
-            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(float(ch["start_time"]))}\n')
+            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(ch["start_time"])}\n')
 
 
 def _parse_makemkv_msg(line: str) -> str | None:
@@ -268,7 +275,7 @@ def emit_summary_log(entire_log: list[str], start_time: float, env: dict | None 
 class TitleInfo:
     """Holds the parsed MakeMKV state for a single title."""
     score: int = 0
-    chapters: int = 0
+    num_chapters: int = 0
     size: int = 0
     file_name: str = "Unknown"
     duration: str = "Unknown"
@@ -296,7 +303,7 @@ def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
             code = parts[2]
             val = parts[3].strip('"') if len(parts) > 3 else ""
             if code == "0":
-                if attr_id == "8": titles[t_idx].chapters = int(val)
+                if attr_id == "8": titles[t_idx].num_chapters = int(val)
                 elif attr_id == "9":
                     titles[t_idx].duration = val
                     try:
@@ -347,7 +354,7 @@ def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
 
     for t_idx, info in sorted(titles.items(), key=lambda x: int(x[0])):
         logger.emit(f"    [Title {t_idx}] {info.file_name}")
-        logger.emit(f"      - Duration: {info.duration} ({info.chapters} Chapters)")
+        logger.emit(f"      - Duration: {info.duration} ({info.num_chapters} Chapters)")
         logger.emit(f"      - Size: {info.size_str}")
 
         if info.streams:
@@ -361,8 +368,24 @@ def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
         logger.emit("")
 
 
+class MusicBrainzCandidate(TypedDict):
+    """ A dictionary of release information returned by MusicBrainz """
+    title: str
+    artist: str
+    year: str
+    mbid: str
+    medium_index: int
+    tracks: list[MusicBrainzTrack]
+
+
+class MusicBrainzTrack(TypedDict):
+    """ Represents a track returned by the MusicBrainz API """
+    title: str
+    duration: int
+
+
 def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int,
-                          target_duration_sec: float, candidates: list[dict]) -> dict | None:
+                          target_duration_sec: float, candidates: list[MusicBrainzCandidate]) -> MusicBrainzCandidate | None:
     """
     Finds the best MusicBrainz candidate for a given artist, name, target chapter count, and target duration.
     Filters for exact track count matches or +1 preamble matches, prioritizing similar durations, lower MB medium index,
@@ -378,20 +401,21 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 
     safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
 
-    def get_similarity(c: dict) -> float:
+    def get_similarity(c: MusicBrainzCandidate) -> float:
         """Calculates a similarity score based on string similarity to the target artist and album."""
         safe_cand = normalize_for_fuzzy_comparison(f"{c['artist']} {c['title']}").replace(" ", "")
         return difflib.SequenceMatcher(None, safe_target, safe_cand).ratio()
 
-    def get_duration_penalty(c: dict) -> int:
-        """Calculates a penalty based on total duration difference (in 120-second buckets)."""
+    def get_duration_penalty(c: MusicBrainzCandidate) -> int:
+        """Calculates a penalty based on total duration difference (in 30-second buckets)."""
         mb_duration_ms = sum(t.get('duration') or 0 for t in c['tracks'])
         if mb_duration_ms == 0 or target_duration_sec == 0:
             return 0
-        mb_sec = mb_duration_ms / 1000.0
-        return int(abs(target_duration_sec - mb_sec) // 120)
+        mb_sec = round(mb_duration_ms / 1000)
 
-    def get_medium_penalty(c: dict) -> int:
+        return int(abs(target_duration_sec - mb_sec) // 30)
+
+    def get_medium_penalty(c: MusicBrainzCandidate) -> int:
         """Penalizes bonus discs and non-primary mediums."""
         # Medium 1 gets 0 penalty. Medium 2 gets 1 penalty, etc.
         return max(0, c.get('medium_index', 1) - 1)
@@ -416,7 +440,7 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 
 
 def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False)\
-        -> tuple[str, dict[str, Any] | None, set[int]]:
+        -> tuple[str, MusicBrainzCandidate | None, set[int], dict[str, TitleInfo]]:
     """Identifies the main audio title by intersecting MakeMKV and MusicBrainz metadata.
 
     Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
@@ -428,10 +452,11 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         prefer_legacy: If True, prioritizes lossless 5.1/Quad formats over Atmos.
 
     Returns:
-        A 3-element tuple containing:
+        A 4-element tuple containing:
         - title_idx: The MakeMKV index of the winning title.
         - matched_candidate: The MusicBrainz release dictionary, or None if the API failed.
-        - makemkv_streams: A list of human-readable stream descriptors parsed by MakeMKV.
+        - atmos_streams: A set of stream indices for all streams containing Atmos audio.
+        - disc_topology: A dictionary containing the disc topology parsed from MakeMKV.
     """
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
         # 1. Fire off the network fetch in the background
@@ -461,7 +486,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
                 continue
 
             logger.emit(f"\n[+] Finding best candidate for Title {title_index}")
-            best_candidate = get_best_mb_candidate(artist, album, info.chapters, info.duration_sec, candidates)
+            best_candidate = get_best_mb_candidate(artist, album, info.num_chapters, info.duration_sec, candidates)
 
             # Keep the title if it matched a candidate, OR if MB is entirely offline
             if best_candidate or not candidates:
@@ -523,7 +548,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
     logger.emit("")
 
     winner = valid_titles[0]
-    return winner[0], winner[1], titles[winner[0]].atmos_streams
+    return winner[0], winner[1], titles[winner[0]].atmos_streams, titles
 
 
 # --- (4) Toolset & Main ---
@@ -790,17 +815,28 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
         return None
 
 
-def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], float]:
+def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[MkvChapter], float]:
     """Returns a list of chapters and the total duration in seconds from the given mkv file."""
-    # We add -show_format to get the duration
     cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", "-show_format", str(mkv_path)]
     res = run_command(cmd, "Extracting Chapter Markers")
     try:
         data = json.loads(res)
-        chapters = data.get('chapters', [])
         duration = float(data.get('format', {}).get('duration', 0))
+
+        chapters: list[MkvChapter] = []
+        for ch in data.get('chapters', []):
+            chapters.append({
+                'id': int(ch.get('id', 0)),
+                'start_time': float(ch.get('start_time', 0.0)),
+                'end_time': float(ch.get('end_time', 0.0)),
+                'title': ch.get('tags', {}).get('title', 'Unknown')
+            })
+
         return chapters, duration
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError) as e:
+        logger.emit(f"[!] ERROR: Failed to parse ffprobe chapter data: {e}")
+        res_snippet = res[:500] + ("..." if len(res) > 500 else "")
+        logger.emit(f"[!] ffprobe raw output snippet: {res_snippet}")
         return [], 0.0
 
 
@@ -808,7 +844,7 @@ def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[dict], 
 MAX_RELEASES_TO_SEARCH: int = 15
 
 
-def fetch_candidate_metadata(artist: str, album: str) -> list[dict[str, Any]]:
+def fetch_candidate_metadata(artist: str, album: str) -> list[MusicBrainzCandidate]:
     """
     Returns the metadata for the candidate releases corresponding to the given (inexact) artist and album name.
     All the releases returned will come from the same release group.
@@ -932,13 +968,13 @@ def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
 
 
 def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
-                                  rg_id: str, rg_artist: str, rg_title: str) -> list[dict[str, Any]]:
+                                  rg_id: str, rg_artist: str, rg_title: str) -> list[MusicBrainzCandidate]:
     """Fetch the tracklists for the given release ids (and dates), which pertain to the given release group metadata"""
     logger.emit(f"\n[*] Fetching tracklists for {len(release_ids_and_dates)} matching MB releases in release group {rg_id}...")
-    candidates = []
+    candidates: list[MusicBrainzCandidate] = []
     for rel_id, year in release_ids_and_dates:
         try:
-            rel_info = _fetch_release_info(rel_id)
+            rel_info = fetch_release_info(rel_id)
 
             # Treat EVERY medium as its own independent candidate
             for pos, medium in enumerate(rel_info.get('release', {}).get('medium-list', []), start=1):
@@ -981,9 +1017,9 @@ def sanitize_track_title(title: str) -> str:
 
 
 @retry_mb_api()
-def _fetch_release_info(rel_id: str) -> dict:
+def fetch_release_info(rel_id: str) -> dict:
     """Fetches a single release with retry logic."""
-    return mb.get_release_by_id(rel_id, includes=['recordings'])
+    return mb.get_release_by_id(rel_id, includes=['recordings', 'artist-credits'])
 
 def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
     """
@@ -1131,9 +1167,22 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
             pass  # Silent failure for cleanup to prevent app startup crashes
 
 
-def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str)\
-        -> tuple[Path, dict[str, Any] | None, list[dict[str, Any]], float, set[int]]:
-    """Acquires the master MKV file, extracts its chapters and duration, and fetches the matching MusicBrainz metadata.
+@dataclass(frozen=True)
+class AcquisitionResult:
+    """ The data obtained by the (joint) metadata lookup and physical extraction phase of the rip """
+    master_mkv_path: Path # The Path to the consolidated (all tracks and streams) MKV file that is ready for audio extraction
+    matched_candidate: MusicBrainzCandidate | None  # The MusicBrainz metadata for the chosen release/medium, or None if
+                                                    # the API failed or no match was found.
+    chapters: list[MkvChapter] # A list of chapter dictionaries extracted from the master MKV (incl. track timings)
+    duration: float # The actual duration of the master MKV in seconds (the total of all tracks)
+    atmos_streams: set[int] # The indices of the streams in the master MKV containing Atmos audio
+    disc_topology: dict[str, TitleInfo] # The disc topology parsed from MakeMKV.
+    title_idx: str # The index of the matched title in the Blu-ray's title table (hence disc_topology)
+    mkv_src_spec: str | None  # The formatted MakeMKV target (e.g., "disc:0"), or None if MakeMKV was bypassed
+
+
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str) -> AcquisitionResult:
+    """Acquires the master MKV file, extracts its chapter timings and duration, and fetches its MusicBrainz metadata.
 
     Handles polymorphic source inputs (optical disc indices, ISOs, BDMV folders, standalone MKVs,
     or IAA folders), ripping or merging them as necessary into a single master MKV in the temporary workspace.
@@ -1145,39 +1194,19 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
         output_container: The target output file extension (e.g., ".m4a", ".flac"), used to determine
             if a legacy lossless rip is explicitly requested.
 
-    Returns:
-        A 5-element tuple containing:
-        - master_mkv: The Path to the consolidated MKV file that is ready for audio extraction.
-        - matched_candidate: The matched MusicBrainz release dictionary, or None if the API failed or no match was found.
-        - chapters: A list of chapter dictionaries extracted from the master MKV via ffprobe.
-        - duration: The total duration of the master MKV in seconds.
-        - atmos_streams: A ints which are the indices of the streams containing Atmos audio
-          (will be empty if the source bypassed MakeMKV).
+    Returns: The master file and its metadata
     """
-    src_p = Path(src_path)
-    source_spec = None
 
-    # 1. Identify Source Type and Resolve source_spec
-    try:
-        drive_idx = int(src_path)
-        if drive_idx == -1:
-            res = run_command([TOOLS.MAKEMKV, "-r", "info", "disc:0"])
-            if "BD-RE" in res or "BD-ROM" in res: drive_idx = 0
-        source_spec = f"disc:{drive_idx}"
-    except (ValueError, TypeError):
-        if src_p.suffix.lower() == ".iso":
-            source_spec = f"iso:{src_p.resolve()}"
-        elif src_p.is_dir() and (src_p / "BDMV").exists():
-            source_spec = f"file:{src_p.resolve() / 'BDMV'}"
-
-    # 2. Execute Source-Specific Acquisition
-    atmos_streams: set[int] = set()
+    source_spec = _resolve_makemkv_src_spec(src_path)
     if source_spec:
-        title_idx, matched_candidate, atmos_streams = find_primary_title(source_spec, artist, album, output_container == ".flac")
+        # Handle formats that require MakeMKV rips (Blu-rays, Blu-ray images, Blu-ray backup directories)
+        title_idx, matched_candidate, atmos_streams, disc_topology = (
+            find_primary_title(source_spec, artist, album, output_container == ".flac"))
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
-        # --- Handle other formats ---
+        # Handle other formats, which bypass MakeMKV (IAA directory of mkv or mp4 tracks, Headphone Dust single mkv
+        src_p = Path(src_path)
         if src_p.is_dir():  # Folder of mkv or mp4 files (IAA)
             atmos_mkv = merge_folder_to_master_mkv(src_p, TMP_DIR)
         else:  # Single MKV file (Headphone Dust)
@@ -1186,15 +1215,108 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
                 raise FileNotFoundError(f"Not found: {src_path}")
 
         # Intersect local MKV chapters with MusicBrainz candidates
-        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
         candidates = fetch_candidate_metadata(artist, album)
-        matched_candidate = get_best_mb_candidate(artist, album, len(chapters), duration, candidates)
+        disc_topology = generate_topology_from_mkv(atmos_mkv)
+        sole_title = disc_topology["0"]
+        chapter_count = sole_title.num_chapters
+        chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
+        title_idx = "0"  # Sole chapter index
+        matched_candidate = get_best_mb_candidate(artist, album, chapter_count, duration, candidates)
+        atmos_streams = sole_title.atmos_streams
+        source_spec = None  # No disc to re-rip.
 
-        # Fallback: if no strict match was found but we HAVE candidates, just blindly trust the top result
-        if not matched_candidate and candidates:
-            matched_candidate = candidates[0]
+    return AcquisitionResult(master_mkv_path=atmos_mkv, matched_candidate=matched_candidate, chapters=chapters,
+                             duration=duration, atmos_streams=atmos_streams, disc_topology=disc_topology,
+                             title_idx=title_idx, mkv_src_spec=source_spec)
 
-    return atmos_mkv, matched_candidate, chapters, duration, atmos_streams
+
+def generate_topology_from_mkv(mkv_path: Path) -> dict[str, TitleInfo]:
+    """Generates a synthetic Carat topology dictionary from a single MKV file."""
+
+    # 1. Ask ffprobe for the FORMAT, streams, and chapters in JSON format
+    cmd = [
+        "ffprobe", "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", "-show_chapters", str(mkv_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    probe_data = json.loads(result.stdout)
+
+    # 2. Parse the chapters
+    chapters = probe_data.get("chapters", [])
+    chapter_count = len(chapters)
+
+    # 3. Parse the duration (Safely cast string -> float -> int)
+    duration_str = probe_data.get("format", {}).get("duration")
+    if duration_str:
+        duration_sec = int(float(duration_str))
+    elif chapters:
+        duration_sec = int(float(chapters[-1].get("end_time", 0.0)))
+    else:
+        duration_sec = 0
+
+    # 4. Parse the audio streams
+    streams = {}
+    atmos_streams: set[int] = set()
+
+    for stream in probe_data.get("streams", []):
+        if stream.get("codec_type") == "audio":
+            idx = stream.get("index")
+            codec = stream.get("codec_name", "unknown")
+            channels = stream.get("channels", 2)
+            layout = stream.get("channel_layout")
+
+            if not layout:
+                channel_map = {8: "7.1", 6: "5.1", 2: "2.0", 1: "1.0"}
+                layout = channel_map.get(channels, f"{channels}.0")
+            else:
+                # Normalize plain-text layouts to match MakeMKV's numeric format
+                if layout == "stereo":
+                    layout = "2.0"
+                elif layout == "mono":
+                    layout = "1.0"
+
+            # Build the descriptive string (e.g., "TRUEHD 7.1")
+            desc = f"{codec.upper()} {layout}"
+            streams[idx] = desc
+
+            profile = stream.get("profile", "").lower()
+            tags = stream.get("tags", {})
+            title = tags.get("title", "").lower()
+
+            if "atmos" in profile or "atmos" in title:
+                atmos_streams.add(idx)
+
+    # 5. Return a fabricated topology dictionary with exactly one Title
+    synthetic_title = TitleInfo(
+        num_chapters=chapter_count,
+        duration_sec=duration_sec,
+        streams=streams,
+        atmos_streams=atmos_streams
+    )
+
+    return {"0": synthetic_title}
+
+
+def _resolve_makemkv_src_spec(src: str) -> str | None:
+    """
+    Converts a raw source path into a MakeMKV-compatible target string.
+    Returns None if the source bypasses MakeMKV (e.g., standalone MKVs or IAA folders).
+    """
+    try:
+        drive_idx = int(src)
+        if drive_idx == -1:
+            res = run_command([TOOLS.MAKEMKV, "-r", "info", "disc:0"])
+            if "BD-RE" in res or "BD-ROM" in res:
+                drive_idx = 0
+        return f"disc:{drive_idx}"
+    except (ValueError, TypeError):
+        src_p = Path(src)
+        if src_p.suffix.lower() == ".iso":
+            return f"iso:{src_p.resolve()}"
+        elif src_p.is_dir() and (src_p / "BDMV").exists():
+            return f"file:{src_p.resolve() / 'BDMV'}"
+
+    return None
 
 
 def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str, cover_path: Path):
@@ -1231,12 +1353,18 @@ def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_
         audio.save()
 
 
-
 def _log_prologue(album: str, artist: str, output_container: str, preferred_codec: str, src_path: str):
     """Emit rip prologue to logger (to enhance readability of log file in isolation)"""
     logger.emit("=== Carat Rip Log ===")
     start_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+
+    # Gather non-invasive environment data
+    os_info = f"{platform.system()} {platform.release()} ({platform.machine()})"
+    py_info = f"Python {platform.python_version()}"
+
     logger.emit(f"Date/Time : {start_time_str}")
+    logger.emit(f"Carat Ver : {__version__}")
+    logger.emit(f"Platform  : {os_info} | {py_info}")
     logger.emit(f"Source    : {src_path}")
     logger.emit(f"Artist    : {artist}")
     logger.emit(f"Album     : {album}")
@@ -1249,11 +1377,12 @@ class AudioProfile(NamedTuple):
     The resolved audio stream and destination formatting for a ripping job.
 
     Attributes:
-        idx (int): The FFmpeg stream index of the selected audio track in the master file.
+        stream_idx (int): The FFmpeg stream index of the selected audio stream in the master file.
         container (str): The target file extension for the output (e.g., '.m4a', '.flac').
         suffix (str): The descriptive tag appended to the final filename (e.g., '(Atmos)', '(Surround)').
+            For stereo tracks, this will be the empty string.
     """
-    idx: int
+    stream_idx: int
     container: str
     suffix: str
 
@@ -1268,7 +1397,7 @@ def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_c
     if requested_container != ".flac":
         idx = find_atmos_stream(master_mkv, atmos_streams, preferred_codec)
         if idx is not None:
-            return AudioProfile(idx=idx, container=requested_container, suffix="(Atmos)")
+            return AudioProfile(stream_idx=idx, container=requested_container, suffix=" (Atmos)")
 
         logger.emit("\n[!] No Dolby Atmos stream found on source.")
         logger.emit("[*] Automatically switching to FLAC slicing for legacy lossless surround...")
@@ -1277,17 +1406,19 @@ def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_c
     legacy_info = find_multichannel_stream(master_mkv)
     if legacy_info is None:
         raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
-
     idx, channels = legacy_info
 
-    if channels == 4:
-        suffix = "(Quad)"
-    elif channels <= 2:
-        suffix = "(Stereo)"
+    if channels == 1:
+        suffix = " (Mono)"
+    elif channels == 2:
+        suffix = ""  # The implicit standard
+    elif channels == 4:
+        suffix = " (Quad)"
     else:
-        suffix = "(Surround)"
+        # Catches 3.0, 5.0, 5.1, 7.1, etc.
+        suffix = " (Surround)"
 
-    return AudioProfile(idx=idx, container=".flac", suffix=suffix)
+    return AudioProfile(stream_idx=idx, container=".flac", suffix=suffix)
 
 
 @dataclass
@@ -1301,24 +1432,24 @@ class RipContext:
     profile: AudioProfile # The resolved audio stream index and destination formatting
     duration: float  # The total duration of the source in seconds
     info: dict[str, Any]  # The matched MusicBrainz release metadata
-    chapters: list[dict]  # The extracted chapter markers
-    tracks: list[dict]  # The tracklist metadata from MusicBrainz
+    chapters: list[MkvChapter]  # The extracted chapter markers
+    tracks: list[MusicBrainzTrack]  # The tracklist metadata from MusicBrainz
 
 
 def _assemble_gapless_album(ctx: RipContext) -> None:
     """Handles the FFmpeg remuxing for gapless M4A or MKV containers."""
-    final_audio_name = f"{ctx.clean_album} {ctx.profile.suffix}{ctx.profile.container}"
+    final_audio_name = f"{ctx.clean_album}{ctx.profile.suffix}{ctx.profile.container}"
 
     if ctx.tracks:
         ctx.chapters = ctx.chapters[:len(ctx.tracks)]
 
-    generate_cue_sheet(ctx.dest / f"{ctx.clean_album} {ctx.profile.suffix}.cue", final_audio_name, ctx.info,
+    generate_cue_sheet(ctx.dest / f"{ctx.clean_album}{ctx.profile.suffix}.cue", final_audio_name, ctx.info,
                        ctx.chapters, ctx.tracks)
 
     cmd = [
         TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
         "-probesize", "100M", "-analyzeduration", "100M",
-        "-i", str(ctx.master_mkv), "-map", f"0:{ctx.profile.idx}",
+        "-i", str(ctx.master_mkv), "-map", f"0:{ctx.profile.stream_idx}",
         "-metadata", f"title={ctx.album}", "-c:a", "copy"
     ]
 
@@ -1333,13 +1464,13 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
 
     cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(ctx.dest / final_audio_name)])
 
-    run_command(cmd, f"Finalizing {ctx.profile.suffix[1:-1]} {ctx.profile.container[1:].upper()}",
+    run_command(cmd, f"Finalizing{ctx.profile.suffix} {ctx.profile.container[1:].upper()}",
                 {"ffmpeg_duration": ctx.duration})
 
 def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
     """Handles slicing the master MKV into individual FLAC tracks."""
-    logger.emit(f"[*] Slicing tracks to FLAC {ctx.profile.suffix}...")
-    if ctx.profile.idx is None:
+    logger.emit(f"[*] Slicing tracks to FLAC{ctx.profile.suffix}...")
+    if ctx.profile.stream_idx is None:
         raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
 
     flac_files = []
@@ -1350,14 +1481,14 @@ def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
         out_path = ctx.dest / out_filename
         flac_files.append((out_path, track, track_num))
 
-        start_time = float(chapter['start_time'])
-        end_time = float(chapter['end_time'])
+        start_time = chapter['start_time']
+        end_time = chapter['end_time']
 
         cmd = [
             TOOLS.FFMPEG, '-hide_banner', '-loglevel', 'error', '-stats', '-y',
             '-ss', str(start_time), '-to', str(end_time),
             '-i', str(ctx.master_mkv),
-            '-map', f"0:{ctx.profile.idx}",
+            '-map', f"0:{ctx.profile.stream_idx}",
             '-c:a', 'flac',
             str(out_path)
         ]
@@ -1405,7 +1536,7 @@ class Codec(StrEnum):
     FLAC = "flac"
 
 
-def rip_album_to_library(src_path: str, artist: str, album: str, library_root: str,
+def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
                          output_container: Container = Container.M4A, preferred_codec: Codec = Codec.TRUEHD) -> bool:
     """
     Rips the specified Atmos or multichannel source into a digital music library.
@@ -1443,7 +1574,7 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
       4. Time-consuming tasks (e.g., Cover Art download, Remuxing) are parallelized where possible.
 
     Args:
-        src_path: The polymorphic source path (Disc index, ISO, BDMV folder, MKV, or IAA folder).
+        src: The polymorphic source path (Disc index, ISO, BDMV folder, MKV, or IAA folder).
         artist: The requested album artist (used for metadata fetching).
         album: The requested album title (used for metadata fetching).
         library_root: The destination directory for the processed album.
@@ -1453,13 +1584,53 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     Returns:
         bool: True if tracklist metadata was successfully found and applied, False otherwise.
     """
+    plan = prepare_album_rip(src, artist, album, library_root, output_container, preferred_codec)
+    logger.emit("Proceeding with Carat heuristic rip...")
+    try:
+        return execute_album_rip(plan)
+    finally:
+        clean_up()
 
+
+def prepare_album_rip(src: str, artist: str, album: str, library_root: str,
+                      output_container: Container = Container.M4A, preferred_codec: Codec = Codec.TRUEHD) -> RipPlan:
+    """
+        Phase 1 of the extraction pipeline: Scans the source, acquires physical media, and formulates a RipPlan.
+
+        This function performs all the heavy I/O and network scouting required before an album can be
+        assembled. It extracts the raw, unencrypted master MKV file to a temporary directory, parses the
+        disc's topological chapter/stream data, and queries MusicBrainz for matching metadata.
+
+        If successful, it leaves the temporary MKV intact on the disk and returns a `RipPlan` object.
+        This object can be inspected or modified by a GUI/client before being passed to `execute_album_rip`
+        for final assembly.
+
+        Note:
+            For comprehensive details on the input parameters and polymorphic source handling,
+            see the docstring for `rip_album_to_library`.
+
+        Args:
+            src: The polymorphic source path (Disc index, ISO, BDMV folder, MKV, or IAA folder).
+            artist: The requested album artist.
+            album: The requested album title.
+            library_root: The destination directory, verified for write access.
+            output_container: The target container format (.m4a, .mkv, or .flac).
+            preferred_codec: The target Atmos codec (truehd, eac3, or ac3).
+
+        Returns:
+            RipPlan: A blueprint containing the proposed heuristics and opaque runtime state.
+
+        Raises:
+            RuntimeError: If MakeMKV fails, the disc is unreadable, or no matching titles are found.
+            PermissionError: If the library_root is not writable.
+        """
     ingestion_start_time = time.time()
+    _nuke_dir(TMP_DIR)  # In case there's any garbage lying around from a previous rip in this session
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     lib_path = Path(library_root)
     _ensure_writable(lib_path)
     logger.open_log_file(TMP_DIR / "carat_rip.log") # We log to tmp dir because we don't yet know the final destination
-    _log_prologue(album, artist, output_container, preferred_codec, src_path)
+    _log_prologue(album, artist, output_container, preferred_codec, src)
 
     # This log_dest value is tentative. It will be used only if the rip fails early on; otherwise it will be overwritten
     clean_artist = _sanitize_filename(artist)
@@ -1468,40 +1639,93 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
     log_dest = lib_path / clean_artist / clean_album / log_name
 
     try:
-        # Extract master mkv and metadata from input file (or disc) and web metadata resources
-        master_mkv, matched_candidate, chapters, duration, atmos_streams = \
-            get_mkv_master_file_and_metadata(src_path, artist, album, output_container)
+        ar: AcquisitionResult = get_mkv_master_file_and_metadata(src, artist, album, output_container)
+        profile = resolve_audio_profile(ar.master_mkv_path, ar.atmos_streams, output_container, preferred_codec)
 
-        # Canonicalize artist and album title
-        if matched_candidate:
-            canonicalized_artist = matched_candidate.get('artist', artist)
-            canonicalized_album = matched_candidate.get('title', album)
-            if (artist != canonicalized_artist) or (album != canonicalized_album):
-                artist = canonicalized_artist
-                album = canonicalized_album
-                logger.emit(f"[+] Canonicalized as Artist: {artist}, Album: {album}")
-            info = matched_candidate
+        # Canonicalize artist and album names if indicated by results of call to get_mkv_master_file_and_metadata
+        canonical_artist = artist
+        canonical_album = album
+        if ar.matched_candidate:
+            canonical_artist = ar.matched_candidate.get('artist', artist)
+            canonical_album = ar.matched_candidate.get('title', album)
+            if (artist != canonical_artist) or (album != canonical_album):
+                logger.emit(f"[+] Canonicalized as Artist: {canonical_artist}, Album: {canonical_album}")
         else:
-            logger.emit(f"[!] No MusicBrainz metadata for Artist: {artist}, Album: {album}")
-            info = {'artist': artist, 'title': album, 'year': 'Unknown'}
+            logger.emit(f"[!] No MusicBrainz metadata found. Proceeding with given artist and album names.")
 
-        # Sanitize artist and album title
-        clean_artist = _sanitize_filename(artist)
-        clean_album = _sanitize_filename(album)
-        if (clean_artist != artist) or (clean_album != album):
-            logger.emit(f"[+] Sanitized as Artist: {clean_artist}, Album: {clean_album}")
+        # Sanitize artist and album names for safe use in file path names, if necessary
+        clean_artist = _sanitize_filename(canonical_artist)
+        clean_album = _sanitize_filename(canonical_album)
+        if (clean_artist != canonical_artist) or (clean_album != canonical_album):
+            logger.emit(f"[+] Sanitized for filesystem as Artist: {clean_artist}, Album: {clean_album}")
 
-        # Perform pre-assembly tasks
-        profile = resolve_audio_profile(master_mkv, atmos_streams, output_container, preferred_codec)
-        dest = lib_path / clean_artist / f"{clean_album} {profile.suffix}"
-        log_dest = dest / f"{clean_artist} - {clean_album} {profile.suffix}.log"
+        log_name = f"{clean_artist} - {clean_album}{profile.suffix}.log".replace("  ", " ").strip()
+        log_dest = lib_path / clean_artist / f"{clean_album}{profile.suffix}" / log_name
+
+        return RipPlan(
+            artist=clean_artist,
+            album=clean_album,
+            matched_candidate=ar.matched_candidate,
+            audio_profile=profile,
+            disc_topology = ar.disc_topology,
+            title_idx=ar.title_idx,
+
+            _internals=_RipPlanInternals(
+                master_mkv_path=ar.master_mkv_path,
+                log_dest_path=log_dest,
+                lib_path=lib_path,
+                src=src,
+                output_container=output_container,
+                ingestion_start_time=ingestion_start_time,
+                makemkv_streams=ar.atmos_streams,
+                duration=ar.duration,
+                chapters=ar.chapters,
+                mkv_src_spec=ar.mkv_src_spec
+            )
+        )
+    except Exception as e:
+        logger.emit(f"\n[!] Preparation aborted: {e}")
+        logger.close_log_file(log_dest)
+        clean_up()
+        raise
+
+# noinspection PyProtectedMember
+def execute_album_rip(plan: RipPlan) -> bool:
+    """
+        Phase 2 of the extraction pipeline: Assembles, tags, and finalizes the audio files.
+
+        This function consumes a `RipPlan` (typically generated by `prepare_album_rip` or modified via
+        `RipPlan.revise()`) and executes the final FFmpeg remuxing or slicing operations. It downloads
+        the highest quality cover art, canonicalizes the directory names, writes the gapless CUE sheets,
+        and injects the MusicBrainz metadata tags.
+
+        This function strictly guarantees cleanup. Whether the extraction succeeds, fails, or crashes,
+        the `finally` block ensures the massive temporary master MKV is deleted and the log file is
+        moved to its final destination in the user's library.
+
+        Args:
+            plan: The immutable blueprint containing the user-approved heuristics and physical file paths.
+
+        Returns:
+            bool: True if tracklist metadata was successfully found and applied, False if the engine
+                  had to fall back to generic "Track <#>" naming.
+    """
+    matched_candidate = plan.matched_candidate
+    profile = plan.audio_profile
+    artist = plan.artist
+    album = plan.album
+    info = matched_candidate or {'artist': artist, 'title': album, 'year': 'Unknown'}
+
+    log_dest = plan._internals.log_dest_path
+    dest = log_dest.parent
+    logger.emit(f"[+] Executing Rip for: {artist} - {album}")
+
+    try:
         dest.mkdir(parents=True, exist_ok=True)
-
-        # Build the immutable state context
         ctx = RipContext(
-            master_mkv=master_mkv, dest=dest, artist=artist, album=album,
-            clean_album=clean_album, profile=profile, duration=duration,
-            info=info, chapters=chapters, tracks=(info.get('tracks', []))
+            master_mkv=plan._internals.master_mkv_path, dest=dest, artist=artist, album=album,
+            clean_album=(_sanitize_filename(album)), profile=profile, duration=plan._internals.duration, info=info,
+            chapters=plan._internals.chapters, tracks=(matched_candidate.get('tracks', []) if matched_candidate else [])
         )
 
         # Execute Assembly (Concurrent)
@@ -1522,12 +1746,280 @@ def rip_album_to_library(src_path: str, artist: str, album: str, library_root: s
                 _tag_flac_files(flac_files, album, artist, info.get('year', 'Unknown'), dest / "cover.jpg")
 
         logger.emit(f"\n[+] Ingestion Complete: {album}")
-        logger.emit(f"[+] Total elapsed time: {(time.time() - ingestion_start_time):.1f} seconds.")
+        logger.emit(f"[+] Total elapsed time: {(time.time() - plan._internals.ingestion_start_time):.1f} seconds.")
     finally:
         logger.close_log_file(log_dest)
-        clean_up()
 
     return bool(matched_candidate)
+
+
+@dataclass(frozen=True)
+class _RipPlanInternals:
+    """Opaque runtime state for a pending extraction.
+
+    This object encapsulates the physical file paths, timers, and raw MakeMKV stream data generated during the
+    preparation phase. It is strictly for internal use by the execution engine.
+
+    Attributes:
+        master_mkv_path: The Path to the consolidated, unencrypted MKV file extracted during Phase 1
+        log_dest_path: Preliminary destination file for the log (will change if canonicalization
+            affects artist or album title).
+        lib_path: The verified target base directory for the user's music library.
+        src: The original source provided by user (for accurate logging)
+        mkv_src_spec: # The validated MakeMKV target (used for re-extraction), or None if MKV extraction bypassed.
+        output_container: The requested target file extension (e.g., '.m4a', '.flac')
+        ingestion_start_time: The epoch timestamp when the preparation phase began,
+            used for calculating total pipeline duration.
+        makemkv_streams: A set of absolute stream indices that MakeMKV explicitly
+            identified as containing Atmos metadata.
+        duration: The total duration of the source in seconds
+        chapters: The extracted chapter markers
+    """
+    master_mkv_path: Path
+    log_dest_path: Path
+    lib_path: Path
+    src: str
+    mkv_src_spec: str | None
+    output_container: str
+    ingestion_start_time: float
+    makemkv_streams: set[int]
+    duration: float
+    chapters: list[MkvChapter]
+
+@dataclass(frozen=True)
+class RipPlan:
+    """A blueprint for extracting and tagging an album.
+
+    Generated by `prepare_album_rip` (or our own 'revise' function), this object acts as the boundary between
+    the heuristic engine and the final execution pipeline. The public attributes represent the "Winning Hand" chosen
+    by Carat's heuristics (or our own 'revise' function).
+
+    Attributes:
+        artist: The canonicalized artist name, to be used in metadata and (once canonicalized) file paths.
+        album:  The canonicalized album title, to be used in metadata and (once canonicalized) file paths.
+        matched_candidate: The MusicBrainz release dictionary containing the tracklist and metadata tags.
+        audio_profile: The AudioProfile object detailing the selected codec and stream index to be extracted.
+        disc_topology: A dictionary containing the disc topology parsed from MakeMKV.
+        title_idx: The index of the title that was extracted from the input source (None if source bypassed MakeMKV).
+    """
+    artist: str
+    album: str
+    audio_profile: AudioProfile
+    matched_candidate: MusicBrainzCandidate | None
+    disc_topology: dict[str, TitleInfo]
+    title_idx: str
+
+    _internals: _RipPlanInternals
+
+    @property
+    def target_dir(self) -> Path:
+        """Returns the fully resolved Path object for the final destination directory."""
+        return self._internals.log_dest_path.parent
+
+    def revise(self, new_title_idx: str, new_stream_idx: int, new_mbid: str, new_medium_idx: int,
+               new_artist: str, new_album: str, start_new_log: bool = True) -> 'RipPlan':
+        """
+        Validates user overrides, fetches revised metadata, and generates a new extraction plan.
+
+        If the `new_title_idx` differs from the current plan, this method will validate the target chapter counts
+        against the cached disc topology. If the validation passes, it performs a synchronous physical extraction of
+        the new title from the source drive to replace the temporary master MKV file.
+
+         Args:
+             new_title_idx: The MakeMKV index of the newly selected Blu-ray title.
+             new_stream_idx: The absolute MakeMKV/FFmpeg index of the selected audio stream.
+             new_mbid: The MusicBrainz Release ID (MBID) for the desired metadata.
+             new_medium_idx: The specific medium (disc) number within the MusicBrainz release.
+             new_artist: Artist to be substituted (locally) for the one obtained from MusicBrainz.
+             new_album: Album title to be substituted (locally) for the one obtained from MusicBrainz.
+             start_new_log: Whether to start a new log file for the revision or continue using the existing one.
+
+         Returns:
+             RipPlan: A new rip plan containing the updated state
+
+         Raises:
+             ValueError: If the requested title or medium index does not exist, or if the source
+                 topology is missing (e.g., if the original source was a folder of loose audio files).
+             TrackMismatchError: If the chapter count of the newly selected physical title does
+                 not perfectly match the track count of the selected metadata.
+         """
+
+        # ==========================================
+        # 1. STATE DIFFING
+        # ==========================================
+        old_mbid = self.matched_candidate['mbid'] if self.matched_candidate else None
+        old_medium = self.matched_candidate['medium_index'] if self.matched_candidate else None
+
+        mbid_changed = (new_mbid != old_mbid)
+        medium_changed = (new_medium_idx != old_medium)
+        metadata_fetch_needed = mbid_changed or medium_changed
+        artist_changed = (new_artist != self.artist)
+        album_changed = (new_album != self.album)
+        title_changed = (new_title_idx != self.title_idx)
+        stream_changed = (new_stream_idx != self.audio_profile.stream_idx)
+
+        # ==========================================
+        # 2. LOGGING PROLOGUE
+        # ==========================================
+        internals = self._internals
+        if start_new_log:
+            new_tmp_log = internals.master_mkv_path.parent / f"carat_rip_revised_{time.time()}.log"
+            logger.open_log_file(new_tmp_log)
+
+        def _flag(changed: bool) -> str:
+            return "*" if changed else " "
+
+        logger.emit("=== Carat Rip Log (Revised Extraction) ===")
+        logger.emit(f"{_flag(artist_changed)} Artist         : {new_artist}")
+        logger.emit(f"{_flag(album_changed)} Album          : {new_album}")
+        logger.emit(f"{_flag(title_changed or stream_changed)} Data Source    : "
+                    f"{internals.src} (Title {new_title_idx}, Stream {new_stream_idx})")
+        logger.emit(f"{_flag(metadata_fetch_needed)} Metadata Source: MBID {new_mbid} (Medium {new_medium_idx})")
+        logger.emit("==========================================\n")
+
+        # ==========================================
+        # 3. TOPOLOGY & METADATA VALIDATION
+        # ==========================================
+        title_info = self.disc_topology.get(new_title_idx)
+        if not title_info:
+            raise ValueError(f"Title {new_title_idx} does not exist on this disc.")
+
+        if metadata_fetch_needed:
+            logger.emit(f"[*] Fetching revised metadata for MBID {new_mbid} (Medium {new_medium_idx})...")
+            rel_info = fetch_release_info(new_mbid)
+
+            target_medium: dict | None = next((m for m in rel_info.get('release', {}).get('medium-list', [])
+                                               if int(m.get('position', 1)) == new_medium_idx), None)
+            if target_medium is None:
+                raise ValueError(f"Medium {new_medium_idx} not found in release {new_mbid}.")
+
+            medium_tracks: list[MusicBrainzTrack] = [{
+                'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
+                'duration': int(track.get('recording', {}).get('length') or 0)
+            } for track in target_medium.get('track-list', [])]
+
+            new_candidate: MusicBrainzCandidate = {
+                'title': rel_info.get('release', {}).get('title', self.album),
+                'artist': extract_artist_from_musicbrainz_metadata(rel_info.get('release', {})),
+                'year': rel_info.get('release', {}).get('date', 'Unknown')[:4],
+                'mbid': new_mbid,
+                'medium_index': new_medium_idx,
+                'tracks': medium_tracks
+            }
+            logger.emit(f"[+] Found Release: {new_candidate['artist']} - {new_candidate['title']} ({len(medium_tracks)} tracks)")
+        else:
+            if not self.matched_candidate:
+                raise ValueError("No existing metadata to reuse, but fetch was bypassed.")
+            new_candidate = self.matched_candidate
+
+        # Enforce chapter count matching
+        mb_track_count = len(new_candidate['tracks'])
+        if (title_changed or metadata_fetch_needed) and title_info.num_chapters != mb_track_count:
+            raise TrackMismatchError(f"Cannot revise: Title {new_title_idx} has {title_info.num_chapters} chapters, "
+                                     f"but metadata has {mb_track_count} tracks.")
+
+        # ==========================================
+        # 4. FINAL NAMING STATE & SLOW RE-RIP
+        # ==========================================
+        clean_artist = _sanitize_filename(new_artist)
+        clean_album = _sanitize_filename(new_album)
+        if (clean_artist != new_artist) or (clean_album != new_album):
+            logger.emit(f"[+] Sanitized for filesystem as Artist: {clean_artist}, Album: {clean_album}")
+
+        new_mkv = internals.master_mkv_path
+        new_chapters = internals.chapters
+        new_duration = internals.duration
+        new_atmos_streams = internals.makemkv_streams
+
+        if title_changed:
+            if not internals.mkv_src_spec:
+                raise ValueError("Cannot perform re-rip: source_spec is missing from internal state.")
+            logger.emit(f"[*] Extracting New Title {new_title_idx} from Blu-ray or image...")
+
+            if internals.master_mkv_path.exists():
+                internals.master_mkv_path.unlink()
+            tmp_dir = internals.master_mkv_path.parent
+            new_mkv = rip_title_to_mkv(internals.mkv_src_spec, tmp_dir, new_title_idx)
+            new_chapters, new_duration = extract_chapters_and_duration_from_mkv(new_mkv)
+            new_atmos_streams = title_info.atmos_streams
+        else:
+            logger.emit("\n[*] Processing revised rip plan...")
+
+        # ==========================================
+        # 5. SUFFIX GENERATION & FORMAT RESOLUTION
+        # ==========================================
+        stream_desc = title_info.streams.get(new_stream_idx, "")
+        suffix = _suffix_for_stream_desc(stream_desc)
+
+        is_atmos_stream = (new_stream_idx in new_atmos_streams)
+        if is_atmos_stream and internals.output_container != ".flac":
+            final_container = internals.output_container
+        else:
+            final_container = ".flac"
+
+        new_profile = AudioProfile(
+            stream_idx=new_stream_idx,
+            container=final_container,
+            suffix=suffix
+        )
+
+        log_name = f"{clean_artist} - {clean_album}{suffix}.log".replace("  ", " ").strip()
+        new_log_dest = internals.lib_path / clean_artist / f"{clean_album}{suffix}" / log_name
+
+        new_internals = replace(internals, master_mkv_path=new_mkv, log_dest_path=new_log_dest,
+                                ingestion_start_time=time.time(), makemkv_streams=new_atmos_streams,
+                                duration=new_duration, chapters=new_chapters)
+
+        return RipPlan(artist=new_artist, album=new_album, audio_profile=new_profile, matched_candidate=new_candidate,
+                       disc_topology=self.disc_topology, title_idx=new_title_idx, _internals=new_internals)
+
+    def with_suffix(self, custom_suffix: str) -> 'RipPlan':
+        """Creates a copy of the plan with a new suffix, bypassing metadata fetches."""
+        from dataclasses import replace
+        custom_suffix = custom_suffix.strip()
+        if not custom_suffix:
+            logger.emit("[-] Custom suffix is empty. Using existing suffix.")
+            return self
+
+        suffix = f" {custom_suffix}" if custom_suffix.startswith("(") else f" ({custom_suffix})"
+
+        new_profile = AudioProfile(
+            stream_idx=self.audio_profile.stream_idx,
+            container=self.audio_profile.container,
+            suffix=suffix
+        )
+
+        internals = self._internals
+        clean_artist = self.artist
+        clean_album = self.album
+        log_name = f"{clean_artist} - {clean_album}{suffix}.log".replace("  ", " ").strip()
+        new_log_dest_path = internals.lib_path / clean_artist / f"{clean_album}{suffix}" / log_name
+
+        new_internals = replace(internals, log_dest_path=new_log_dest_path)
+        return replace(self, audio_profile=new_profile, _internals=new_internals)
+
+
+class TrackMismatchError(Exception):
+    """Raised when user-selected metadata track count doesn't match selected title chapter count."""
+    pass
+
+
+def _suffix_for_stream_desc(stream_desc: str) -> str:
+    """
+    Determines the appropriate file suffix based on a MakeMKV stream description.
+    """
+    desc_lower = stream_desc.lower()
+
+    if "atmos" in desc_lower or "truehd" in desc_lower:
+        return " (Atmos)"
+    elif "quad" in desc_lower or "4.0" in desc_lower:
+        return " (Quad)"
+    elif "stereo" in desc_lower or "2.0" in desc_lower:
+        return ""
+    elif "surround" in desc_lower or "5.0" in desc_lower or "5.1" in desc_lower or "7.1" in desc_lower:
+        return " (Surround)"
+
+    return " (Unknown)"
 
 
 def _clean_path_arg(arg: str) -> str:

@@ -29,7 +29,7 @@ from PIL import Image, ImageTk
 
 import carat
 import logger
-from carat import Codec, Container, rip_album_to_library
+from carat import Codec, Container
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
@@ -53,6 +53,10 @@ class OutputProfile(Enum):
                 return profile
         # Safe default if the config file has an obsolete string
         return cls.M4A_LOSSLESS
+
+def _clean_path_arg(arg: str) -> str:
+    """Strips rogue literal quotes caused by Windows shell path escaping."""
+    return arg.strip('"')
 
 class CaratGUI:
     """ Tkinter GUI for Carat """
@@ -95,7 +99,7 @@ class CaratGUI:
             script_dir = Path(__file__).resolve().parent
             icon_path = str(script_dir / 'assets' / 'carat_logo_icon.png')
             img_icon = tk.PhotoImage(file=icon_path)
-            self.parent.iconphoto(False, img_icon)
+            self.parent.iconphoto(True, img_icon)
         except tk.TclError as e:
             logger.emit(f"[!] logo icon missing, falling back to default icon: {e}")
 
@@ -107,11 +111,18 @@ class CaratGUI:
         self.progress_queue = queue.Queue()
         self.status_queue = queue.Queue()
         self.art_queue = queue.Queue()
+        self.done_queue = queue.Queue()
 
         # Initialize state variables
         self.current_cover_path = None
         self.is_ripping = False
         logger.init(self._log_callback)
+
+        # Initialize variables used by rip-plan revision dialog
+        self.action_queue = queue.Queue()
+        self.review_event = threading.Event()
+        self.review_result = None
+        self.review_metadata_var = tk.BooleanVar(value=self.config.get('review_metadata', False))
 
         # Override window close hook to give the user a chance to back out and clean up if they don't
         self.parent.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -141,7 +152,8 @@ class CaratGUI:
         """Saves persistent data to the config file."""
         cfg = {
             "library_root": self.dest_var.get(),
-            "output_format": self.output_format_var.get()
+            "output_format": self.output_format_var.get(),
+            "review_metadata": self.review_metadata_var.get()
         }
         try:
             CONFIG_FILE.write_text(json.dumps(cfg))
@@ -155,14 +167,14 @@ class CaratGUI:
         if self.is_ripping:
             return
 
-            # Check if all four fields have text in them
+        # Check if all four fields have text in them
         if not all([self.src_var.get().strip(), self.dest_var.get().strip(),
                     self.artist_var.get().strip(), self.album_var.get().strip()]):
             # State 1: Not Ready
             self.btn_rip.config(state="disabled", text="Fill in Blank Fields (above)")
         else:
             # State 2: Ready (This also acts as the reset for State 4 when a user edits a field)
-            self.btn_rip.config(state="normal", text="Rip")
+            self.btn_rip.config(state="normal", text="Rip", command=self._start_rip_thread)
 
     def _init_ui(self) -> None:
         """Constructs the GUI."""
@@ -209,6 +221,8 @@ class CaratGUI:
         ttk.Button(frame_src, text="Folder/Disc...", command=self._browse_source_folder).pack(side="right", padx=(2, 0))
         ttk.Button(frame_src, text="File...", command=self._browse_source_file).pack(side="right")
 
+        self.src_var.trace_add("write", self._on_source_changed) # Clears old src stuff when new one is entered
+
         # 3. Metadata & Art Container
         frame_meta_cont = ttk.Frame(self.parent)
         frame_meta_cont.pack(fill="x", padx=10, pady=5)
@@ -226,6 +240,10 @@ class CaratGUI:
         self.album_var = tk.StringVar()
         self.ent_album = ttk.Entry(frame_meta, textvariable=self.album_var)
         self.ent_album.grid(row=1, column=1, sticky="ew", padx=5, pady=2)
+
+        ttk.Checkbutton(frame_meta, text="Review metadata before ripping", variable=self.review_metadata_var,
+                        command=self._save_config).grid(row=99, column=0, columnspan=2, sticky="sw", pady=(15, 0))
+        frame_meta.rowconfigure(98, weight=1) # The "Spring" - forces empty row 98 to absorb all leftover vertical space
 
         # --- Smart Auto-Fill State ---
         self._user_touched_metadata = False
@@ -269,8 +287,8 @@ class CaratGUI:
         # 6. Console Output
         frame_log = ttk.LabelFrame(self.parent, text="Console Output", padding=10)
         frame_log.pack(fill="both", expand=True, padx=10, pady=10)
-        self.txt_log = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9))
-        self.txt_log.pack(fill="both", expand=True)
+        self.console = scrolledtext.ScrolledText(frame_log, state="disabled", font=('Consolas', 9))
+        self.console.pack(fill="both", expand=True)
 
         # Bind the variables to the state evaluator
         self.src_var.trace_add("write", self._evaluate_button_state)
@@ -366,6 +384,15 @@ class CaratGUI:
         if not getattr(self, '_is_autofilling', False):
             self._user_touched_metadata = True
 
+    def _on_source_changed(self, *_args):
+        """Clears stale console output and cover art when the source is modified."""
+
+        # Clear the console and art only if there is a stale rip log present
+        current_console_text = self.console.get(1.0, tk.END)
+        if "=== Carat Rip Log ===" in current_console_text:
+            self._clear_console()
+            self.clear_cover_art()
+
     def _browse_dest(self) -> None:
         """Prompts the user for the library root."""
         path = filedialog.askdirectory(title="Select Library Root")
@@ -373,55 +400,143 @@ class CaratGUI:
 
     def _start_rip_thread(self) -> None:
         """Collects inputs and launches the background workers."""
-
-        # Auto-clear the console on new rip
+        # Auto-clear the console and cover art on new rip
         self._clear_console()
-
-        # Clear artwork from previous rip (if any)
-        self.lbl_art.configure(image='', text="Waiting...")
-        self.lbl_art.image = None  # type: ignore
-        self.lbl_art.update_idletasks()
+        self.clear_cover_art()
 
         # Change state to State #3 - Rip in progress
         self._save_config()
         self.is_ripping = True
         self.btn_rip.config(state="disabled", text="Ripping in Progress...")
 
-        # Collect arguments for the rip
-        source = self.src_var.get().strip()
-        artist = self.artist_var.get().strip()
-        album = self.album_var.get().strip()
-        music_lib_root = self.dest_var.get().strip()
-
-        # Translate the UI Profile into orthogonal backend parameters
-        selected_string = self.output_format_var.get()
-        profile = OutputProfile.from_display_string(selected_string)
-        output_container = profile.container
-        preferred_codec = profile.codec
-
         self.progress_bar.config(mode='indeterminate')
         self.progress_bar.start(50)  # 50 ms. refresh interval
 
-        # Pass the new parameters to the thread
-        thread = threading.Thread(target=self._run_logic,
-                                  args=(source, artist, album, music_lib_root, output_container, preferred_codec))
+        # Fire and forget!
+        thread = threading.Thread(target=self._run_rip_thread)
         thread.daemon = True
         thread.start()
 
-    def _run_logic(self, source: str, artist: str, album: str, music_lib_root: str,
-                   output_container: str, preferred_codec: carat.Codec) -> None:
-        """The worker thread function."""
-        success = False
-        got_metadata = False
+    def clear_cover_art(self):
+        """ Clear the cover art from the GUI (typically because a new rip is being specified) """
+        self.lbl_art.configure(image='', text="Waiting...")
+        self.lbl_art.image = None  # type: ignore
+        self.lbl_art.update_idletasks()
+
+    def _run_rip_thread(self) -> None:
         try:
-            got_metadata = rip_album_to_library(source, artist, album, music_lib_root, output_container, preferred_codec)
-            success = True
+            # Gather UI Variables safely
+            source_path = _clean_path_arg(self.src_var.get())
+            artist = self.artist_var.get().strip()
+            album = self.album_var.get().strip()
+            lib_root = _clean_path_arg(self.dest_var.get())
+            profile = OutputProfile.from_display_string(self.output_format_var.get())
+            output_container = profile.container
+            preferred_codec = profile.codec
+
+            # Phase 1: prepare rip plan
+            plan = carat.prepare_album_rip(source_path, artist, album, lib_root, output_container, preferred_codec)
+
+            # Phase 2: (optional): inspect and possibly revise rip plan
+            if self.review_metadata_var.get():
+                logger.emit("\n[*] Awaiting user confirmation of metadata...")
+                self.action_queue.put(("REVIEW", plan))
+                self.review_event.wait()
+                self.review_event.clear()
+
+                if self.review_result is None:
+                    logger.emit("[-] Rip cancelled by user during review.")
+                    self.done_queue.put(("FAIL", None, None))
+                    return
+
+                logger.emit("[+] Re-calculating Rip Plan based on user overrides...\n")
+                plan = plan.revise(self.review_result.get('title_idx'), self.review_result.get('stream_idx'),
+                    new_mbid=self.review_result.get('mbid'), new_medium_idx=self.review_result.get('medium'),
+                    new_artist=self.review_result.get('artist'), new_album=self.review_result.get('album'),
+                    start_new_log=False)  # <-- Stops the Phase 3 log from clobbering Phase 1 log!
+
+            # Phase 2.5: Smart Overwrite Protection
+            plan = self._enforce_overwrite_protection(plan)
+            if not plan:
+                self.done_queue.put(("FAIL", None, None))
+                return
+
+            # Phase 3: Execute rip plan
+            success = carat.execute_album_rip(plan)
+
+            if success:
+                self.done_queue.put(("SUCCESS", plan))
+            else:
+                self.done_queue.put(("FAIL", plan))
         except Exception as e:
-            self.log_queue.put(f"CRITICAL ERROR: {e}")
-        finally:
-            # Pass the success state back to the main thread
-            # noinspection PyTypeChecker
-            self.parent.after(0, lambda: self._finalize_ui(success, got_metadata))
+            logger.emit(f"\n[!] Carat Engine Error: {str(e)}")
+            self.done_queue.put(("FAIL", None, None))
+
+    def _enforce_overwrite_protection(self, plan: carat.RipPlan) -> carat.RipPlan | None:
+        """
+        Thread-safe helper to check for directory collisions and prompt the user.
+        Returns the safe RipPlan, or None if the user canceled.
+        """
+        if not plan.target_dir.exists():
+            return plan
+
+        logger.emit("\n[!] Target directory exists. Awaiting user conflict resolution...")
+        self.action_queue.put(("SUFFIX", plan))
+        self.review_event.wait()
+        self.review_event.clear()
+
+        action = self.review_result.get("action") if self.review_result else "cancel"
+
+        if action == "cancel":
+            logger.emit("[-] Rip cancelled by user to prevent overwrite.")
+            return None
+        elif action == "overwrite":
+            logger.emit("[!] User elected to OVERWRITE existing directory.")
+            return plan
+        elif action == "suffix":
+            safe_plan = plan.with_suffix(self.review_result["value"])
+            logger.emit(f"[+] Applied custom suffix for new mix: {safe_plan.audio_profile.suffix}")
+            return safe_plan
+
+        return None
+
+    def _trigger_post_rip_revise(self, plan) -> None:
+        dialog = ReviseDialog(self.parent, plan)
+        self.parent.wait_window(dialog)
+
+        if dialog.result:
+            self._clear_console()
+            self.btn_rip.config(state="disabled", text="Processing Revised Plan...")
+            self.lbl_status.config(text="Initializing...")
+            self.btn_rip.config(state="disabled", text="Re-ripping using new metadata...")
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(10)
+            self.is_ripping = True
+            threading.Thread(target=self._run_revise_thread, args=(plan, dialog.result), daemon=True).start()
+
+    def _run_revise_thread(self, old_plan, review_result) -> None:
+        try:
+            logger.emit("[*] Post-Rip override initiated by user. Re-calculating plan...\n")
+            new_plan = old_plan.revise(review_result.get('title_idx'), new_stream_idx=review_result.get('stream_idx'),
+                new_mbid=review_result.get('mbid'), new_medium_idx=review_result.get('medium'),
+                new_artist=review_result.get('artist'), new_album=review_result.get('album'))
+
+            if new_plan.matched_candidate and 'cover_art_path' in new_plan.matched_candidate:
+                self.art_queue.put(new_plan.matched_candidate['cover_art_path'])
+
+            safe_plan = self._enforce_overwrite_protection(new_plan)
+            if not safe_plan:
+                self.done_queue.put(("FAIL", old_plan))
+                return
+
+            success = carat.execute_album_rip(safe_plan)
+            if success:
+                self.done_queue.put(("SUCCESS", safe_plan))
+            else:
+                self.done_queue.put(("FAIL", safe_plan))
+        except Exception as e:
+            logger.emit(f"\n[!] Carat Engine Error during revise: {str(e)}")
+            self.done_queue.put(("FAIL", old_plan))
 
     def _finalize_ui(self, success: bool, got_metadata: bool) -> None:
         self.progress_bar.stop()
@@ -470,11 +585,25 @@ class CaratGUI:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to update cover: {e}")
 
+    def _show_review_dialog(self, plan) -> None:
+        """Isolated handler for the Revise Dialog to prevent blocking the poller."""
+        dialog = ReviseDialog(self.parent, plan)
+        self.parent.wait_window(dialog)
+        self.review_result = dialog.result
+        self.review_event.set()
+
+    def _show_suffix_dialog(self, plan) -> None:
+        """Isolated handler for the Suffix Dialog to prevent blocking the poller."""
+        dialog = SuffixDialog(self.parent, plan.target_dir, plan.audio_profile.suffix)
+        self.parent.wait_window(dialog)
+        self.review_result = dialog.result
+        self.review_event.set()
+
     def _start_queue_poller(self) -> None:
         """Consumes queue events and updates the UI (must run on the main thread)."""
         # Bulk log insertion for responsiveness
         if not self.log_queue.empty():
-            self.txt_log.config(state="normal")
+            self.console.config(state="normal")
             logs = []
             while not self.log_queue.empty():
                 try:
@@ -482,9 +611,56 @@ class CaratGUI:
                 except queue.Empty:
                     break
             if logs:
-                self.txt_log.insert("end", "\n".join(logs) + "\n")
-                self.txt_log.see("end")
-            self.txt_log.config(state="disabled")
+                self.console.insert("end", "\n".join(logs) + "\n")
+                self.console.see("end")
+            self.console.config(state="disabled")
+
+        # Check for UI Intercepts
+        while not self.action_queue.empty():
+            msg = self.action_queue.get_nowait()
+            if isinstance(msg, tuple) and msg[0] == "REVIEW":
+                self.parent.after(0, self._show_review_dialog, msg[1])
+            elif isinstance(msg, tuple) and msg[0] == "SUFFIX":
+                self.parent.after(0, self._show_suffix_dialog, msg[1])
+
+        # --- Check for Rip Completion ---
+        while not self.done_queue.empty():
+            status = self.done_queue.get_nowait()
+
+            # Stop the progress bar and reset state
+            self.progress_bar.stop()
+            self.progress_bar.config(mode='determinate')
+            self.is_ripping = False
+            self.progress_var.set(100)
+
+            if isinstance(status, tuple):
+                msg_type = status[0]
+                # Safely extract the plan if it was passed back
+                plan: carat.RipPlan | None = status[1] if len(status) > 1 else None
+
+                if msg_type == "SUCCESS" and plan is not None:
+                    self.lbl_status.config(text="Idle")
+                    self.btn_rip.config(
+                        state="normal",
+                        text="Rip Complete — Rip Additional Stream",
+                        command=lambda p=plan: self._trigger_post_rip_revise(p)
+                    )
+                elif msg_type == "FAIL":
+                    self.lbl_status.config(text="Failed / Cancelled")
+                    if plan:
+                        # We have a plan! Guide them to the Revise flow to fix the collision.
+                        self.btn_rip.config(
+                            state="normal",
+                            text="Revise Plan to Retry",
+                            command=lambda p=plan: self._trigger_post_rip_revise(p)
+                        )
+                    else:
+                        # Fatal error before a plan was created. Reset to square one.
+                        self.btn_rip.config(
+                            state="normal",
+                            text="Rip Failed! (Check Log)",
+                            command=self._start_rip_thread
+                        )
 
         while not self.progress_queue.empty():
             # If we get a valid number, we are Determinate. Stop any bouncing.
@@ -529,9 +705,9 @@ class CaratGUI:
 
     def _clear_console(self) -> None:
         """Wipes the console text box clean."""
-        self.txt_log.config(state="normal")
-        self.txt_log.delete('1.0', tk.END)
-        self.txt_log.config(state="disabled")
+        self.console.config(state="normal")
+        self.console.delete('1.0', tk.END)
+        self.console.config(state="disabled")
 
     def handle_fatal_error(self, message: str) -> None:
         """
@@ -544,6 +720,380 @@ class CaratGUI:
         messagebox.showerror("Carat: Startup Error", message, parent=self.parent)
         self.parent.destroy()
         sys.exit(1)
+
+
+class ReviseDialog(tk.Toplevel):
+    """ Modal Dialog that allows the user to override heuristic rip plans. """
+
+    def __init__(self, parent, plan):
+        super().__init__(parent)
+        self.title("Inspect or Revise Rip Plan")
+        self.geometry("850x650")
+        self.transient(parent)
+        self.grab_set()
+
+        self.result = None
+        self.plan = plan  # Saved for validation helper
+
+        current_mbid = plan.matched_candidate['mbid'] if plan.matched_candidate else ""
+        current_medium = plan.matched_candidate.get('medium_index', 1) if plan.matched_candidate else 1
+
+        # Track state for the validation indicators
+        self.current_mb_tracks = 0
+        self.current_mb_duration = 0
+
+        if plan.matched_candidate and 'tracks' in plan.matched_candidate:
+            self.current_mb_tracks = len(plan.matched_candidate['tracks'])
+            self.current_mb_duration = sum((int(t.get('duration') or 0)) for t in plan.matched_candidate['tracks'])
+
+        # --- Top Metadata Frame ---
+        top_frame = ttk.Frame(self, padding=10)
+        top_frame.pack(fill="x")
+
+        ttk.Label(top_frame, text="MusicBrainz ID:").grid(row=0, column=0, sticky="e")
+        self.mbid_var = tk.StringVar(value=current_mbid)
+        self.mbid_var.trace_add("write", self._on_mbid_changed)
+        ttk.Entry(top_frame, textvariable=self.mbid_var, width=45).grid(row=0, column=1, padx=5, sticky="w")
+
+        ttk.Label(top_frame, text="Medium:").grid(row=1, column=0, sticky="e", pady=5)
+        self.medium_var = tk.IntVar(value=current_medium)
+        self.medium_var.trace_add("write", self._trigger_live_preview)
+        ttk.Spinbox(top_frame, from_=1, to=99, textvariable=self.medium_var, width=5).grid(row=1, column=1, sticky="w",
+                                                                                           padx=5, pady=5)
+        import webbrowser
+        link_lbl = ttk.Label(top_frame, text="View Release on MusicBrainz", foreground="blue", cursor="hand2")
+        link_lbl.grid(row=2, column=1, sticky="w", padx=5)
+        link_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://musicbrainz.org/release/{self.mbid_var.get()}"))
+
+        # --- Middle Frame (Side-by-Side) ---
+        mid_frame = ttk.Frame(self, padding=10)
+        mid_frame.pack(fill="both", expand=True)
+
+        # Configure the grid weights to enforce a STRICT 40/60 split
+        mid_frame.columnconfigure(0, weight=2, uniform="pane_split")  # Left column gets 2 parts
+        mid_frame.columnconfigure(1, weight=3, uniform="pane_split")  # Right column gets 3 parts
+        mid_frame.rowconfigure(0, weight=1)  # Allow vertical expansion
+
+        # --- Left Pane (MusicBrainz Live Preview) ---
+        left_frame = ttk.LabelFrame(mid_frame, text="Current MusicBrainz Tracklist")
+        left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+
+        # --- Local Naming Overrides ---
+        override_frame = ttk.LabelFrame(left_frame, text=" Local Naming Overrides (Does not trigger metadata search) ")
+        override_frame.pack(fill="x", padx=5, pady=(0, 10))
+
+        ttk.Label(override_frame, text="Override Artist:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.artist_var = tk.StringVar(value=plan.artist)
+        ttk.Entry(override_frame, textvariable=self.artist_var, width=35).grid(row=0, column=1, padx=5, pady=5,
+                                                                               sticky="w")
+
+        ttk.Label(override_frame, text="Override Album:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.album_var = tk.StringVar(value=plan.album)
+        ttk.Entry(override_frame, textvariable=self.album_var, width=35).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        if plan.matched_candidate:
+            mb_artist = plan.matched_candidate.get('artist', plan.artist)
+            mb_album = plan.matched_candidate.get('title', plan.album)
+            total_mins, total_secs = divmod(self.current_mb_duration // 1000, 60)
+            initial_text = f"{mb_artist} - {mb_album} ({self.current_mb_tracks} tracks, {total_mins}:{total_secs:02d})"
+            self.lbl_preview_status = ttk.Label(left_frame, text=initial_text, font=("Segoe UI", 10, "bold"))
+        else:
+            self.lbl_preview_status = ttk.Label(left_frame, text="Matched Release: None", foreground="gray")
+
+        self.lbl_preview_status.pack(anchor="w", pady=(5, 0), padx=5)
+
+        self.mb_tree = ttk.Treeview(left_frame, columns=("Length",), show="tree headings", height=12)
+        self.mb_tree.heading("#0", text="Track Title")
+        self.mb_tree.heading("Length", text="Length")
+        self.mb_tree.column("#0", width=250)
+        self.mb_tree.column("Length", width=60, anchor="e", stretch=False)
+        self.mb_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+        if plan.matched_candidate and 'tracks' in plan.matched_candidate:
+            for i, track in enumerate(plan.matched_candidate['tracks']):
+                duration_ms = int(track.get('duration') or 0)
+                mins, secs = divmod(duration_ms // 1000, 60)
+                title = track.get('title', 'Unknown')
+                self.mb_tree.insert("", "end", text=f"{i + 1}. {title}", values=(f"{mins}:{secs:02d}",))
+
+        def _prevent_mb_selection(_event):
+            sel = self.mb_tree.selection()
+            if sel:
+                self.mb_tree.selection_remove(sel)
+
+        self.mb_tree.bind("<<TreeviewSelect>>", _prevent_mb_selection)
+
+        # --- Right Pane (Disc Topology) ---
+        right_frame = ttk.LabelFrame(mid_frame, text="Disc Topology Override")
+        right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+
+        self.topo_tree = None
+        if plan.disc_topology is not None:
+            self.topo_tree = ttk.Treeview(right_frame, show="tree")
+            self.topo_tree.tag_configure('title', font=("TkDefaultFont", 9, "bold"))
+            self.topo_tree.tag_configure('atmos', font=("TkDefaultFont", 9, "bold"), foreground="blue")
+            self.topo_tree.pack(fill="both", expand=True, padx=5, pady=5)
+
+            topology = plan.disc_topology
+            for t_idx, title_info in topology.items():
+                dur_str = f"{title_info.duration_sec // 60}:{title_info.duration_sec % 60:02d}"
+                t_text = f"Title {t_idx} ({title_info.num_chapters} tracks, {dur_str})"
+
+                # Safely extract the filename (ignoring MakeMKV's default "Unknown" or empty strings)
+                file_name = getattr(title_info, 'file_name', '')
+                if file_name and file_name.lower() != "unknown":
+                    t_text += f" — {file_name}"
+
+                t_node = self.topo_tree.insert("", "end", iid=t_idx, text=t_text, tags=('title',), open=True)
+
+                for s_idx, stream in title_info.streams.items():
+                    # Filter out Video streams to reduce clutter/errors
+                    if any(v in stream.lower() for v in ["mpeg", "avc", "hevc"]):
+                        continue
+
+                    s_text = f"Stream {s_idx}: {stream}"
+                    if s_idx in title_info.atmos_streams:
+                        s_node = self.topo_tree.insert(t_node, "end", iid=f"{t_idx}|{s_idx}", text=s_text, tags=('atmos',))
+                    else:
+                        s_node = self.topo_tree.insert(t_node, "end", iid=f"{t_idx}|{s_idx}", text=s_text)
+
+                    if plan.title_idx == t_idx and plan.audio_profile and str(plan.audio_profile.stream_idx) == str(s_idx):
+                        self.topo_tree.selection_set(s_node)
+
+            def _enforce_stream_selection(event):
+                tree = event.widget
+                sel = tree.selection()
+                if sel and "|" not in sel[0]:
+                    tree.selection_remove(sel[0])
+                # Trigger validation update when a new stream is clicked
+                self.after(10, self._update_validation_status)
+
+            self.topo_tree.bind("<<TreeviewSelect>>", _enforce_stream_selection)
+        else:
+            ttk.Label(right_frame, text="No Disc Topology Available", justify="center").pack(expand=True)
+
+        # --- Validation / Status Bar ---
+        self.val_frame = ttk.Frame(self, padding=(10, 0))
+        self.val_frame.pack(fill="x", pady=(0, 5))
+        self.lbl_track_match = ttk.Label(self.val_frame, text="Waiting for selection...",
+                                         font=("TkDefaultFont", 12, "bold"))
+        self.lbl_track_match.pack(side="left", padx=(0, 40))
+        self.lbl_dur_match = ttk.Label(self.val_frame, font=("TkDefaultFont", 12, "bold"))
+        self.lbl_dur_match.pack(side="left")
+
+        # --- Bottom Buttons ---
+        btn_frame = ttk.Frame(self, padding=10)
+        btn_frame.pack(fill="x")
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="right", padx=5)
+
+        # CAPTURE THE RIP BUTTON AS A VARIABLE
+        self.btn_rip = ttk.Button(btn_frame, text="Rip", command=self._on_rip)
+        self.btn_rip.pack(side="right")
+
+        # Run an initial validation pass
+        self._update_validation_status()
+
+    def _update_validation_status(self):
+        """Compares the selected MKV Title against the Live MusicBrainz preview."""
+        if not hasattr(self, 'current_mb_tracks') or not self.topo_tree:
+            return
+
+        sel = self.topo_tree.selection()
+        if not sel:
+            self.lbl_track_match.config(text="No Stream Selected", foreground="gray")
+            self.lbl_dur_match.config(text="")
+            if hasattr(self, 'btn_rip'):
+                self.btn_rip.state(['disabled'])  # Disable if nothing selected
+            return
+
+        iid = sel[0]
+        t_idx = iid.split('|')[0] if '|' in iid else iid
+
+        title_info = self.plan.disc_topology.get(t_idx)
+        if not title_info:
+            return
+
+        mkv_tracks = title_info.num_chapters
+        mkv_dur = title_info.duration_sec * 1000
+
+        mb_tracks = self.current_mb_tracks
+        mb_dur = self.current_mb_duration
+
+        # 1. Track Count Validation (THE FATAL GUARDRAIL)
+        if mkv_tracks == mb_tracks:
+            self.lbl_track_match.config(text=f"✔ Tracks Match ({mkv_tracks})", foreground="green")
+            if hasattr(self, 'btn_rip'):
+                self.btn_rip.state(['!disabled'])  # ENABLE BUTTON
+        else:
+            self.lbl_track_match.config(text=f"✖ Track Mismatch (MKV: {mkv_tracks} / MB: {mb_tracks})",
+                                        foreground="red")
+            if hasattr(self, 'btn_rip'):
+                self.btn_rip.state(['disabled'])  # DISABLE BUTTON
+
+        # 2. Duration Validation
+        if mb_dur == 0 or mkv_dur == 0:
+            self.lbl_dur_match.config(text="? Duration Unknown", foreground="gray")
+        else:
+            diff = abs(mkv_dur - mb_dur) / float(max(mkv_dur, mb_dur))
+            if diff <= 0.10:  # 10% tolerance
+                self.lbl_dur_match.config(text="✔ Duration Match (<10% variance)", foreground="green")
+            else:
+                self.lbl_dur_match.config(text="✖ Duration Mismatch (>10% variance)", foreground="red")
+
+    def _on_mbid_changed(self, *_args):
+        """Resets the medium index to 1 when a new MBID is entered, and triggers a preview."""
+        self.medium_var.set(1)
+        self._trigger_live_preview()
+
+    def _trigger_live_preview(self, *_args):
+        if hasattr(self, '_preview_timer') and self._preview_timer:
+            self.after_cancel(self._preview_timer)
+        self._preview_timer = self.after(750, self._fetch_live_preview)
+
+    def _fetch_live_preview(self):
+        mbid = self.mbid_var.get().strip()
+        medium = self.medium_var.get()
+
+        if len(mbid) != 36:
+            self.lbl_preview_status.config(text="Waiting for valid 36-character MBID...", foreground="gray")
+            return
+
+        self.lbl_preview_status.config(text="Fetching metadata...", foreground="blue")
+
+        def worker():
+            """ Daemon thread to fetch the MB preview. """
+            try:
+                logger.emit(f"[*] Fetching live MusicBrainz preview for MBID {mbid} (Medium {medium})...")
+                rel_info = carat.fetch_release_info(mbid)
+                self.after(0, lambda: self._update_preview_ui(rel_info, medium))
+            except Exception as e:
+                self.after(0, lambda: self.lbl_preview_status.config(text=f"Fetch failed: {e}", foreground="red"))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _update_preview_ui(self, rel_info, target_medium):
+        if not self.winfo_exists():
+            return
+
+        self.mb_tree.delete(*self.mb_tree.get_children())
+
+        release = rel_info.get('release', {})
+        medium_list = release.get('medium-list', [])
+        target_med_data = next((m for m in medium_list if int(m.get('position', 1)) == target_medium), None)
+
+        if not isinstance(target_med_data, dict):
+            self.lbl_preview_status.config(text=f"Error: Medium {target_medium} not found in this release.",
+                                           foreground="red")
+            return
+
+        artist = carat.extract_artist_from_musicbrainz_metadata(release)
+        album = release.get('title', 'Unknown')
+        tracks = target_med_data.get('track-list', [])
+
+        total_ms = 0
+
+        for i, track in enumerate(tracks):
+            duration_ms = int(track.get('recording', {}).get('length') or 0)
+            total_ms += duration_ms
+            mins, secs = divmod(duration_ms // 1000, 60)
+            title = carat.sanitize_track_title(track.get('recording', {}).get('title', 'Unknown'))
+            self.mb_tree.insert("", "end", text=f"{i + 1}. {title}", values=(f"{mins}:{secs:02d}",))
+
+        total_mins, total_secs = divmod(total_ms // 1000, 60)
+        status_text = f"{artist} - {album} ({len(tracks)} tracks, {total_mins}:{total_secs:02d})"
+        self.lbl_preview_status.config(text=status_text, font=("Segoe UI", 10, "bold"))
+
+        # Update the state variables and trigger the validation check
+        self.artist_var.set(artist)
+        self.album_var.set(album)
+        self.current_mb_tracks = len(tracks)
+        self.current_mb_duration = total_ms
+        self._update_validation_status()
+
+    def _on_rip(self):
+        new_mbid = self.mbid_var.get().strip()
+        if len(new_mbid) > 0 and len(new_mbid) != 36:
+            from tkinter import messagebox
+            messagebox.showerror("Invalid Input", "MBID must be a 36-character UUID, or empty.", parent=self)
+            return
+
+        selected_title = None
+        selected_stream = None
+
+        if self.topo_tree:
+            sel = self.topo_tree.selection()
+            if sel:
+                iid = sel[0]
+                if "|" in iid:
+                    selected_title, selected_stream = iid.split("|")
+                else:
+                    selected_title = iid
+
+        self.result = {
+            "mbid": new_mbid,
+            "medium": self.medium_var.get(),
+            "title_idx": selected_title,
+            "stream_idx": int(selected_stream) if selected_stream else None,
+            'artist': self.artist_var.get().strip(),
+            'album': self.album_var.get().strip()
+        }
+        self.destroy()
+
+class SuffixDialog(tk.Toplevel):
+    """Modal Dialog to resolve directory overwrite conflicts."""
+    def __init__(self, parent, folder_name: str, current_suffix: str = ""):
+        super().__init__(parent)
+        self.title("Folder Already Exists")
+        self.geometry("450x170")
+        self.transient(parent)
+        self.grab_set()
+        self.result = None
+
+        ttk.Label(self, text=f"The folder '{folder_name}' already exists.", font=("Segoe UI", 10, "bold")).pack(
+            pady=(15, 5))
+        ttk.Label(self, text="Enter a suffix to save as a new mix (e.g., 'Instrumental'), or Overwrite:").pack(
+            pady=(0, 10))
+
+        # --- THE NUDGE LOGIC ---
+        clean_suffix = current_suffix.strip()
+        if clean_suffix:
+            suggested_text = f"{clean_suffix} (Alt Mix)"
+        else:
+            suggested_text = "(Alt Mix)"
+
+        self.suffix_var = tk.StringVar(value=suggested_text)
+
+        # Highlight just the words "Alt Mix" so typing instantly replaces it!
+        entry = ttk.Entry(self, textvariable=self.suffix_var, width=30)
+        entry.pack(pady=5)
+
+        start_idx = len(suggested_text) - 8  # Highlights the "Alt Mix" part
+        entry.select_range(start_idx, start_idx + 7)
+        entry.focus()
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Cancel Rip", command=self._on_cancel).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Overwrite Original", command=self._on_overwrite).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Save as New Mix", command=self._on_save).pack(side="left", padx=5)
+
+    def _on_cancel(self):
+        self.result = {"action": "cancel"}
+        self.destroy()
+
+    def _on_overwrite(self):
+        self.result = {"action": "overwrite"}
+        self.destroy()
+
+    def _on_save(self):
+        suffix = self.suffix_var.get().strip()
+        if suffix:
+            self.result = {"action": "suffix", "value": suffix}
+        else:
+            self.result = {"action": "overwrite"}  # Fallback if they leave it blank
+        self.destroy()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
