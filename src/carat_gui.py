@@ -732,13 +732,9 @@ class ReviseDialog(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
+        # 1. Initialize Core State
         self.result = None
         self.plan = plan  # Saved for validation helper
-
-        current_mbid = plan.matched_candidate['mbid'] if plan.matched_candidate else ""
-        current_medium = plan.matched_candidate.get('medium_index', 1) if plan.matched_candidate else 1
-
-        # Track state for the validation indicators
         self.current_mb_tracks = 0
         self.current_mb_duration = 0
 
@@ -746,9 +742,30 @@ class ReviseDialog(tk.Toplevel):
             self.current_mb_tracks = len(plan.matched_candidate['tracks'])
             self.current_mb_duration = sum((int(t.get('duration_ms') or 0)) for t in plan.matched_candidate['tracks'])
 
-        # --- Top Metadata Frame ---
+        # 2. Build UI Regions
+        self._build_top_frame()
+
+        # Master container for the side-by-side panes
+        mid_frame = ttk.Frame(self, padding=10)
+        mid_frame.pack(fill="both", expand=True)
+        mid_frame.columnconfigure(0, weight=2, uniform="pane_split")  # 40% Left
+        mid_frame.columnconfigure(1, weight=3, uniform="pane_split")  # 60% Right
+        mid_frame.rowconfigure(0, weight=1)
+
+        self._build_left_pane(mid_frame)
+        self._build_right_pane(mid_frame)
+        self._build_bottom_frame()
+
+        # 3. Run initial validation pass
+        self._update_validation_status()
+
+    def _build_top_frame(self):
+        """Constructs the MusicBrainz ID search and medium selection bar."""
         top_frame = ttk.Frame(self, padding=10)
         top_frame.pack(fill="x")
+
+        current_mbid = self.plan.matched_candidate['mbid'] if self.plan.matched_candidate else ""
+        current_medium = self.plan.matched_candidate.get('medium_index', 1) if self.plan.matched_candidate else 1
 
         ttk.Label(top_frame, text="MusicBrainz ID:").grid(row=0, column=0, sticky="e")
         self.mbid_var = tk.StringVar(value=current_mbid)
@@ -760,40 +777,33 @@ class ReviseDialog(tk.Toplevel):
         self.medium_var.trace_add("write", self._trigger_live_preview)
         ttk.Spinbox(top_frame, from_=1, to=99, textvariable=self.medium_var, width=5).grid(row=1, column=1, sticky="w",
                                                                                            padx=5, pady=5)
+
         import webbrowser
         link_lbl = ttk.Label(top_frame, text="View Release on MusicBrainz", foreground="blue", cursor="hand2")
         link_lbl.grid(row=2, column=1, sticky="w", padx=5)
         link_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://musicbrainz.org/release/{self.mbid_var.get()}"))
 
-        # --- Middle Frame (Side-by-Side) ---
-        mid_frame = ttk.Frame(self, padding=10)
-        mid_frame.pack(fill="both", expand=True)
-
-        # Configure the grid weights to enforce a STRICT 40/60 split
-        mid_frame.columnconfigure(0, weight=2, uniform="pane_split")  # Left column gets 2 parts
-        mid_frame.columnconfigure(1, weight=3, uniform="pane_split")  # Right column gets 3 parts
-        mid_frame.rowconfigure(0, weight=1)  # Allow vertical expansion
-
-        # --- Left Pane (MusicBrainz Live Preview) ---
-        left_frame = ttk.LabelFrame(mid_frame, text="Current MusicBrainz Tracklist")
+    def _build_left_pane(self, parent_container):
+        """Constructs the local naming overrides and the MusicBrainz live preview tree."""
+        left_frame = ttk.LabelFrame(parent_container, text="Current MusicBrainz Tracklist")
         left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
-        # --- Local Naming Overrides ---
         override_frame = ttk.LabelFrame(left_frame, text=" Local Naming Overrides (Does not trigger metadata search) ")
         override_frame.pack(fill="x", padx=5, pady=(0, 10))
 
         ttk.Label(override_frame, text="Override Artist:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-        self.artist_var = tk.StringVar(value=plan.artist)
+        self.artist_var = tk.StringVar(value=self.plan.artist)
         ttk.Entry(override_frame, textvariable=self.artist_var, width=35).grid(row=0, column=1, padx=5, pady=5,
                                                                                sticky="w")
 
         ttk.Label(override_frame, text="Override Album:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-        self.album_var = tk.StringVar(value=plan.album)
-        ttk.Entry(override_frame, textvariable=self.album_var, width=35).grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        self.album_var = tk.StringVar(value=self.plan.album)
+        ttk.Entry(override_frame, textvariable=self.album_var, width=35).grid(row=1, column=1, padx=5, pady=5,
+                                                                              sticky="w")
 
-        if plan.matched_candidate:
-            mb_artist = plan.matched_candidate.get('artist', plan.artist)
-            mb_album = plan.matched_candidate.get('title', plan.album)
+        if self.plan.matched_candidate:
+            mb_artist = self.plan.matched_candidate.get('artist', self.plan.artist)
+            mb_album = self.plan.matched_candidate.get('title', self.plan.album)
             total_mins, total_secs = divmod(self.current_mb_duration // 1000, 60)
             initial_text = f"{mb_artist} - {mb_album} ({self.current_mb_tracks} tracks, {total_mins}:{total_secs:02d})"
             self.lbl_preview_status = ttk.Label(left_frame, text=initial_text, font=("Segoe UI", 10, "bold"))
@@ -809,8 +819,8 @@ class ReviseDialog(tk.Toplevel):
         self.mb_tree.column("Length", width=60, anchor="e", stretch=False)
         self.mb_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
-        if plan.matched_candidate and 'tracks' in plan.matched_candidate:
-            for i, track in enumerate(plan.matched_candidate['tracks']):
+        if self.plan.matched_candidate and 'tracks' in self.plan.matched_candidate:
+            for i, track in enumerate(self.plan.matched_candidate['tracks']):
                 duration_ms = int(track.get('duration_ms') or 0)
                 mins, secs = divmod(duration_ms // 1000, 60)
                 title = track.get('title', 'Unknown')
@@ -818,28 +828,26 @@ class ReviseDialog(tk.Toplevel):
 
         def _prevent_mb_selection(_event):
             sel = self.mb_tree.selection()
-            if sel:
-                self.mb_tree.selection_remove(sel)
+            if sel: self.mb_tree.selection_remove(sel)
 
         self.mb_tree.bind("<<TreeviewSelect>>", _prevent_mb_selection)
 
-        # --- Right Pane (Disc Topology) ---
-        right_frame = ttk.LabelFrame(mid_frame, text="Disc Topology Override")
+    def _build_right_pane(self, parent_container):
+        """Constructs the Disc Topology tree and populates it with MakeMKV state."""
+        right_frame = ttk.LabelFrame(parent_container, text="Disc Topology Override")
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
         self.topo_tree = None
-        if plan.disc_topology is not None:
+        if self.plan.disc_topology is not None:
             self.topo_tree = ttk.Treeview(right_frame, show="tree")
             self.topo_tree.tag_configure('title', font=("TkDefaultFont", 9, "bold"))
             self.topo_tree.tag_configure('atmos', font=("TkDefaultFont", 9, "bold"), foreground="blue")
             self.topo_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
-            topology = plan.disc_topology
-            for t_idx, title_info in topology.items():
+            for t_idx, title_info in self.plan.disc_topology.items():
                 dur_str = f"{title_info.duration_sec // 60}:{title_info.duration_sec % 60:02d}"
                 t_text = f"Title {t_idx} ({title_info.num_chapters} tracks, {dur_str})"
 
-                # Safely extract the filename (ignoring MakeMKV's default "Unknown" or empty strings)
                 file_name = getattr(title_info, 'file_name', '')
                 if file_name and file_name.lower() != "unknown":
                     t_text += f" — {file_name}"
@@ -847,51 +855,44 @@ class ReviseDialog(tk.Toplevel):
                 t_node = self.topo_tree.insert("", "end", iid=t_idx, text=t_text, tags=('title',), open=True)
 
                 for s_idx, stream in title_info.streams.items():
-                    # Filter out Video streams to reduce clutter/errors
                     if any(v in stream.lower() for v in ["mpeg", "avc", "hevc"]):
                         continue
 
                     s_text = f"Stream {s_idx}: {stream}"
-                    if s_idx in title_info.atmos_streams:
-                        s_node = self.topo_tree.insert(t_node, "end", iid=f"{t_idx}|{s_idx}", text=s_text, tags=('atmos',))
-                    else:
-                        s_node = self.topo_tree.insert(t_node, "end", iid=f"{t_idx}|{s_idx}", text=s_text)
+                    tags = ('atmos',) if s_idx in title_info.atmos_streams else ()
+                    s_node = self.topo_tree.insert(t_node, "end", iid=f"{t_idx}|{s_idx}", text=s_text, tags=tags)
 
-                    if plan.title_idx == t_idx and plan.audio_profile and str(plan.audio_profile.stream_idx) == str(s_idx):
+                    if self.plan.title_idx == t_idx and self.plan.audio_profile and str(
+                            self.plan.audio_profile.stream_idx) == str(s_idx):
                         self.topo_tree.selection_set(s_node)
 
-            def _enforce_stream_selection(event):
-                tree = event.widget
-                sel = tree.selection()
+            def _enforce_stream_selection(_event):
+                sel = self.topo_tree.selection()
                 if sel and "|" not in sel[0]:
-                    tree.selection_remove(sel[0])
-                # Trigger validation update when a new stream is clicked
+                    self.topo_tree.selection_remove(sel[0])
                 self.after(10, self._update_validation_status)
 
             self.topo_tree.bind("<<TreeviewSelect>>", _enforce_stream_selection)
         else:
             ttk.Label(right_frame, text="No Disc Topology Available", justify="center").pack(expand=True)
 
-        # --- Validation / Status Bar ---
+    def _build_bottom_frame(self):
+        """Constructs the validation status text and action buttons."""
         self.val_frame = ttk.Frame(self, padding=(10, 0))
         self.val_frame.pack(fill="x", pady=(0, 5))
+
         self.lbl_track_match = ttk.Label(self.val_frame, text="Waiting for selection...",
                                          font=("TkDefaultFont", 12, "bold"))
         self.lbl_track_match.pack(side="left", padx=(0, 40))
         self.lbl_dur_match = ttk.Label(self.val_frame, font=("TkDefaultFont", 12, "bold"))
         self.lbl_dur_match.pack(side="left")
 
-        # --- Bottom Buttons ---
         btn_frame = ttk.Frame(self, padding=10)
         btn_frame.pack(fill="x")
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="right", padx=5)
 
-        # CAPTURE THE RIP BUTTON AS A VARIABLE
         self.btn_rip = ttk.Button(btn_frame, text="Rip", command=self._on_rip)
         self.btn_rip.pack(side="right")
-
-        # Run an initial validation pass
-        self._update_validation_status()
 
     def _update_validation_status(self):
         """Compares the selected MKV Title against the Live MusicBrainz preview."""
@@ -1011,15 +1012,17 @@ class ReviseDialog(tk.Toplevel):
             messagebox.showerror("Invalid Input", "MBID must be a 36-character UUID, or empty.", parent=self)
             return
 
-        selected_title = None
-        selected_stream = None
+        selected_title: str | None = None
+        selected_stream: int | None = None
 
         if self.topo_tree:
             sel = self.topo_tree.selection()
             if sel:
                 iid = sel[0]
                 if "|" in iid:
-                    selected_title, selected_stream = iid.split("|")
+                    t_idx, s_idx = iid.split("|")
+                    selected_title = t_idx
+                    selected_stream = int(s_idx)
                 else:
                     selected_title = iid
 
@@ -1027,7 +1030,7 @@ class ReviseDialog(tk.Toplevel):
             "mbid": new_mbid,
             "medium": self.medium_var.get(),
             "title_idx": selected_title,
-            "stream_idx": int(selected_stream) if selected_stream else None,
+            "stream_idx": selected_stream,
             'artist': self.artist_var.get().strip(),
             'album': self.album_var.get().strip()
         }
