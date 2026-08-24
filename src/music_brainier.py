@@ -125,19 +125,27 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 # The maximum number of releases to search for a good match for the user-supplied album and artist names
 MAX_RELEASES_TO_SEARCH: int = 15
 
+
 def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
     """
-    Finds the release group corresponding to the given album and artist name (which may be inexact).
+    Finds the release group corresponding to the given artist and album name (which may be inexact).
     Searches by release rather than release group to bypass strict artist indexing.
+    Prioritizes 'Album' release groups over 'Single' or 'EP' to prevent tracklist mismatches.
 
     Returns:
         A tuple containing (release_group_id, artist, title) if found, otherwise None.
     """
+    # Priority mapping for release group types (lowest number wins)
+    type_priority = {"Album": 1, "EP": 2, "Single": 3}
+
     for is_strict in [True, False]:
         query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
         logger.emit(f"[*] Executing Query: {query}")
         try:
             res = _search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
+
+            valid_matches = []
+
             for r in res.get('release-list', []):
                 found_artist = extract_artist_from_musicbrainz_metadata(r)
                 found_album = r.get('title', 'Unknown')
@@ -147,16 +155,29 @@ def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
                 album_match = _is_safe_match(album, found_album)
 
                 if artist_match and album_match:
-                    rg_id = r.get('release-group', {}).get('id')
-                    rg_title, rg_artist = found_album, found_artist
-                    logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})\n")
+                    rg = r.get('release-group', {})
+                    rg_id = rg.get('id')
+                    rg_type = rg.get('primary-type', 'Unknown')
 
-                    # Ensure rg_id actually exists to satisfy the strict return type!
                     if rg_id:
-                        return str(rg_id), rg_artist, rg_title
+                        # Score the match
+                        priority = type_priority.get(rg_type, 4)
+                        valid_matches.append((priority, str(rg_id), found_artist, found_album, rg_type))
                 else:
                     logger.emit(f"    [-] Rejected Candidate: {found_artist} - {found_album} "
                                 f"(Artist Match: {artist_match}, Album Match: {album_match})")
+
+            # If we found matches in this strictness pass, pick the best one and exit!
+            if valid_matches:
+                # Sort by our priority score (index 0 of our tuple)
+                valid_matches.sort(key=lambda x: x[0])
+                best_match = valid_matches[0]
+
+                _, rg_id, rg_artist, rg_title, rg_type = best_match
+                logger.emit(f"    [+] Match Found: {rg_artist} - {rg_title} (RG ID: {rg_id}, Type: {rg_type})\n")
+
+                return rg_id, rg_artist, rg_title
+
         except mb.WebServiceError as e:
             logger.emit(f"    [!] API Error: {e}")
 
