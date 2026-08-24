@@ -50,7 +50,7 @@ def fetch_candidate_metadata(artist: str, album: str) -> list[MusicBrainzMetadat
     """
     logger.emit("\n[*] === STARTING METADATA FETCH ===")
 
-    rg = find_release_group(album, artist)
+    rg = find_release_group(artist, album)
     if not rg:
         logger.emit("    [-] No matching release group found. Aborting metadata fetch.")
         return []
@@ -125,7 +125,7 @@ def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: 
 # The maximum number of releases to search for a good match for the user-supplied album and artist names
 MAX_RELEASES_TO_SEARCH: int = 15
 
-def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
+def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
     """
     Finds the release group corresponding to the given album and artist name (which may be inexact).
     Searches by release rather than release group to bypass strict artist indexing.
