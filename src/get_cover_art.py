@@ -13,34 +13,64 @@ __copyright__ = "Copyright 2026, Joshua Bloch"
 __license__ = "MIT"
 __version__ = "1.0B3.1"
 
-import re
 import sys
-import time
 from io import BytesIO
 from pathlib import Path
 
-import musicbrainzngs as mb
 import requests
-import unicodedata
 from PIL import Image
-
-import logger
 
 __all__ = ['download_cover_art']
 
+import logger
+from music_brainier import generate_mb_art_urls
+
+from util import normalize_for_fuzzy_comparison
+
+MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5  # Maximum number of Apple album covers to examine before switching to CAA
+MAX_FILE_SIZE = 15 * 1024 * 1024      # 15 MB Cap on image file size
+MIN_DIMENSION = 1000                  # Minimum pixels on a side for 'High Res' image
+
 # We search multiple albums on Apple Music to give us a buffer against Apple's fuzzy search
-MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5
+def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | None = None) -> None:
+    """
+    Downloads the "best" available cover art for the specified release (or does nothing if no acceptable art found).
+    """
+    # Apple's API is still our first choice for high-res art, but MB acts as the precise fallback
+    image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album, mbid)
 
-mb.set_useragent("Carat CoverArtRetrievalTool", __version__, "josh@bloch.us")
+    if image_url:
+        logger.emit(f"[*] Downloading: {image_url}")
+        img_data = requests.get(image_url, timeout=15).content
+        img = Image.open(BytesIO(img_data))
 
-MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB Cap
-MIN_DIMENSION = 1000  # Minimum pixels for 'High Res'
+        # Strip transparency layer if present, as it would cause Pillow to crash on jpeg conversion
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        # Save as high-quality JPEG
+        save_path = target_dir / "cover.jpg"
+        img.save(save_path, "JPEG", quality=95)
+        logger.emit(f"[+] Success: Saved {img.width}x{img.height} cover to {save_path}")
+    else:
+        logger.emit("[!] No suitable art found.")
+
+def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> str | None:
+    """ Consumes candidate URLs from MusicBrainz and returns the first valid image. """
+    for url in generate_mb_art_urls(artist, album, mbid):
+        valid, w, h = is_valid_image(url)
+        if valid:
+            return url
+        else:
+            logger.emit(f"  [-] Skipped invalid/undersized CAA art at: {url}")
+
+    return None
 
 
 def is_valid_image(url: str) -> tuple[bool, int, int]:
     """ Returns true and the image dimensions if the image at the given URL has an appropriate shape for cover art. """
     try:
-        # 1. Broaden the check to skip fragile HEAD requests for CAA and iTunes CDNs
+        # 1. Limit size check to skip fragile HEAD requests for CAA and iTunes CDNs
         is_thumbnail = "coverartarchive.org" in url or "mzstatic.com" in url or "itunes.apple.com" in url
 
         if not is_thumbnail:
@@ -65,129 +95,6 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
     except (requests.RequestException, OSError, ValueError):
         pass
     return False, 0, 0
-
-
-def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> str | None:
-    """ Returns the URL of acceptable album art from MusicBrainz, or None if not found. """
-    logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...")
-    try:
-        if mbid:
-            # 1. We have the exact Release ID! Check it directly first.
-            exact_url = get_mb_art_url_from_releases([{'id': mbid}])
-            if exact_url:
-                return exact_url
-
-            # 2. If the exact release has no art, grab its parent Release Group ID to check siblings
-            release_info = _get_release_by_id(mbid, includes=["release-groups"])
-            rg_id = release_info['release']['release-group']['id']
-        else: # 3 No Release ID given, get a release group ID from the artist and album names
-            release_groups = _search_release_groups(artist=artist, releasegroup=album)
-            if release_groups['release-group-count'] == 0: return None
-            rg_id = release_groups['release-group-list'][0]['id']
-
-        # Fallback: Search all official releases in the release group
-        releases = _get_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
-
-        # Prioritize 'Digital' releases (which have digital-native cover art) over other official releases
-        digital = [r for r in releases if r.get('status') == 'Official' and r.get('packaging') is None]
-        image_url = get_mb_art_url_from_releases(digital)
-        if not image_url:
-            official = [r for r in releases if r.get('status') == 'Official']
-            image_url = get_mb_art_url_from_releases(official)
-
-        return image_url
-    except (mb.MusicBrainzError, KeyError, IndexError) as e:
-        logger.emit(f"  [!] MusicBrainz API Error: {e}")
-        pass
-    return None
-
-
-def get_mb_art_url_from_releases(releases)-> str | None:
-    """ Returns the URL of the best candidate from the given MB releases, or None if none appear satisfactory. """
-    # Sort releases by date desc (ensure date is treated as a string)
-    releases.sort(key=lambda x: str(x.get('date', '0000')), reverse=True)
-    for r in releases:
-        mb_id = r['id']
-        # IMPORTANT: Perform a direct lookup for the release to get fresh CAA status
-        # The release data inside a release-group object is often incomplete.
-        try:
-            full_release = _get_release_by_id(mb_id)
-            status = full_release['release'].get('cover-art-archive', {})
-
-            if str(status.get('artwork')).lower() == 'true':
-                logger.emit(f"  [+] Found CAA art for: {mb_id}")
-                caa_data = requests.get(f"https://coverartarchive.org/release/{mb_id}", timeout=10).json()
-                for img_entry in caa_data['images']:
-                    if img_entry['front']:
-                        url = img_entry['thumbnails'].get('1200') or img_entry['image']
-                        valid, w, h = is_valid_image(url)
-                        if valid:
-                            return url
-                        else:
-                            logger.emit(f"Invalid CAA art: '{img_entry}'")
-        except Exception as e:
-            logger.emit(f"  [!] Error checking release {mb_id}: {e}")
-            continue
-    return None
-
-def retry_mb_api(retries: int = 3, delay: float = 2.0):
-    """Decorator to retry MusicBrainz API calls on transient web errors."""
-    def decorator(func):
-        """Internal decorator to retry MusicBrainz API calls."""
-        def wrapper(*args, **kwargs):
-            """internal decorator that does the actual work"""
-            attempt = 0
-            while True:
-                try:
-                    return func(*args, **kwargs)
-                except mb.WebServiceError:
-                    attempt += 1
-                    if attempt >= retries:
-                        raise
-                    time.sleep(delay)
-        return wrapper
-    return decorator
-
-@retry_mb_api()
-def _get_release_by_id(rel_id: str, includes: list[str] | None = None) -> dict:
-    """Fetches a single release by ID with retry logic."""
-    return mb.get_release_by_id(rel_id, includes=includes or [])
-
-@retry_mb_api()
-def _search_release_groups(artist: str, releasegroup: str) -> dict:
-    """Searches for release groups with retry logic."""
-    return mb.search_release_groups(artist=artist, releasegroup=releasegroup)
-
-@retry_mb_api()
-def _get_release_group_by_id(rg_id: str, includes: list[str] | None = None) -> dict:
-    """Fetches a release group by ID with retry logic."""
-    return mb.get_release_group_by_id(rg_id, includes=includes or [])
-
-
-def normalize_for_fuzzy_comparison(s: str) -> str:
-    """
-    Robust normalization for fuzzy matching.
-        1. Normalizes Unicode (NFKD) to decompose diacritics and fix full-width chars.
-        2. Strips combining diacritics (e.g., the dots on 'ö').
-        3. Lowercases and expands '&'.
-        4. Keeps ALL alphanumeric characters (including Cyrillic, Kanji, etc.)
-        5. Collapses whitespace.
-    """
-    if not s: return ""  #  Shouldn't be necessary, but acceptably defensive under the circumstances
-
-    # 1. Decompose (turn 'ö' into 'o' + '¨', and 'Ｆ' into 'F')
-    s = unicodedata.normalize('NFKD', s)
-
-    # 2. Strip diacritics
-    s = "".join([c for c in s if not unicodedata.combining(c)])
-
-    s = s.lower().replace("&", "and")
-
-    # 3. Filter: Keep only letters/numbers and spaces works for any script, e.g., Greek, Cyrillic, CJK
-    s = "".join([c if c.isalnum() else " " for c in s])
-
-    # 4. Collapse multiple spaces down to one
-    return re.sub(r'\s+', ' ', s).strip()
 
 
 def get_itunes_art_url(artist: str, album: str) -> str | None:
@@ -218,30 +125,6 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
     except (requests.RequestException, KeyError, ValueError):
         pass
     return None
-
-
-def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | None = None) -> None:
-    """
-    Downloads the "best" available cover art for the specified release (or does nothing if no acceptable art found).
-    """
-    # Apple's API is still our first choice for high-res art, but MB acts as the precise fallback
-    image_url = get_itunes_art_url(artist, album) or get_mb_digital_art_url(artist, album, mbid)
-
-    if image_url:
-        logger.emit(f"[*] Downloading: {image_url}")
-        img_data = requests.get(image_url, timeout=15).content
-        img = Image.open(BytesIO(img_data))
-
-        # Strip transparency layer if present, as it would cause Pillow to crash on jpeg conversion
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-
-        # Save as high-quality JPEG
-        save_path = target_dir / "cover.jpg"
-        img.save(save_path, "JPEG", quality=95)
-        logger.emit(f"[+] Success: Saved {img.width}x{img.height} cover to {save_path}")
-    else:
-        logger.emit("[!] No suitable art found.")
 
 
 def main():

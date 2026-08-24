@@ -29,7 +29,10 @@ from PIL import Image, ImageTk
 
 import carat
 import logger
+import music_brainier
 from carat import Codec, Container
+from music_brainier import MusicBrainzMetadata
+from util import _clean_path_arg
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
@@ -54,9 +57,6 @@ class OutputProfile(Enum):
         # Safe default if the config file has an obsolete string
         return cls.M4A_LOSSLESS
 
-def _clean_path_arg(arg: str) -> str:
-    """Strips rogue literal quotes caused by Windows shell path escaping."""
-    return arg.strip('"')
 
 class CaratGUI:
     """ Tkinter GUI for Carat """
@@ -744,7 +744,7 @@ class ReviseDialog(tk.Toplevel):
 
         if plan.matched_candidate and 'tracks' in plan.matched_candidate:
             self.current_mb_tracks = len(plan.matched_candidate['tracks'])
-            self.current_mb_duration = sum((int(t.get('duration') or 0)) for t in plan.matched_candidate['tracks'])
+            self.current_mb_duration = sum((int(t.get('duration_ms') or 0)) for t in plan.matched_candidate['tracks'])
 
         # --- Top Metadata Frame ---
         top_frame = ttk.Frame(self, padding=10)
@@ -811,7 +811,7 @@ class ReviseDialog(tk.Toplevel):
 
         if plan.matched_candidate and 'tracks' in plan.matched_candidate:
             for i, track in enumerate(plan.matched_candidate['tracks']):
-                duration_ms = int(track.get('duration') or 0)
+                duration_ms = int(track.get('duration_ms') or 0)
                 mins, secs = divmod(duration_ms // 1000, 60)
                 title = track.get('title', 'Unknown')
                 self.mb_tree.insert("", "end", text=f"{i + 1}. {title}", values=(f"{mins}:{secs:02d}",))
@@ -963,41 +963,34 @@ class ReviseDialog(tk.Toplevel):
         def worker():
             """ Daemon thread to fetch the MB preview. """
             try:
-                logger.emit(f"[*] Fetching live MusicBrainz preview for MBID {mbid} (Medium {medium})...")
-                rel_info = carat.fetch_release_info(mbid)
-                self.after(0, lambda: self._update_preview_ui(rel_info, medium))
+                metadata = music_brainier.fetch_metadata(mbid, medium)
+                self.after(0, lambda: self._update_preview_ui(metadata))
             except Exception as e:
                 self.after(0, lambda: self.lbl_preview_status.config(text=f"Fetch failed: {e}", foreground="red"))
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_preview_ui(self, rel_info, target_medium):
+    def _update_preview_ui(self, metadata: MusicBrainzMetadata):
         if not self.winfo_exists():
             return
 
         self.mb_tree.delete(*self.mb_tree.get_children())
 
-        release = rel_info.get('release', {})
-        medium_list = release.get('medium-list', [])
-        target_med_data = next((m for m in medium_list if int(m.get('position', 1)) == target_medium), None)
-
-        if not isinstance(target_med_data, dict):
-            self.lbl_preview_status.config(text=f"Error: Medium {target_medium} not found in this release.",
-                                           foreground="red")
+        if not metadata:
+            self.lbl_preview_status.config(text=f"Error: Medium not found in this release.", foreground="red")
             return
 
-        artist = carat.extract_artist_from_musicbrainz_metadata(release)
-        album = release.get('title', 'Unknown')
-        tracks = target_med_data.get('track-list', [])
+        artist = metadata['artist']
+        album = metadata['title']
+        tracks = metadata['tracks']
 
         total_ms = 0
-
         for i, track in enumerate(tracks):
-            duration_ms = int(track.get('recording', {}).get('length') or 0)
+            duration_ms = track['duration_ms']
             total_ms += duration_ms
             mins, secs = divmod(duration_ms // 1000, 60)
-            title = carat.sanitize_track_title(track.get('recording', {}).get('title', 'Unknown'))
+            title = track['title']
             self.mb_tree.insert("", "end", text=f"{i + 1}. {title}", values=(f"{mins}:{secs:02d}",))
 
         total_mins, total_secs = divmod(total_ms // 1000, 60)

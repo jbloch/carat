@@ -20,7 +20,6 @@ __all__ = ['rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'e
 import argparse
 import atexit
 import concurrent.futures
-import difflib
 import json
 import os
 import platform
@@ -44,8 +43,9 @@ from mutagen.flac import FLAC, Picture
 import get_cover_art
 import logger
 import makemkv_updater
-# noinspection PyProtectedMember
-from get_cover_art import normalize_for_fuzzy_comparison, retry_mb_api
+from music_brainier import MusicBrainzMetadata, MusicBrainzTrack, get_best_mb_candidate, fetch_candidate_metadata, \
+    fetch_metadata
+from util import _clean_path_arg
 
 
 # --- (1) Metadata & Utils ---
@@ -62,10 +62,11 @@ def seconds_to_cue(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}:{int((seconds % 1) * 75):02d}"
 
 
-def generate_cue_sheet(cue_path: Path, file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
+def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
     """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
-        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\nREM DATE {info.get("year", "Unknown")}\nFILE "{file_name}" WAVE\n')
+        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\n'
+                f'REM DATE {info.get("year", "Unknown")}\nFILE "{audio_file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(ch["start_time"])}\n')
@@ -368,79 +369,8 @@ def log_disc_topology(titles: dict[str, TitleInfo]) -> None:
         logger.emit("")
 
 
-class MusicBrainzCandidate(TypedDict):
-    """ A dictionary of release information returned by MusicBrainz """
-    title: str
-    artist: str
-    year: str
-    mbid: str
-    medium_index: int
-    tracks: list[MusicBrainzTrack]
-
-
-class MusicBrainzTrack(TypedDict):
-    """ Represents a track returned by the MusicBrainz API """
-    title: str
-    duration: int
-
-
-def get_best_mb_candidate(target_artist: str, target_album: str, chapter_count: int,
-                          target_duration_sec: float, candidates: list[MusicBrainzCandidate]) -> MusicBrainzCandidate | None:
-    """
-    Finds the best MusicBrainz candidate for a given artist, name, target chapter count, and target duration.
-    Filters for exact track count matches or +1 preamble matches, prioritizing similar durations, lower MB medium index,
-    and finally string similarity to the target artist and album names.
-    """
-    if not candidates:
-        return None
-
-    # Filter for valid matches (exact or +1 preamble)
-    matched = [c for c in candidates if 0 <= (chapter_count - len(c['tracks'])) <= 1]
-    if not matched:
-        return None
-
-    safe_target = normalize_for_fuzzy_comparison(f"{target_artist} {target_album}").replace(" ", "")
-
-    def get_similarity(c: MusicBrainzCandidate) -> float:
-        """Calculates a similarity score based on string similarity to the target artist and album."""
-        safe_cand = normalize_for_fuzzy_comparison(f"{c['artist']} {c['title']}").replace(" ", "")
-        return difflib.SequenceMatcher(None, safe_target, safe_cand).ratio()
-
-    def get_duration_penalty(c: MusicBrainzCandidate) -> int:
-        """Calculates a penalty based on total duration difference (in 30-second buckets)."""
-        mb_duration_ms = sum(t.get('duration') or 0 for t in c['tracks'])
-        if mb_duration_ms == 0 or target_duration_sec == 0:
-            return 0
-        mb_sec = round(mb_duration_ms / 1000)
-
-        return int(abs(target_duration_sec - mb_sec) // 30)
-
-    def get_medium_penalty(c: MusicBrainzCandidate) -> int:
-        """Penalizes bonus discs and non-primary mediums."""
-        # Medium 1 gets 0 penalty. Medium 2 gets 1 penalty, etc.
-        return max(0, c.get('medium_index', 1) - 1)
-
-    # Sort Hierarchy:
-    # 1. Duration Penalty (Filters out radically different tracklists)
-    # 2. Medium Position (Prioritizes Disc 1 over Disc 2/3/4)
-    # 3. Text Similarity (Fuzzy string match for exact album/artist text)
-    matched.sort(key=lambda c: (
-        get_duration_penalty(c),
-        get_medium_penalty(c),
-        -get_similarity(c)
-    ))
-
-    for i, c in enumerate(matched):
-        bullet = "*" if i == 0 else "-"
-        logger.emit(f"    {bullet} {c['title']} ({c.get('year', 'Unknown')}) [MBID {c.get('mbid', 'Unknown')} "
-                    f"({c.get('medium_index', 1)})] [Scores: Duration={get_duration_penalty(c)},"
-                    f" Medium={get_medium_penalty(c)}, Artist/Title={get_similarity(c) :.2f}]")
-
-    return matched[0]
-
-
 def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy: bool = False)\
-        -> tuple[str, MusicBrainzCandidate | None, set[int], dict[str, TitleInfo]]:
+        -> tuple[str, MusicBrainzMetadata | None, set[int], dict[str, TitleInfo]]:
     """Identifies the main audio title by intersecting MakeMKV and MusicBrainz metadata.
 
     Fetches the MusicBrainz candidates concurrently while MakeMKV scans the disc.
@@ -840,230 +770,6 @@ def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[MkvChap
         return [], 0.0
 
 
-# The maximum number of releases to search on MusicBrainz for a good match for the user-supplied album and artist names
-MAX_RELEASES_TO_SEARCH: int = 15
-
-
-def fetch_candidate_metadata(artist: str, album: str) -> list[MusicBrainzCandidate]:
-    """
-    Returns the metadata for the candidate releases corresponding to the given (inexact) artist and album name.
-    All the releases returned will come from the same release group.
-    """
-    logger.emit("\n[*] === STARTING METADATA FETCH ===")
-
-    rg = find_release_group(album, artist)
-    if not rg:
-        logger.emit("    [-] No matching release group found. Aborting metadata fetch.")
-        return []
-    rg_id, rg_artist, rg_title = rg
-
-    releases = find_releases_and_dates_for_release_group(rg_id, rg_title)
-    logger.emit(f"    -> Filtered down to {len(releases)} matching release(s).")
-
-    if not releases:
-        logger.emit("    [-] No matching releases found. Aborting metadata fetch.")
-        return []
-
-    candidates = fetch_tracklists_for_releases(releases, rg_id, rg_artist, rg_title)
-    return candidates
-
-
-def find_release_group(album: str, artist: str) -> tuple[str, str, str] | None:
-    """
-    Finds the release group corresponding to the given album and artist name (which may be inexact).
-    Searches by release rather than release group to bypass strict artist indexing.
-
-    Returns:
-        A tuple containing (release_group_id, artist, title) if found, otherwise None.
-    """
-    for is_strict in [True, False]:
-        query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
-        logger.emit(f"[*] Executing Query: {query}")
-        try:
-            res = _search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
-            for r in res.get('release-list', []):
-                found_artist = extract_artist_from_musicbrainz_metadata(r)
-                found_album = r.get('title', 'Unknown')
-
-                # Evaluate matches for plausibility with "substring leniency"
-                artist_match = _is_safe_match(artist, found_artist)
-                album_match = _is_safe_match(album, found_album)
-
-                if artist_match and album_match:
-                    rg_id = r.get('release-group', {}).get('id')
-                    rg_title, rg_artist = found_album, found_artist
-                    logger.emit(f"    [+] Match Found: {found_artist} - {found_album} (RG ID: {rg_id})\n")
-
-                    # Ensure rg_id actually exists to satisfy the strict return type!
-                    if rg_id:
-                        return str(rg_id), rg_artist, rg_title
-                else:
-                    logger.emit(f"    [-] Rejected Candidate: {found_artist} - {found_album} (Artist Match: {artist_match}, Album Match: {album_match})")
-        except mb.WebServiceError as e:
-            logger.emit(f"    [!] API Error: {e}")
-
-    return None
-
-
-@retry_mb_api()
-def _search_releases(query: str, limit: int) -> dict:
-    """Executes a release search with retry logic."""
-    return mb.search_releases(query=query, limit=limit)
-
-
-def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
-    """
-    Returns release IDs and dates of releases of the given release group corresponding to all possible track-counts.
-    Evaluates mediums individually to strictly match physical disc topology.
-    """
-    logger.emit(f"[*] Fetching all releases and mediums for Release Group: {rg_id} ({rg_title})")
-
-    releases = []
-    limit = 100
-    offset = 0
-
-    # 1. Fetch all releases by paginating through the browse_releases endpoint
-    try:
-        while True:
-            result = _browse_releases(rg_id, limit, offset)
-            batch = result.get('release-list', [])
-            releases.extend(batch)
-
-            if len(batch) < limit:
-                break  # We've reached the end of the list
-            offset += limit
-
-        logger.emit(f"    -> API returned {len(releases)} releases in this group.")
-    except mb.WebServiceError as e:
-        logger.emit(f"    [!] Error fetching releases: {e}")
-        return []
-
-    unique_releases = {}
-    seen_counts = set()
-
-    # 2. Map the mediums to find unique track counts
-    for r in releases:
-        mediums = r.get('medium-list', [])
-
-        if not mediums:
-            t_count = int(r.get('medium-track-count', r.get('track-count', 0)))
-            if t_count > 0 and t_count not in seen_counts:
-                seen_counts.add(t_count)
-                unique_releases[r['id']] = r.get('date', '')[:4]
-            continue
-
-        for m in mediums:
-            m_count = int(m.get('track-count', 0))
-            if m_count > 0 and m_count not in seen_counts:
-                seen_counts.add(m_count)
-                unique_releases[r['id']] = r.get('date', '')[:4]
-
-    logger.emit(f"    -> Identified unique track counts: {sorted(list(seen_counts))}")
-    return [(r_id, date) for r_id, date in unique_releases.items()]
-
-@retry_mb_api()
-def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
-    """Fetches a paginated list of releases with retry logic."""
-    return mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)
-
-
-def fetch_tracklists_for_releases(release_ids_and_dates: list[tuple[str, str]],
-                                  rg_id: str, rg_artist: str, rg_title: str) -> list[MusicBrainzCandidate]:
-    """Fetch the tracklists for the given release ids (and dates), which pertain to the given release group metadata"""
-    logger.emit(f"\n[*] Fetching tracklists for {len(release_ids_and_dates)} matching MB releases in release group {rg_id}...")
-    candidates: list[MusicBrainzCandidate] = []
-    for rel_id, year in release_ids_and_dates:
-        try:
-            rel_info = fetch_release_info(rel_id)
-
-            # Treat EVERY medium as its own independent candidate
-            for pos, medium in enumerate(rel_info.get('release', {}).get('medium-list', []), start=1):
-                medium_tracks = []
-                for track in medium.get('track-list', []):
-                    medium_tracks.append({
-                        'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
-                        'duration': int(track.get('recording', {}).get('length') or 0)
-                    })
-
-                if medium_tracks:
-                    candidates.append({
-                        'title': rg_title,
-                        'artist': rg_artist,
-                        'year': year or 'Unknown',
-                        'mbid': rel_id,  # Specific release MBID instead of the Release Group ID
-                        'medium_index': int(medium.get('position', pos)),
-                        'tracks': medium_tracks
-                    })
-        except mb.WebServiceError:
-            continue
-    logger.emit(f"[*] Metadata fetch complete. Found {len(candidates)} candidate MB mediums in release group.")
-    return candidates
-
-
-def sanitize_track_title(title: str) -> str:
-    """
-    Strips Extra Title Information (MusicBrainz ETI) from track titles safely.
-    Removes parenthetical blocks ONLY if they contain known technical/mix keywords.
-    Preserves structural parentheticals like "(Don't Fear) The Reaper".
-    """
-    # A blacklist of words that strongly indicate technical metadata rather than a song title
-    eti_keywords = r'(mix|remix|remaster|master|version|edit|live|instrumental|demo|take|stereo|mono|surround|atmos|acoustic)'
-
-    # Matches " (" or "(", followed by anything, the keyword (as a whole word), anything, and ")"
-    pattern = re.compile(rf'\s*\([^)]*\b{eti_keywords}\b[^)]*\)', re.IGNORECASE)
-
-    # Strip the ETI and clean up any lingering trailing spaces
-    return pattern.sub('', title).strip()
-
-
-@retry_mb_api()
-def fetch_release_info(rel_id: str) -> dict:
-    """Fetches a single release with retry logic."""
-    return mb.get_release_by_id(rel_id, includes=['recordings', 'artist-credits'])
-
-def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
-    """
-    Reconstructs the full artist credit string from MusicBrainz's parsed list format. MusicBrainz stores
-    collaborations as lists of fragments (e.g., [{'name': 'Simon'}, {'joinphrase': ' & '}, {'name': 'Garfunkel'}]).
-    """
-    # Sometimes older API endpoints just return a flat string
-    credit = entity.get('artist-credit', '')
-    if isinstance(credit, str):
-        return credit
-
-    if isinstance(credit, list):
-        full_name = ""
-        for fragment in credit:
-            if isinstance(fragment, dict):
-                # 'name' is the literal text on the jacket; 'artist' is the DB entity
-                name = fragment.get('name') or fragment.get('artist', {}).get('name', '')
-                join_phrase = fragment.get('joinphrase', '')
-                full_name += name + join_phrase
-            elif isinstance(fragment, str):
-                full_name += fragment
-        return full_name.strip() or "Unknown"
-
-    return "Unknown"
-
-
-def _is_safe_match(expected: str, found: str) -> bool:
-    """
-    Compares two strings for similarity after stripping all spaces and punctuation.
-    Acts as a lenient gatekeeper: allows pure substrings (for truncated titles or
-    collaborations) or highly similar strings (for typos/acronyms).
-    """
-    # Universal substring safety valve for messy artist collaborations or truncated titles
-    # (e.g., "Scary Monsters" in "Scary Monsters (and Super Creeps)")
-    if expected.lower() in found.lower():
-        return True
-
-    safe_expected = normalize_for_fuzzy_comparison(expected).replace(" ", "")
-    safe_found = normalize_for_fuzzy_comparison(found).replace(" ", "")
-
-    ratio = difflib.SequenceMatcher(None, safe_expected, safe_found).ratio()
-    return ratio > 0.7
-
-
 def merge_folder_to_master_mkv(directory_path: Path, ssd_path: Path) -> Path:
     """
     Merges a directory of sequential audio files (MKV, MKA, M4A, or MP4) into a single master MKV.
@@ -1171,7 +877,7 @@ def cleanup_orphaned_temps(min_days_old: int = 1):
 class AcquisitionResult:
     """ The data obtained by the (joint) metadata lookup and physical extraction phase of the rip """
     master_mkv_path: Path # The Path to the consolidated (all tracks and streams) MKV file that is ready for audio extraction
-    matched_candidate: MusicBrainzCandidate | None  # The MusicBrainz metadata for the chosen release/medium, or None if
+    matched_candidate: MusicBrainzMetadata | None  # The MusicBrainz metadata for the chosen release/medium, or None if
                                                     # the API failed or no match was found.
     chapters: list[MkvChapter] # A list of chapter dictionaries extracted from the master MKV (incl. track timings)
     duration: float # The actual duration of the master MKV in seconds (the total of all tracks)
@@ -1685,6 +1391,7 @@ def prepare_album_rip(src: str, artist: str, album: str, library_root: str,
         )
     except Exception as e:
         logger.emit(f"\n[!] Preparation aborted: {e}")
+        log_dest.parent.mkdir(parents=True, exist_ok=True)
         logger.close_log_file(log_dest)
         clean_up()
         raise
@@ -1805,7 +1512,7 @@ class RipPlan:
     artist: str
     album: str
     audio_profile: AudioProfile
-    matched_candidate: MusicBrainzCandidate | None
+    matched_candidate: MusicBrainzMetadata | None
     disc_topology: dict[str, TitleInfo]
     title_idx: str
 
@@ -1885,28 +1592,7 @@ class RipPlan:
             raise ValueError(f"Title {new_title_idx} does not exist on this disc.")
 
         if metadata_fetch_needed:
-            logger.emit(f"[*] Fetching revised metadata for MBID {new_mbid} (Medium {new_medium_idx})...")
-            rel_info = fetch_release_info(new_mbid)
-
-            target_medium: dict | None = next((m for m in rel_info.get('release', {}).get('medium-list', [])
-                                               if int(m.get('position', 1)) == new_medium_idx), None)
-            if target_medium is None:
-                raise ValueError(f"Medium {new_medium_idx} not found in release {new_mbid}.")
-
-            medium_tracks: list[MusicBrainzTrack] = [{
-                'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
-                'duration': int(track.get('recording', {}).get('length') or 0)
-            } for track in target_medium.get('track-list', [])]
-
-            new_candidate: MusicBrainzCandidate = {
-                'title': rel_info.get('release', {}).get('title', self.album),
-                'artist': extract_artist_from_musicbrainz_metadata(rel_info.get('release', {})),
-                'year': rel_info.get('release', {}).get('date', 'Unknown')[:4],
-                'mbid': new_mbid,
-                'medium_index': new_medium_idx,
-                'tracks': medium_tracks
-            }
-            logger.emit(f"[+] Found Release: {new_candidate['artist']} - {new_candidate['title']} ({len(medium_tracks)} tracks)")
+            new_candidate = fetch_metadata(new_mbid, new_medium_idx)
         else:
             if not self.matched_candidate:
                 raise ValueError("No existing metadata to reuse, but fetch was bypassed.")
@@ -2020,11 +1706,6 @@ def _suffix_for_stream_desc(stream_desc: str) -> str:
         return " (Surround)"
 
     return " (Unknown)"
-
-
-def _clean_path_arg(arg: str) -> str:
-    """Strips rogue literal quotes caused by Windows shell path escaping (e.g., \\")."""
-    return arg.strip('"')
 
 
 def main():
