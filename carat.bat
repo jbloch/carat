@@ -1,6 +1,6 @@
 @echo off
-REM Carat Launcher - inlcudes intaller, which runs to the extent necessary for a successful launch
-REM Uses Winget for native, silent dependency installation where possible
+REM Carat Launcher - includes installer, which runs to the extent necessary for a successful launch
+REM Uses winget for native, silent dependency installation where possible
 
 REM Prevent the window from closing instantly if a fatal syntax error occurs, so the user can debug (or report) it
 if "%~1"=="__RESTARTED__" goto :MAIN
@@ -30,18 +30,22 @@ if exist "C:\Program Files\MakeMKV\makemkvcon64.exe" goto :ADD_MAKEMKV_64
 where makemkvcon64 >nul 2>nul
 if %errorlevel% equ 0 goto :CHECK_FFMPEG
 
-REM MakeMKV Missing - Concierge Mode
-echo.
-echo [*] MakeMKV not found.
+echo [*] MakeMKV not found. Auto-installing via Winget...
+winget install -e --id GuinpinSoft.MakeMKV --accept-source-agreements --accept-package-agreements
+if %errorlevel% neq 0 goto :MANUAL_MAKEMKV
+set REQUIRES_RESTART=1
 
-echo     1. I am opening the MakeMKV download page.
-echo     2. Download and install the latest version.
-echo     3. Once installed, come back here and press any key.
-start https://www.makemkv.com/download/
-echo [*] Waiting for you to install MakeMKV...
+REM Re-check the installation path so we can add it to the current session's PATH
+if exist "C:\Program Files (x86)\MakeMKV\makemkvcon64.exe" goto :ADD_MAKEMKV_X86
+if exist "C:\Program Files\MakeMKV\makemkvcon64.exe" goto :ADD_MAKEMKV_64
+goto :CHECK_FFMPEG
+
+:MANUAL_MAKEMKV
+echo [!] Winget install failed. The MakeMKV website may be experiencing downtime.
+echo     Please try installing MakeMKV manually from https://www.makemkv.com/download/
+echo     and restart this script.
 pause
-echo [*] Re-checking for MakeMKV...
-goto :CHECK_MAKEMKV
+exit /b 1
 
 :ADD_MAKEMKV_X86
 set "PATH=%PATH%;C:\Program Files (x86)\MakeMKV"

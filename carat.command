@@ -89,10 +89,34 @@ export PATH=$PATH:/Applications/MakeMKV.app/Contents/MacOS
 # ---------------------------------------------------------
 # 4. SETUP PYTHON ENVIRONMENT
 # ---------------------------------------------------------
-# We use the Homebrew python3 if system python is missing/old
+# We use Homebrew python3 if system python is missing or older than 3.11
+
+NEEDS_PYTHON=0
 if ! command -v python3 &>/dev/null; then
-    echo "[*] Python 3 not found. Installing via Homebrew..."
+    NEEDS_PYTHON=1
+else
+    # Extract the Major and Minor version numbers
+    PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)' 2>/dev/null)
+    PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null)
+
+    # Check if the version is strictly >= 3.11 (Required for StrEnum and modern Type Hints)
+    if [ -z "$PY_MAJOR" ] || [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+        echo "[*] Found outdated Python ($PY_MAJOR.$PY_MINOR). Carat requires 3.11+."
+        NEEDS_PYTHON=1
+    fi
+fi
+
+if [ $NEEDS_PYTHON -eq 1 ]; then
+    echo "[*] Installing/Upgrading Python 3 via Homebrew..."
     brew install python
+
+    # Verify the upgrade succeeded
+    PY_MAJOR=$(python3 -c 'import sys; print(sys.version_info.major)' 2>/dev/null)
+    PY_MINOR=$(python3 -c 'import sys; print(sys.version_info.minor)' 2>/dev/null)
+    if [ -z "$PY_MAJOR" ] || [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+        osascript -e 'display alert "Carat Startup Error" message "Carat requires Python 3.11 or newer. Homebrew installation failed to provide a recent version." as critical'
+        exit 1
+    fi
 fi
 
 if [ ! -d ".venv" ]; then
@@ -108,6 +132,7 @@ fi
 
 # Activate
 source .venv/bin/activate
+
 
 # ---------------------------------------------------------
 # 5. INSTALL REQUIREMENTS
