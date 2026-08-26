@@ -15,11 +15,6 @@ import logger
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__author__ = "Joshua Bloch"
-__copyright__ = "Copyright 2026, Joshua Bloch"
-__license__ = "MIT"
-__version__ = "1.0B3"
-
 # Anchor to the project root (assuming this script is in src/)
 ROOT_DIR: str = str(Path(__file__).resolve().parent.parent)
 CONFIG_FILE: str = str(Path(ROOT_DIR) / ".carat_config.json")

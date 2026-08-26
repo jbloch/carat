@@ -10,10 +10,7 @@ supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__author__ = "Joshua Bloch"
-__copyright__ = "Copyright 2026, Joshua Bloch"
-__license__ = "MIT"
-__version__ = "1.0B3.1"
+__version__ = "1.0B4"
 
 __all__ = ['rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan']
 
@@ -36,7 +33,6 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Callable, NoReturn, NamedTuple, cast, TypedDict
 
-import musicbrainzngs as mb
 # noinspection PyProtectedMember
 from mutagen.flac import FLAC, Picture
 
@@ -62,7 +58,8 @@ def seconds_to_cue(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}:{int((seconds % 1) * 75):02d}"
 
 
-def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: dict, chapters: list, mb_tracks: list) -> None:
+def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: MusicBrainzMetadata, chapters: list[MkvChapter],
+                       mb_tracks: list[MusicBrainzTrack]) -> None:
     """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
         f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\n'
@@ -448,7 +445,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         # 2. Duration Penalty: How well does this physical title match the logical album, duration-wise?
         duration_penalty = 0
         if matched_candidate:
-            mb_dur_ms = sum(t.get('duration') or 0 for t in matched_candidate['tracks'])
+            mb_dur_ms = sum(t.get('duration_ms') or 0 for t in matched_candidate['tracks'])
             title_sec = titles[t_idx].duration_sec
             if mb_dur_ms > 0 and title_sec > 0:
                 duration_penalty = int(abs(title_sec - (mb_dur_ms / 1000.0)) // 120)
@@ -581,8 +578,8 @@ def init(fatal_error_handler: Callable[[str], None] | None = None) -> None:
     global TOOLS
     TOOLS = Toolset(fatal_error_handler)
 
-
-mb.set_useragent("carat - concise atmos rip automation tool", __version__, "josh@bloch.us")
+    import music_brainier # Local import to avoid circular dependencies
+    music_brainier.init(__version__)
 
 
 def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
@@ -1137,7 +1134,7 @@ class RipContext:
     clean_album: str  # The sanitized album title used for file naming
     profile: AudioProfile # The resolved audio stream index and destination formatting
     duration: float  # The total duration of the source in seconds
-    info: dict[str, Any]  # The matched MusicBrainz release metadata
+    info: MusicBrainzMetadata  # The matched MusicBrainz release metadata
     chapters: list[MkvChapter]  # The extracted chapter markers
     tracks: list[MusicBrainzTrack]  # The tracklist metadata from MusicBrainz
 
@@ -1421,8 +1418,7 @@ def execute_album_rip(plan: RipPlan) -> bool:
     profile = plan.audio_profile
     artist = plan.artist
     album = plan.album
-    info = matched_candidate or {'artist': artist, 'title': album, 'year': 'Unknown'}
-
+    info = matched_candidate or MusicBrainzMetadata(title=album, artist=artist, year='unknown', mbid='unknown', medium_index=1, tracks=[])
     log_dest = plan._internals.log_dest_path
     dest = log_dest.parent
     logger.emit(f"[+] Executing Rip for: {artist} - {album}")

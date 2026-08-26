@@ -8,11 +8,6 @@ and MusicBrainz as sources, but this does not affect the contract between this m
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__author__ = "Joshua Bloch"
-__copyright__ = "Copyright 2026, Joshua Bloch"
-__license__ = "MIT"
-__version__ = "1.0B3.1"
-
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -79,8 +74,8 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
             if size > MAX_FILE_SIZE:
                 return False, 0, 0
 
-        # 2. Add custom User-Agent to prevent Archive.org from dropping the connection
-        headers = {"User-Agent": "carat/1.0B ( josh@bloch.us )"}
+        # 2. Add custom User-Agent to prevent Archive.org from dropping the connection (Shouldn't be necessary)
+        headers = {"User-Agent": "Carat ( josh@bloch.us )"}
 
         # 3. Load fully into BytesIO. PIL requires seek() for Progressive JPEGs, which resp.raw lacks.
         resp = requests.get(url, headers=headers, timeout=10)

@@ -9,11 +9,6 @@ GUI applications can generate high-quality progress bars by providing appropriat
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__author__ = "Joshua Bloch"
-__copyright__ = "Copyright 2026, Joshua Bloch"
-__license__ = "MIT"
-__version__ = "1.0B3.1"
-
 import io
 import shutil
 import sys

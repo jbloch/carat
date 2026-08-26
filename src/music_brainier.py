@@ -7,12 +7,7 @@ Provides a higher level and more pleasant programmatic API than the thin skin ov
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__author__ = "Joshua Bloch"
-__copyright__ = "Copyright 2026, Joshua Bloch"
-__license__ = "MIT"
-__version__ = "1.0B3.1"
-
-__all__ = ['MusicBrainzMetadata', 'MusicBrainzTrack', 'fetch_candidate_metadata', 'fetch_metadata',
+__all__ = ['init', 'MusicBrainzMetadata', 'MusicBrainzTrack', 'fetch_candidate_metadata', 'fetch_metadata',
            'get_best_mb_candidate', 'find_release_group', 'generate_mb_art_urls']
 
 import difflib
@@ -27,8 +22,23 @@ import logger
 from util import normalize_for_fuzzy_comparison
 
 
+def init(app_version: str) -> None:
+    """Initializes the MusicBrainz API client with the required User-Agent."""
+    mb.set_useragent("carat - concise atmos rip automation tool", app_version, "josh@bloch.us")
+
+
 class MusicBrainzMetadata(TypedDict):
-    """ A dictionary of release information returned by MusicBrainz """
+    """
+    A dictionary of release information returned by MusicBrainz.
+
+    Attributes:
+        title (str): The canonicalized title of the release
+        artist (str): The canonicalized artist credit
+        year (str): The 4-digit year of the release (e.g., '1973')
+        mbid (str): The 36-character MusicBrainz Release ID
+        medium_index (int): The 1-based index of the physical medium (disc)
+        tracks (list[MusicBrainzTrack]): The ordered list of tracks on this medium
+    """
     title: str
     artist: str
     year: str
@@ -38,7 +48,13 @@ class MusicBrainzMetadata(TypedDict):
 
 
 class MusicBrainzTrack(TypedDict):
-    """ Represents a track returned by the MusicBrainz API """
+    """
+    A dictionary of track information returned by the MusicBrainz API.
+
+    Attributes:
+        title (str): The sanitized title of the track (e.g., with ETI stripped)
+        duration_ms (int): The duration of the track in milliseconds
+    """
     title: str
     duration_ms: int
 
