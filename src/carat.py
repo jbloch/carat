@@ -385,8 +385,11 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         - atmos_streams: A set of stream indices for all streams containing Atmos audio.
         - disc_topology: A dictionary containing the disc topology parsed from MakeMKV.
     """
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
         # 1. Fire off the network fetch in the background
+        MUSICBRAINZ_TIMEOUT = 60.0  # Maximum time (s) to wait for MusicBrainz
+        fetch_start = time.time()
         candidates_future = prefetch_ex.submit(fetch_candidate_metadata, artist, album)
 
         # 2. Scan input using MakeMKV locally (runs concurrently with the fetch)
@@ -399,8 +402,12 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
 
         # 3. Synchronize: Grab the results of the background fetch
         candidates = []
+        elapsed = time.time() - fetch_start
+        remaining_timeout = max(0.1, MUSICBRAINZ_TIMEOUT - elapsed)
         try:
-            candidates = candidates_future.result(timeout=30) or []
+            if not candidates_future.done():
+                logger.emit(f"[*] Waiting for MusicBrainz metadata (Timeout in {remaining_timeout:.0f}s)...")
+            candidates = candidates_future.result(timeout=remaining_timeout) or []
         except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
             logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
 
