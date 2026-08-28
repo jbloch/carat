@@ -42,18 +42,27 @@ Carat uses a highly robust, idempotent launcher script that handles both install
 1. Download the latest `.zip` release and extract it to a folder.
 2. **Windows**: Double-click `carat.bat`
 3. **macOS**: Double-click `carat.command`
-4. The launcher pretty much takes it from there. The first time you click it, it installs the program and runs it. Subsequently, it just runs it. The installation of some components, especially on Windows, will require you to click through the usual install screens, accepting all the defaults. Windows will ask for permission to install the components before it runs their installers. If you don't have [MakeMKV](https://www.makemkv.com/) installed yet, the Carat installer will open a page on your browser, and you'll have to install it yourself before continuing.
+4. The launcher pretty much takes it from there. The first time you click it, it installs the program and runs it. Subsequently, it just runs it.
 
-**How it works:** On its first run, the launcher automatically checks your system, downloads any missing dependencies (via Winget or Homebrew), builds an isolated Python virtual environment, and launches the GUI. *Did something get interrupted?* Just double-click it again! The script is strictly idempotent—you can run it as many times as necessary, and it will simply pick up where it left off without polluting your system. Subsequent runs will bypass the checks and launch instantly.
+**How it works:** On its first run, the launcher automatically checks your system, downloads any missing dependencies via Winget (Windows) or Homebrew (Mac)—including automatically fetching MakeMKV and FFmpeg—builds an isolated Python virtual environment, and launches the GUI. *Did something get interrupted?* Just double-click it again! The script is strictly idempotent—you can run it as many times as necessary, and it will simply pick up where it left off without polluting your system. Subsequent runs will bypass the checks and launch instantly.
 
 Feel free to move the entire Carat-Beta directory anywhere you like, or to rename it; it won't affect the operation of the program.
 
-## Usage
+## Usage & The *Rip Plan*
+Carat is designed to be a one-click tool, but it hides a massive amount of flexibility just beneath the surface via the **Rip Plan**.
+
 1. Insert your disc or locate your source files.
 2. Launch Carat.
-3. Select your input (and library root, if this is the first time you've run Carat), enter the artist and the album title, and click **Rip**.
-4. Keep going. Carat is built for batch processing. You can leave the app open and rip multiple albums in a single session without ever needing to restart; the console will automatically reset for the next disc or download.
+3. Select your input (and library root, if this is the first time you've run Carat), and enter the artist and the album title.
+4. **(Optional) Review the Rip Plan:** Check the *Review metadata before ripping* box. Carat will pause before extraction, allowing you to intercept the *Rip Plan.* You can manually change the MusicBrainz ID, select a specific Musicbrainz *medium* (to use the track list from a particular CD in a box-set), or choose to rip an alternative title from the blue ray, or audio stream from the title instead of the default Atmos track. In other words, you can select whatever metadata or data suits you. If the data and the metadata don't match (e.g, wrong number of tracks or duration) Carat will let you know.
+5. Click **Rip**.
+6. **Rip Additional Streams:** When the rip finishes, the Rip button changes to *Rip Complete — Rip Additional Stream*. Click it to immediately extract a different mix from the exact same source without having to re-read the disc (unless you select an alternate title). Atmos streams are highlighted in blue (though you're free to rip other streams too). Carat will even ask you for a custom suffix (e.g., `(Instrumental)`) so you don't overwrite your first rip!
+7. Keep going. Carat is built for batch processing. You can leave the app open and rip multiple albums in a single session without ever needing to restart; the console will automatically reset for the next disc or download.
 
+<div align="center">
+  <img src="docs/carat_rip_plan_screenshot.jpg" alt="Carat screenshot: Frank Zappa remux in progress" width="600"/>
+</div>
+ 
 ## Advanced Usage (CLI & Programmatic)
 While Carat features a fully automated GUI, the core engine is completely decoupled. Power users can:
 * **Run Headless:** Execute Carat directly from the command line or import it programmatically into custom Python scripts for batch-processing.
