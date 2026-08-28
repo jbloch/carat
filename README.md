@@ -69,7 +69,7 @@ While Carat features a fully automated GUI, the core engine is completely decoup
 * **Get Cover Art:** The `get_cover_art` module can be used in isolation to scrape top-tier artwork from MusicBrainz/CAA and Apple/iTunes to upgrade your existing digital library.
 
 ## Under the Hood
-Carat acts as an elegant conductor for the community's best open-source media tools. The entire program consists of fewer than 2,000 lines of Python (taking up just 1/3 the space of its 400x400 icon). The entire distribution, including the icon, would fit six times on a standard floppy disk. Carat is also aggressively hygienic: it goes to great lengths to clean up after itself. Even if it is forcefully closed mid-rip, it tracks its state to ensure that it never leaves orphaned background processes running, or abandons multi-gigabyte temporary files on your drive.
+Carat acts as an elegant conductor for the community's best open-source media tools. The entire program consists of about 3,500 lines of Python (taking up just 1/2 the space of its 400x400 icon). The entire distribution, including the icon, would fit five times on a standard floppy disk. Carat is also aggressively hygienic: it goes to great lengths to clean up after itself. Even if it is forcefully closed mid-rip, it tracks its state to ensure that it never leaves orphaned background processes running, or abandons multi-gigabyte temporary files on your drive.
 
 The underlying tools (which do all the heavy lifting) are:
 * **GUI:** [Python/Tkinter](https://www.python.org/) 

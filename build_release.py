@@ -4,17 +4,16 @@ import os
 import shutil
 
 # --- Configuration ---
-RELEASE_NAME = "Carat_Beta_3.1"
+RELEASE_NAME = "Carat_Beta_4"
 DIST_DIR = "dist"
 BUILD_DIR = os.path.join(DIST_DIR, RELEASE_NAME)
 
-# Explicitly list the files and folders you want in the final zip
 FILES_TO_INCLUDE = [
     "carat.bat",
     "carat.command",
     "requirements.txt",
     "LICENSE",
-    "README.md"  # Add this if you have one!
+    "README.md"
 ]
 DIRS_TO_INCLUDE = ["src"]
 
