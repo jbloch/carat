@@ -1,5 +1,7 @@
 """Updates MakeMKV trial key if necessary."""
 
+from __future__ import annotations
+
 import json
 import os
 import platform

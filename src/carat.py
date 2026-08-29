@@ -10,7 +10,9 @@ supports all popular Atmos distribution formats (Blu-ray, mkv, mp4, BDMV).
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
-__version__ = "1.0B4"
+from __future__ import annotations
+
+__version__ = "1.0B4.1"
 
 __all__ = ['rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan']
 

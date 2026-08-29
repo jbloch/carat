@@ -7,6 +7,8 @@ Every project of a certain size needs a junk drawer.
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
+from __future__ import annotations
+
 import re
 
 import unicodedata

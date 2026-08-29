@@ -9,14 +9,16 @@ GUI applications can generate high-quality progress bars by providing appropriat
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
+from __future__ import annotations
+
+__all__ = ['init', 'emit', 'open_log_file', 'close_log_file']
+
 import io
 import shutil
 import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
-
-__all__ = ['init', 'emit', 'open_log_file', 'close_log_file']
 
 # Global lock to prevent threads from garbling the console
 _print_lock = threading.Lock()

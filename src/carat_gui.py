@@ -8,6 +8,8 @@ selection. (See carat.py for details.)
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
+from __future__ import annotations
+
 import itertools
 import json
 import platform

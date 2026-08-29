@@ -8,6 +8,10 @@ and MusicBrainz as sources, but this does not affect the contract between this m
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
+from __future__ import annotations
+
+__all__ = ['download_cover_art']
+
 import sys
 from io import BytesIO
 from pathlib import Path
@@ -15,11 +19,8 @@ from pathlib import Path
 import requests
 from PIL import Image
 
-__all__ = ['download_cover_art']
-
 import logger
 from music_brainier import generate_mb_art_urls
-
 from util import normalize_for_fuzzy_comparison
 
 MAX_APPLE_ALBUM_COVERS_TO_SEARCH = 5  # Maximum number of Apple album covers to examine before switching to CAA

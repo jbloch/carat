@@ -134,29 +134,35 @@ pause
 exit /b 1
 
 REM ----------------------------------------------------
-REM 4. CHECK & INSTALL PYTHON (SHIM-PROOF)
+REM 4. CHECK & INSTALL PYTHON (SHIM-PROOF & VERSION-CHECKED)
 REM ----------------------------------------------------
 :CHECK_PYTHON
 
 REM A. Check for 'py' launcher (Always preferred)
 where py >nul 2>nul
-if %errorlevel% equ 0 set PYTHON_CMD=py
-if %errorlevel% equ 0 goto :DO_RESTART
+if %errorlevel% equ 0 (
+    set PYTHON_CMD=py
+    goto :VERIFY_VERSION
+)
 
 REM B. Check for 'python' executable
 where python >nul 2>nul
-if %errorlevel% neq 0 goto :INSTALL_PYTHON
+if %errorlevel% equ 0 (
+    set PYTHON_CMD=python
+    goto :VERIFY_VERSION
+)
 
-REM C. SHIM CHECK: Does 'python --version' actually work?
-python --version >nul 2>nul
-if %errorlevel% neq 0 goto :INSTALL_PYTHON
+REM C. If nothing found, go straight to install
+goto :INSTALL_PYTHON
 
-REM If we passed both checks, it is a real Python.
-set PYTHON_CMD=python
-goto :DO_RESTART
+:VERIFY_VERSION
+REM Check if the discovered Python is at least version 3.11 (Required for StrEnum)
+%PYTHON_CMD% -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" >nul 2>nul
+if %errorlevel% equ 0 goto :DO_RESTART
+echo [*] Found outdated Python. Carat requires Python 3.11 or newer.
 
 :INSTALL_PYTHON
-echo [*] Python not found - Auto-installing Python 3.12 via Winget...
+echo [*] Auto-installing Python 3.12 via Winget...
 winget install -e --id Python.Python.3.12 --scope machine --accept-source-agreements --accept-package-agreements
 
 if %errorlevel% neq 0 goto :MANUAL_PYTHON

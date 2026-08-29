@@ -7,6 +7,8 @@ Provides a higher level and more pleasant programmatic API than the thin skin ov
 # Copyright (c) 2026 Joshua Bloch
 # SPDX-License-Identifier: MIT
 
+from __future__ import annotations
+
 __all__ = ['init', 'MusicBrainzMetadata', 'MusicBrainzTrack', 'fetch_candidate_metadata', 'fetch_metadata',
            'get_best_mb_candidate', 'find_release_group', 'generate_mb_art_urls']
 
