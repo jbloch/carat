@@ -541,7 +541,6 @@ class Toolset:
         # 3. Handle fatal errors
         if missing:
             error_msg = f"Missing required dependencies: {', '.join(missing)}.\n\nPlease ensure they are installed."
-            fatal_error_handler(f"[!] {error_msg}")
 
             if fatal_error_handler:
                 # Let the GUI show a nice popup and exit
