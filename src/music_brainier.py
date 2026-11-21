@@ -14,19 +14,20 @@ __all__ = ['init', 'MusicBrainzMetadata', 'MusicBrainzTrack', 'fetch_candidate_m
 
 import difflib
 import re
-import time
-from typing import TypedDict
+from collections.abc import Iterator
+from typing import NotRequired, TypedDict, cast
 
-import musicbrainzngs as mb
 import requests
 
 import logger
+import musicbrainz_api as mb_api
+from musicbrainz_api import ArtistCreditEntity, ReleaseSummary
 from util import normalize_for_fuzzy_comparison
 
 
 def init(app_version: str) -> None:
     """Initializes the MusicBrainz API client with the required User-Agent."""
-    mb.set_useragent("carat - concise atmos rip automation tool", app_version, "josh@bloch.us")
+    mb_api.init(app_version)
 
 
 class MusicBrainzMetadata(TypedDict):
@@ -56,9 +57,31 @@ class MusicBrainzTrack(TypedDict):
     Attributes:
         title (str): The sanitized title of the track (e.g., with ETI stripped)
         duration_ms (int): The duration of the track in milliseconds
+        track_artist (str): The artist credit for this track, when supplied by MusicBrainz
     """
     title: str
     duration_ms: int
+    track_artist: NotRequired[str]
+
+
+# Cover Art Archive returns image records separate from MusicBrainz release data.
+_CAAThumbnails = TypedDict("_CAAThumbnails", {"1200": str}, total=False)
+
+
+class _CAAImage(TypedDict):
+    image: str
+    thumbnails: _CAAThumbnails
+
+
+class _CAAImageWithFront(_CAAImage, total=False):
+    front: bool
+
+
+_CAAResponse = TypedDict(
+    "_CAAResponse",
+    {"images": list[_CAAImageWithFront]},
+    total=False,
+)
 
 
 def fetch_candidate_metadata(artist: str, album: str) -> list[MusicBrainzMetadata]:
@@ -160,9 +183,9 @@ def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
         query = f'artist:"{artist}" AND release:"{album}"' if is_strict else f'"{artist}" "{album}"'
         logger.emit(f"[*] Executing Query: {query}")
         try:
-            res = _search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
+            res = mb_api.search_releases(query=query, limit=MAX_RELEASES_TO_SEARCH)
 
-            valid_matches = []
+            valid_matches: list[tuple[int, str, str, str, str]] = []
 
             for r in res.get('release-list', []):
                 found_artist = extract_artist_from_musicbrainz_metadata(r)
@@ -173,9 +196,14 @@ def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
                 album_match = _is_safe_match(album, found_album)
 
                 if artist_match and album_match:
-                    rg = r.get('release-group', {})
-                    rg_id = rg.get('id')
-                    rg_type = rg.get('primary-type', 'Unknown')
+                    rg = r.get('release-group')
+
+                    if rg is not None:
+                        rg_id = rg.get('id')
+                        rg_type = rg.get('primary-type', 'Unknown')
+                    else:
+                        rg_id = None
+                        rg_type = 'Unknown'
 
                     if rg_id:
                         # Score the match
@@ -196,29 +224,10 @@ def find_release_group(artist: str, album: str) -> tuple[str, str, str] | None:
 
                 return rg_id, rg_artist, rg_title
 
-        except mb.WebServiceError as e:
+        except mb_api.WebServiceError as e:
             logger.emit(f"    [!] API Error: {e}")
 
     return None
-
-
-def _retry_mb_api(retries: int = 3, delay: float = 2.0):
-    """Decorator to retry MusicBrainz API calls on transient web errors."""
-    def decorator(func):
-        """Internal decorator to retry MusicBrainz API calls."""
-        def wrapper(*args, **kwargs):
-            """internal decorator that does the actual work"""
-            attempt = 0
-            while True:
-                try:
-                    return func(*args, **kwargs)
-                except mb.WebServiceError:
-                    attempt += 1
-                    if attempt >= retries:
-                        raise
-                    time.sleep(delay)
-        return wrapper
-    return decorator
 
 
 def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list[tuple[str, str]]:
@@ -228,15 +237,15 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
     """
     logger.emit(f"[*] Fetching all releases and mediums for Release Group: {rg_id} ({rg_title})")
 
-    releases = []
+    releases: list[ReleaseSummary] = []
     limit = 100
     offset = 0
 
     # 1. Fetch all releases by paginating through the browse_releases endpoint
     try:
         while True:
-            result = _browse_releases(rg_id, limit, offset)
-            batch = result.get('release-list', [])
+            result = mb_api.browse_releases(rg_id, limit, offset)
+            batch = result['release-list']
             releases.extend(batch)
 
             if len(batch) < limit:
@@ -244,12 +253,12 @@ def find_releases_and_dates_for_release_group(rg_id: str, rg_title: str) -> list
             offset += limit
 
         logger.emit(f"    -> API returned {len(releases)} releases in this group.")
-    except mb.WebServiceError as e:
+    except mb_api.WebServiceError as e:
         logger.emit(f"    [!] Error fetching releases: {e}")
         return []
 
-    unique_releases = {}
-    seen_counts = set()
+    unique_releases: dict[str, str] = {}
+    seen_counts: set[int] = set()
 
     # 2. Map the mediums to find unique track counts
     for r in releases:
@@ -279,16 +288,24 @@ def fetch_metadata_for_releases(release_ids_and_dates: list[tuple[str, str]],
     candidates: list[MusicBrainzMetadata] = []
     for rel_id, year in release_ids_and_dates:
         try:
-            rel_info = _fetch_release_by_id(rel_id, includes=['recordings', 'artist-credits'])
+            rel_info = mb_api.fetch_release_by_id(rel_id, includes=['recordings', 'artist-credits'])
+            release = rel_info['release']
 
             # Treat EVERY medium as its own independent candidate
-            for pos, medium in enumerate(rel_info.get('release', {}).get('medium-list', []), start=1):
-                medium_tracks = []
+            for pos, medium in enumerate(release.get('medium-list', []), start=1):
+                medium_tracks: list[MusicBrainzTrack] = []
                 for track in medium.get('track-list', []):
-                    medium_tracks.append({
-                        'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
-                        'duration_ms': int(track.get('recording', {}).get('length') or 0)
-                    })
+                    recording = track.get('recording')
+                    track_data: MusicBrainzTrack = {
+                        'title': sanitize_track_title(
+                            recording.get('title', 'Unknown Track') if recording else 'Unknown Track'
+                        ),
+                        'duration_ms': int(recording.get('length') or 0) if recording else 0
+                    }
+                    track_artist = _get_track_artist(track, recording)
+                    if track_artist is not None:
+                        track_data['track_artist'] = track_artist
+                    medium_tracks.append(track_data)
 
                 if medium_tracks:
                     candidates.append({
@@ -299,7 +316,7 @@ def fetch_metadata_for_releases(release_ids_and_dates: list[tuple[str, str]],
                         'medium_index': int(medium.get('position', pos)),
                         'tracks': medium_tracks
                     })
-        except mb.WebServiceError:
+        except mb_api.WebServiceError:
             continue
     logger.emit(f"[*] Metadata fetch complete. Found {len(candidates)} candidate MB mediums in release group.")
     return candidates
@@ -321,7 +338,7 @@ def sanitize_track_title(title: str) -> str:
     return pattern.sub('', title).strip()
 
 
-def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
+def extract_artist_from_musicbrainz_metadata(entity: ArtistCreditEntity) -> str:
     """
     Reconstructs the full artist credit string from MusicBrainz's parsed list format. MusicBrainz stores
     collaborations as lists of fragments (e.g., [{'name': 'Simon'}, {'joinphrase': ' & '}, {'name': 'Garfunkel'}]).
@@ -332,11 +349,12 @@ def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
         return credit
 
     if isinstance(credit, list):
-        full_name = ""
+        full_name = ''
         for fragment in credit:
             if isinstance(fragment, dict):
                 # 'name' is the literal text on the jacket; 'artist' is the DB entity
-                name = fragment.get('name') or fragment.get('artist', {}).get('name', '')
+                artist = fragment.get('artist')
+                name = fragment.get('name') or (artist.get('name', '') if artist else '')
                 join_phrase = fragment.get('joinphrase', '')
                 full_name += name + join_phrase
             elif isinstance(fragment, str):
@@ -344,6 +362,19 @@ def extract_artist_from_musicbrainz_metadata(entity: dict) -> str:
         return full_name.strip() or "Unknown"
 
     return "Unknown"
+
+
+def _get_track_artist(
+    track: ArtistCreditEntity,
+    recording: ArtistCreditEntity | None,
+) -> str | None:
+    for entity in (track, recording):
+        if entity is None or not entity.get('artist-credit'):
+            continue
+        artist = extract_artist_from_musicbrainz_metadata(entity)
+        if artist != "Unknown":
+            return artist
+    return None
 
 
 def _is_safe_match(expected: str, found: str) -> bool:
@@ -368,21 +399,33 @@ def fetch_metadata(mbid: str, medium_idx: int) -> MusicBrainzMetadata:
     """Fetches the metadata for a single medium of a release."""
     logger.emit(f"[*] Fetching metadata for MBID {mbid} (Medium {medium_idx})...")
 
-    rel_info = _fetch_release_by_id(mbid, includes=['recordings', 'artist-credits'])
-    medium_info: dict | None = next((m for m in rel_info.get('release', {}).get('medium-list', [])
-                                       if int(m.get('position', 1)) == medium_idx), None)
+    rel_info = mb_api.fetch_release_by_id(mbid, includes=['recordings', 'artist-credits'])
+    release = rel_info['release']
+    medium_info = next(
+        (m for m in release.get('medium-list', []) if int(m.get('position', 1)) == medium_idx),
+        None,
+    )
     if medium_info is None:
         raise ValueError(f"Medium {medium_idx} not found in release {mbid}.")
 
-    medium_tracks: list[MusicBrainzTrack] = [{
-        'title': sanitize_track_title(track.get('recording', {}).get('title', 'Unknown Track')),
-        'duration_ms': int(track.get('recording', {}).get('length') or 0)
-    } for track in medium_info.get('track-list', [])]
+    medium_tracks: list[MusicBrainzTrack] = []
+    for track in medium_info.get('track-list', []):
+        recording = track.get('recording')
+        track_data: MusicBrainzTrack = {
+            'title': sanitize_track_title(
+                recording.get('title', 'Unknown Track') if recording else 'Unknown Track'
+            ),
+            'duration_ms': int(recording.get('length') or 0) if recording else 0
+        }
+        track_artist = _get_track_artist(track, recording)
+        if track_artist is not None:
+            track_data['track_artist'] = track_artist
+        medium_tracks.append(track_data)
 
     metadata: MusicBrainzMetadata = {
-        'title': rel_info.get('release', {}).get('title', 'unknown'),
-        'artist': extract_artist_from_musicbrainz_metadata(rel_info.get('release', {})),
-        'year': rel_info.get('release', {}).get('date', 'Unknown')[:4],
+        'title': release.get('title', 'unknown'),
+        'artist': extract_artist_from_musicbrainz_metadata(release),
+        'year': release.get('date', 'Unknown')[:4],
         'mbid': mbid,
         'medium_index': medium_idx,
         'tracks': medium_tracks
@@ -392,10 +435,10 @@ def fetch_metadata(mbid: str, medium_idx: int) -> MusicBrainzMetadata:
     return metadata
 
 
-def generate_mb_art_urls(artist: str, album: str, mbid: str | None = None):
+def generate_mb_art_urls(artist: str, album: str, mbid: str | None = None) -> Iterator[str]:
     """ Yields candidate CoverArtArchive URLs in priority order. """
     logger.emit(f"[*] Searching MusicBrainz for {artist} - {album}...")
-    batches = []
+    batches: list[list[ReleaseSummary]] = []
 
     try:
         if mbid:
@@ -403,16 +446,23 @@ def generate_mb_art_urls(artist: str, album: str, mbid: str | None = None):
             batches.append([{'id': mbid, 'date': '9999'}])
 
             # 2. Get siblings
-            rel_info = _fetch_release_by_id(mbid, includes=["release-groups"])
-            rg_id = rel_info['release']['release-group']['id']
+            rel_info = mb_api.fetch_release_by_id(mbid, includes=["release-groups"])
+            release_group = rel_info['release'].get('release-group')
+            if release_group is None:
+                raise KeyError('release-group')
+            rg_id = release_group['id']
         else:
             # 3. No MBID, search by text
-            release_groups = _search_release_groups(artist=artist, releasegroup=album)
-            if release_groups['release-group-count'] == 0: return
+            release_groups = mb_api.search_release_groups(artist=artist, releasegroup=album)
+            if release_groups['release-group-count'] == 0:
+                return
             rg_id = release_groups['release-group-list'][0]['id']
 
         # Get all releases in the group
-        releases = _fetch_release_group_by_id(rg_id, includes=["releases"])['release-group']['release-list']
+        release_group = mb_api.fetch_release_group_by_id(rg_id, includes=["releases"])['release-group']
+        releases = release_group.get('release-list')
+        if releases is None:
+            raise KeyError('release-list')
 
         # Batch them by priority
         digital = [r for r in releases if r.get('status') == 'Official' and r.get('packaging') is None]
@@ -429,40 +479,11 @@ def generate_mb_art_urls(artist: str, album: str, mbid: str | None = None):
                 resp = requests.get(f"https://coverartarchive.org/release/{mb_id}", timeout=10)
                 if resp.status_code == 200:
                     logger.emit(f"  [+] Found CAA metadata for: {mb_id}")
-                    for img_entry in resp.json().get('images', []):
+                    response = cast(_CAAResponse, resp.json())
+                    for img_entry in response.get('images', []):
                         if img_entry.get('front'):
                             # YIELD pauses this function and hands the URL back to client, e.g., get_cover_art.py
                             yield img_entry['thumbnails'].get('1200') or img_entry['image']
 
-    except (mb.MusicBrainzError, KeyError, IndexError, requests.RequestException) as e:
+    except (mb_api.MusicBrainzError, KeyError, IndexError, requests.RequestException) as e:
         logger.emit(f"  [!] MusicBrainz/CAA API Error: {e}")
-
-
-@_retry_mb_api()
-def _fetch_release_by_id(rel_id: str, includes: list[str] | None = None) -> dict:
-    """Fetches a single release by ID with retry logic."""
-    return mb.get_release_by_id(rel_id, includes=includes or [])
-
-
-@_retry_mb_api()
-def _fetch_release_group_by_id(rg_id: str, includes: list[str] | None = None) -> dict:
-    """Fetches a release group by ID with retry logic."""
-    return mb.get_release_group_by_id(rg_id, includes=includes or [])
-
-
-@_retry_mb_api()
-def _search_releases(query: str, limit: int) -> dict:
-    """Executes a release search with retry logic."""
-    return mb.search_releases(query=query, limit=limit)
-
-
-@_retry_mb_api()
-def _search_release_groups(artist: str, releasegroup: str) -> dict:
-    """Searches for release groups with retry logic."""
-    return mb.search_release_groups(artist=artist, releasegroup=releasegroup)
-
-
-@_retry_mb_api()
-def _browse_releases(rg_id: str, limit: int, offset: int) -> dict:
-    """Fetches a paginated list of releases with retry logic."""
-    return mb.browse_releases(release_group=rg_id, includes=['media'], limit=limit, offset=offset)

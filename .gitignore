@@ -24,3 +24,6 @@ output_library/
 
 # --- JetBrains / PyCharm ---
 .idea/
+
+# --- VS Code ---
+.vscode/

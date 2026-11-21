@@ -14,7 +14,10 @@ from __future__ import annotations
 
 __version__ = "1.0B4.1"
 
-__all__ = ['rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan']
+__all__ = [
+    'rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan',
+    'RipPlanRevision'
+]
 
 import argparse
 import atexit
@@ -43,7 +46,7 @@ import logger
 import makemkv_updater
 from music_brainier import MusicBrainzMetadata, MusicBrainzTrack, get_best_mb_candidate, fetch_candidate_metadata, \
     fetch_metadata
-from util import _clean_path_arg
+from util import clean_path_arg
 
 
 # --- (1) Metadata & Utils ---
@@ -54,6 +57,34 @@ class MkvChapter(TypedDict):
     start_time: float
     end_time: float
     title: str
+
+
+class FFprobeStream(TypedDict, total=False):
+    index: int
+    channels: int
+    codec_name: str
+    codec_type: str
+    profile: str
+    channel_layout: str
+    tags: dict[str, str]
+
+
+class FFprobeChapter(TypedDict, total=False):
+    id: int
+    start_time: str
+    end_time: str
+    tags: dict[str, str]
+
+
+class FFprobeFormat(TypedDict, total=False):
+    duration: str
+
+
+class FFprobeOutput(TypedDict, total=False):
+    streams: list[FFprobeStream]
+    chapters: list[FFprobeChapter]
+    format: FFprobeFormat
+
 
 def seconds_to_cue(seconds: float) -> str:
     """Converts seconds to MM:SS:FF for gapless CUE sheets."""
@@ -67,8 +98,13 @@ def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: MusicBrainzMe
         f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\n'
                 f'REM DATE {info.get("year", "Unknown")}\nFILE "{audio_file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
-            title = mb_tracks[i]['title'] if i < len(mb_tracks) else f"Track {i + 1}"
-            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n    INDEX 01 {seconds_to_cue(ch["start_time"])}\n')
+            track = mb_tracks[i] if i < len(mb_tracks) else None
+            title = track['title'] if track is not None else f"Track {i + 1}"
+            f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n')
+            track_artist = track.get('track_artist') if track is not None else None
+            if track_artist and track_artist != info['artist']:
+                f.write(f'    PERFORMER "{track_artist}"\n')
+            f.write(f'    INDEX 01 {seconds_to_cue(ch["start_time"])}\n')
 
 
 def _parse_makemkv_msg(line: str) -> str | None:
@@ -123,7 +159,16 @@ def _ensure_writable(path: Path) -> None:
 
 # --- (2) The Plumbing - subprocess cleanup and output beautification ---
 
-def _process_output_line(line: str, output_acc: list[str], env: dict):
+@dataclass
+class ExecutionContext:
+    """Configuration and mutable parser state for one command execution."""
+    ffmpeg_duration: float = 0.0
+    ffmpeg_time_offset: float = 0.0
+    ffmpeg_prefix: str = "Remuxing"
+    is_extracting: bool = False
+
+
+def _process_output_line(line: str, output_acc: list[str], context: ExecutionContext) -> None:
     """Process the given line of output from a subprocess and emit the processed output to the logger."""
     line = line.rstrip('\r\n')
     if not line: return
@@ -132,7 +177,7 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
 
     # Latch Trigger for MakeMKV
     if "PRGC:5017" in line:
-        env["is_extracting"] = True
+        context.is_extracting = True
 
     # [1] MakeMKV Progress
     if "PRG" in line:
@@ -141,14 +186,13 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
                 parts = line.split(":")[1].split(",")
                 current, max_val = float(parts[0]), float(parts[2])
 
-                if max_val > 0 and env.get("is_extracting"):
+                if max_val > 0 and context.is_extracting:
                     pct = (current / max_val) * 100
                     if 0 <= pct <= 100:
                         logger.emit(f"    Extraction: {pct:.1f}%", is_progress=True)
             except (IndexError, ValueError):
                 pass
 
-        env["last_was_progress"] = True
         return
 
     # [2] ffmpeg Progress
@@ -161,23 +205,22 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
 
             clean_stats = line.strip().replace("frame=", "")
 
-            total = env.get("ffmpeg_duration", 0)
-            offset = env.get("ffmpeg_time_offset", 0.0)
+            total = context.ffmpeg_duration
+            offset = context.ffmpeg_time_offset
 
             if total > 0:
                 pct = ((current_seconds + offset) / total) * 100
                 pct = min(pct, 100.0)  # Clamp to 100% just in case
 
                 # Allow dynamic prefix for different stages (Slicing vs. Remuxing)
-                prefix = env.get("ffmpeg_prefix", "Remuxing")
+                prefix = context.ffmpeg_prefix
                 logger.emit(f"{prefix}: [{pct:.1f}%] {clean_stats}", is_progress=True)
             else:
-                prefix = env.get("ffmpeg_prefix", "Remuxing")
+                prefix = context.ffmpeg_prefix
                 logger.emit(f"{prefix}: {clean_stats}", is_progress=True)
         except (ValueError, IndexError):
             pass
 
-        env["last_was_progress"] = True
         return
 
     # [3] mkvmerge Progress
@@ -190,7 +233,6 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
         except ValueError:
             pass
 
-        env["last_was_progress"] = True
         return
 
     # [4] Normal Output
@@ -201,14 +243,13 @@ def _process_output_line(line: str, output_acc: list[str], env: dict):
         elif not line.startswith(("DRV:", "TDRV:", "CIDC:", "SINFO:", "TINFO:", "CINFO:", "TCOUNT:")):
             logger.emit(line)
 
-        env["last_was_progress"] = False
 
-
-def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None, suppress_summary: bool = False) -> str:
+def run_command(cmd: list[str], desc: str | None = None, context: ExecutionContext | None = None,
+                suppress_summary: bool = False) -> str:
     """
     Synchronously executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
-    Accepts an optional environment dict to pass state (such as album duration) to the output parser.
+    Accepts optional context for progress formatting and parser state.
     This method is aggressively single-threaded. Don't even think about running it in multiple threads.
     """
     global _active_subprocess
@@ -216,11 +257,8 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
     if desc: logger.emit(f"[*] {desc}...")
     logger.emit(f"[*] Command: {cmd}")
 
-    if env is None: env = {}
-
-    # Initialize parser state keys
-    env.setdefault("last_was_progress", False)
-    env.setdefault("is_extracting", False)
+    if context is None:
+        context = ExecutionContext()
 
     start_time = time.time()
     hide_console_flag = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -229,10 +267,10 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
     _active_subprocess = process
 
     try:
-        output_acc = []
+        output_acc: list[str] = []
         if process.stdout:  # Will always be satisfied, but PyCharm doesn't know it
             for line in process.stdout:
-                _process_output_line(line, output_acc, env)
+                _process_output_line(line, output_acc, context)
 
         process.wait()
     except:
@@ -250,11 +288,11 @@ def run_command(cmd: list[str], desc: str | None = None, env: dict | None = None
         raise RuntimeError(f"Command failed (Code {process.returncode}): {' '.join(cmd)}")
 
     if not suppress_summary:
-        emit_summary_log(output_acc, start_time, env)
+        emit_summary_log(output_acc, start_time, context)
     return "\n".join(output_acc)
 
 
-def emit_summary_log(entire_log: list[str], start_time: float, env: dict | None = None):
+def emit_summary_log(entire_log: list[str], start_time: float, context: ExecutionContext) -> None:
     """Emits to the logger a summary of a completed task based on the given log and start time."""
     elapsed = time.time() - start_time
     # 1. Search backwards through the accumulated log for ffmpeg's final stats
@@ -262,7 +300,7 @@ def emit_summary_log(entire_log: list[str], start_time: float, env: dict | None 
 
     if final_stats:
         clean_stats = final_stats.strip().replace("frame=", " ")
-        action = "Slice" if env and env.get("ffmpeg_prefix") == "Slicing" else "Remux"
+        action = "Slice" if context.ffmpeg_prefix == "Slicing" else "Remux"
         summary = f"[+] {action} finished in {elapsed:.1f}s -> {clean_stats}"
     else:
         summary = f"[+] Task finished in {elapsed:.1f} seconds."
@@ -281,13 +319,13 @@ class TitleInfo:
     duration: str = "Unknown"
     duration_sec: float = 0.0
     size_str: str = "Unknown"
-    streams: dict[int, str] = field(default_factory=dict)
-    atmos_streams: set[int] = field(default_factory=set)
+    streams: dict[int, str] = field(default_factory=dict) # pyright: ignore[reportUnknownVariableType]
+    atmos_streams: set[int] = field(default_factory=set) # pyright: ignore[reportUnknownVariableType]
 
 
 def parse_makemkv_info(res: str) -> dict[str, TitleInfo]:
     """Parses the raw text output of 'makemkvcon info' into a dictionary of TitleInfo objects."""
-    titles = defaultdict(TitleInfo)
+    titles: defaultdict[str, TitleInfo] = defaultdict(TitleInfo)
 
     for line in res.splitlines():
         parts = line.split(",")
@@ -414,8 +452,8 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
             logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
 
     # Find all input titles with the same track count as a candidate MusicBrainz releases
+    valid_titles: list[tuple[str, MusicBrainzMetadata | None]] = []
     if candidates:
-        valid_titles = []
         for title_index, info in titles.items():
             if info.score <= 0:
                 logger.emit(f"    [-] Rejected Title {title_index} (No valid audio stream detected)")
@@ -434,7 +472,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
 
     # noinspection PyShadowingNames
-    def sort_key(item: tuple[str, dict | None]) -> tuple[int, int, int, int]:
+    def sort_key(item: tuple[str, MusicBrainzMetadata | None]) -> tuple[int, int, int, int]:
         """Sort criterion: (Format Penalty, Duration Penalty, MB Rank, -Size)"""
         t_idx, matched_candidate = item
 
@@ -460,7 +498,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
                 duration_penalty = int(abs(title_sec - (mb_dur_ms / 1000.0)) // 120)
 
         # 3. Relevance: Index in the MusicBrainz search results (0 is best, 999 if MB is offline)
-        mb_rank = candidates.index(matched_candidate) if matched_candidate in candidates else 999
+        mb_rank = candidates.index(matched_candidate) if matched_candidate is not None and matched_candidate in candidates else 999
 
         # 4. Size: Negated so that larger files sort first when using min()
         size = titles[t_idx].size
@@ -470,11 +508,10 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
     logger.emit("\n[*] Finding best title match across all input titles:")
     valid_titles.sort(key=sort_key)
     for i, vt in enumerate(valid_titles):
-        title_index, matched_candidate = vt
+        title_index, mc = vt
         format_penalty, duration_penalty, mb_rank, neg_size = sort_key(vt)
         bullet = "*" if i == 0 else "-"
-        if matched_candidate is not None:
-            mc = cast(dict, cast(object, matched_candidate))  # Re-anchors the type for PyCharm, whose typechecker is dumb
+        if mc is not None:
             logger.emit(f"    {bullet}  Title {title_index} [{mc['title']} ({mc.get('year', 'Unknown')})]"
                     f" [MBID {mc.get('mbid', 'None')} ({mc.get('medium_index', 1)})]"
                     f" [Scores: Format={format_penalty}, Duration={duration_penalty}, Rank={mb_rank}, Size={neg_size}]")
@@ -526,7 +563,7 @@ class Toolset:
         makemkv_updater.main()
 
         # 2. Check for missing binaries
-        missing = []
+        missing: list[str] = []
         if not self.FFMPEG: missing.append("FFmpeg")
         if not self.FFPROBE: missing.append("FFprobe")
         if not self.MKVMERGE: missing.append("MKVMerge")
@@ -574,17 +611,17 @@ class Toolset:
 
 
 # Global singleton placeholder
-TOOLS: Toolset = cast(Toolset, cast(Any, None)) # Whatever it takes...
+TOOLS: Toolset = cast(Toolset, cast(Any, None)) # Whatever it takes to shut up the static analyzer...
 
 
 def init(fatal_error_handler: Callable[[str], None] | None = None) -> None:
     """
-    Initializes this module. Must be called by the frontend before ripping. This method ensures that the tools that
-    are required for the operation of this module are present and functional. Inf not, it calls the fatal error handler,
+    Initializes this module. Must be called by the frontend before ripping. This method ensures that the tools
+    required for the operation of this module are present and functional. If not, it calls the fatal error handler,
     which is responsible for displaying the error to the user and terminating the application.
     """
     global TOOLS
-    TOOLS = Toolset(fatal_error_handler)
+    TOOLS = Toolset(fatal_error_handler) # pyright: ignore[reportConstantRedefinition]
 
     import music_brainier # Local import to avoid circular dependencies
     music_brainier.init(__version__)
@@ -629,15 +666,18 @@ def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: 
     res = run_command(cmd, "Scanning for Atmos Stream")
 
     try:
-        streams: list[dict[str, Any]] = json.loads(res).get('streams', [])
+        probe_data: FFprobeOutput = json.loads(res)
+        streams: list[FFprobeStream] = probe_data.get('streams', [])
         if not streams:
             return None
 
-        valid_streams = [s for s in streams if s.get('codec_name', '').lower() in [preferred_codec, "eac3", "ac3"]]
+        valid_streams: list[FFprobeStream] = [
+            s for s in streams if s.get('codec_name', '').lower() in [preferred_codec, "eac3", "ac3"]
+        ]
         if not valid_streams:
             return None
 
-        def stream_sort_key(s):
+        def stream_sort_key(s: FFprobeStream) -> tuple[int, int, int]:
             """Sort criterion: (Format Penalty, -Channels, Index)"""
             idx = int(s.get('index', 999))
             codec = s.get('codec_name', '').lower()
@@ -669,7 +709,7 @@ def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: 
                         f"[Scores: Format={fmt_pen}, Channels={neg_chan}, Index={s_idx}]")
 
         best_stream = valid_streams[0]
-        best_idx = int(best_stream['index'])
+        best_idx = int(best_stream.get('index', 999))
         best_codec = best_stream.get('codec_name', 'unknown')
         best_channels = best_stream.get('channels', 'unknown')
 
@@ -700,9 +740,10 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
 
     res = run_command(cmd, "Scanning for Lossless Multichannel Stream")
     try:
-        streams = json.loads(res).get('streams', [])
+        probe_data: FFprobeOutput = json.loads(res)
+        streams: list[FFprobeStream] = probe_data.get('streams', [])
         lossless_codecs = {'truehd', 'pcm_s16le', 'pcm_s24le', 'pcm_s24be', 'mlp', 'alac', 'flac'}
-        valid_streams = []
+        valid_streams: list[FFprobeStream] = []
 
         for s in streams:
             codec = s.get('codec_name', '').lower()
@@ -718,7 +759,7 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
             return None
 
         # noinspection shadowing-names
-        def mc_sort_key(s):
+        def mc_sort_key(s: FFprobeStream) -> tuple[int, int, int, int]:
             """Sort criterion: (Atmos Penalty, -IsMultichannel, -Channels, Index)"""
             profile = s.get('profile', '').lower()
             channels = int(s.get('channels', 0))
@@ -739,7 +780,7 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
                         f"[Scores: AtmosPen={is_atmos}, Multi={-neg_multi}, Channels={neg_chan}, Index={s_idx}]")
 
         best_stream = valid_streams[0]
-        best_idx = int(best_stream['index'])
+        best_idx = int(best_stream.get('index', 999))
         best_channels = int(best_stream.get('channels', 0))
 
         logger.emit(
@@ -755,11 +796,12 @@ def extract_chapters_and_duration_from_mkv(mkv_path: Path) -> tuple[list[MkvChap
     cmd = [TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json", "-show_chapters", "-show_format", str(mkv_path)]
     res = run_command(cmd, "Extracting Chapter Markers")
     try:
-        data = json.loads(res)
+        data: FFprobeOutput = json.loads(res)
         duration = float(data.get('format', {}).get('duration', 0))
 
         chapters: list[MkvChapter] = []
-        for ch in data.get('chapters', []):
+        probe_chapters: list[FFprobeChapter] = data.get('chapters', [])
+        for ch in probe_chapters:
             chapters.append({
                 'id': int(ch.get('id', 0)),
                 'start_time': float(ch.get('start_time', 0.0)),
@@ -816,7 +858,7 @@ _active_subprocess: subprocess.Popen[str] | None = None  # Tracks the currently 
 
 def _nuke_dir(path: Path) -> None:
     """ Deletes the given directory with extreme prejudice, even if other processes have it locked. """
-    for attempt in range(5):  # If at first you don't succeed, try a few more times because Windows is like that
+    for _ in range(5):  # If at first you don't succeed, try a few more times because Windows is like that
         try:
             shutil.rmtree(path, ignore_errors=True)
             if not path.exists():
@@ -892,7 +934,7 @@ class AcquisitionResult:
     mkv_src_spec: str | None  # The formatted MakeMKV target (e.g., "disc:0"), or None if MakeMKV was bypassed
 
 
-def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: str) -> AcquisitionResult:
+def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, output_container: Container) -> AcquisitionResult:
     """Acquires the master MKV file, extracts its chapter timings and duration, and fetches its MusicBrainz metadata.
 
     Handles polymorphic source inputs (optical disc indices, ISOs, BDMV folders, standalone MKVs,
@@ -902,7 +944,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
         src_path: The physical or virtual path to the source material.
         artist: The requested album artist, used for metadata querying.
         album: The requested album title, used for metadata querying.
-        output_container: The target output file extension (e.g., ".m4a", ".flac"), used to determine
+        output_container: The target output format (e.g., "m4a", "flac"), used to determine
             if a legacy lossless rip is explicitly requested.
 
     Returns: The master file and its metadata
@@ -912,7 +954,7 @@ def get_mkv_master_file_and_metadata(src_path: str, artist: str, album: str, out
     if source_spec:
         # Handle formats that require MakeMKV rips (Blu-rays, Blu-ray images, Blu-ray backup directories)
         title_idx, matched_candidate, atmos_streams, disc_topology = (
-            find_primary_title(source_spec, artist, album, output_container == ".flac"))
+            find_primary_title(source_spec, artist, album, output_container == Container.FLAC))
         atmos_mkv = rip_title_to_mkv(source_spec, TMP_DIR, title_idx)
         chapters, duration = extract_chapters_and_duration_from_mkv(atmos_mkv)
     else:
@@ -950,10 +992,10 @@ def generate_topology_from_mkv(mkv_path: Path) -> dict[str, TitleInfo]:
         "-show_format", "-show_streams", "-show_chapters", str(mkv_path)
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
-    probe_data = json.loads(result.stdout)
+    probe_data: FFprobeOutput = json.loads(result.stdout)
 
     # 2. Parse the chapters
-    chapters = probe_data.get("chapters", [])
+    chapters: list[FFprobeChapter] = probe_data.get("chapters", [])
     chapter_count = len(chapters)
 
     # 3. Parse the duration (Safely cast string -> float -> int)
@@ -966,12 +1008,14 @@ def generate_topology_from_mkv(mkv_path: Path) -> dict[str, TitleInfo]:
         duration_sec = 0
 
     # 4. Parse the audio streams
-    streams = {}
+    streams: dict[int, str] = {}
     atmos_streams: set[int] = set()
 
     for stream in probe_data.get("streams", []):
         if stream.get("codec_type") == "audio":
             idx = stream.get("index")
+            if idx is None:
+                continue
             codec = stream.get("codec_name", "unknown")
             channels = stream.get("channels", 2)
             layout = stream.get("channel_layout")
@@ -1030,7 +1074,13 @@ def _resolve_makemkv_src_spec(src: str) -> str | None:
     return None
 
 
-def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_artist: str, year: str, cover_path: Path):
+def _tag_flac_files(
+    flac_files: list[tuple[Path, MusicBrainzTrack, int]],
+    album: str,
+    album_artist: str,
+    year: str,
+    cover_path: Path,
+) -> None:
     """Injects metadata and cover art into the sliced FLAC files."""
     logger.emit("[*] Applying metadata and embedded artwork to FLAC files...")
 
@@ -1048,23 +1098,23 @@ def _tag_flac_files(flac_files: list[tuple[Path, dict, int]], album: str, album_
         audio = FLAC(filepath)
 
         # Clear existing tags just in case FFmpeg pulled garbage from the MKV
-        audio.delete()
+        audio.delete() # pyright: ignore[reportUnknownMemberType]
 
         # Inject standard tags
         audio['title'] = track_data['title']
-        audio['artist'] = track_data.get('artist', album_artist)
+        audio['artist'] = track_data.get('track_artist') or album_artist
         audio['albumartist'] = album_artist
         audio['album'] = album
         audio['date'] = str(year)
         audio['tracknumber'] = str(track_num)
         audio['totaltracks'] = str(len(flac_files))
         if pic:
-            audio.add_picture(pic)
+            audio.add_picture(pic) # pyright: ignore[reportUnknownMemberType]
 
-        audio.save()
+        audio.save() # pyright: ignore[reportUnknownMemberType]
 
 
-def _log_prologue(album: str, artist: str, output_container: str, preferred_codec: str, src_path: str):
+def _log_prologue(album: str, artist: str, output_container: Container, preferred_codec: Codec, src_path: str):
     """Emit rip prologue to logger (to enhance readability of log file in isolation)"""
     logger.emit("=== Carat Rip Log ===")
     start_time_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
@@ -1089,23 +1139,24 @@ class AudioProfile(NamedTuple):
 
     Attributes:
         stream_idx (int): The FFmpeg stream index of the selected audio stream in the master file.
-        container (str): The target file extension for the output (e.g., '.m4a', '.flac').
+        container (Container): The target output format.
         suffix (str): The descriptive tag appended to the final filename (e.g., '(Atmos)', '(Surround)').
             For stereo tracks, this will be the empty string.
     """
     stream_idx: int
-    container: str
+    container: Container
     suffix: str
 
 
-def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_container: str, preferred_codec: str) -> AudioProfile:
+def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_container: Container,
+                          preferred_codec: Codec) -> AudioProfile:
     """
     Scans the master MKV and determines the optimal audio stream and output format.
     Will automatically fall back to lossless FLAC slicing if Atmos is requested but unavailable.
     """
 
     # 1. Attempt Atmos (if permitted by the user)
-    if requested_container != ".flac":
+    if requested_container != Container.FLAC:
         idx = find_atmos_stream(master_mkv, atmos_streams, preferred_codec)
         if idx is not None:
             return AudioProfile(stream_idx=idx, container=requested_container, suffix=" (Atmos)")
@@ -1129,7 +1180,7 @@ def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_c
         # Catches 3.0, 5.0, 5.1, 7.1, etc.
         suffix = " (Surround)"
 
-    return AudioProfile(stream_idx=idx, container=".flac", suffix=suffix)
+    return AudioProfile(stream_idx=idx, container=Container.FLAC, suffix=suffix)
 
 
 @dataclass
@@ -1149,7 +1200,7 @@ class RipContext:
 
 def _assemble_gapless_album(ctx: RipContext) -> None:
     """Handles the FFmpeg remuxing for gapless M4A or MKV containers."""
-    final_audio_name = f"{ctx.clean_album}{ctx.profile.suffix}{ctx.profile.container}"
+    final_audio_name = f"{ctx.clean_album}{ctx.profile.suffix}.{ctx.profile.container}"
 
     if ctx.tracks:
         ctx.chapters = ctx.chapters[:len(ctx.tracks)]
@@ -1168,27 +1219,25 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
     if mbid:
         cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
 
-    if ctx.profile.container == ".m4a":
+    if ctx.profile.container == Container.M4A:
         cmd.extend(["-f", "mp4", "-movflags", "+faststart", "-strict", "-2"])
     else:
         cmd.extend(["-f", "matroska"])
 
     cmd.extend(["-fflags", "+genpts", "-map_chapters", "-1", "-y", str(ctx.dest / final_audio_name)])
 
-    run_command(cmd, f"Finalizing{ctx.profile.suffix} {ctx.profile.container[1:].upper()}",
-                {"ffmpeg_duration": ctx.duration})
+    run_command(cmd, f"Finalizing{ctx.profile.suffix} {ctx.profile.container.upper()}",
+                context=ExecutionContext(ffmpeg_duration=ctx.duration))
 
-def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
+def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, MusicBrainzTrack, int]]:
     """Handles slicing the master MKV into individual FLAC tracks."""
     logger.emit(f"[*] Slicing tracks to FLAC{ctx.profile.suffix}...")
-    if ctx.profile.stream_idx is None:
-        raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
 
-    flac_files = []
+    flac_files: list[tuple[Path, MusicBrainzTrack, int]] = []
     for i, (track, chapter) in enumerate(zip(ctx.tracks, ctx.chapters)):
         track_num = i + 1
         safe_title = _sanitize_filename(track['title'])
-        out_filename = f"{track_num:02d} {safe_title}.flac"
+        out_filename = f"{track_num:02d} {safe_title}.{Container.FLAC}"
         out_path = ctx.dest / out_filename
         flac_files.append((out_path, track, track_num))
 
@@ -1204,12 +1253,12 @@ def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, dict, int]]:
             str(out_path)
         ]
 
-        env = {
-            "ffmpeg_duration": ctx.duration,
-            "ffmpeg_time_offset": start_time,
-            "ffmpeg_prefix": "Slicing"
-        }
-        run_command(cmd, f"Extracting track {track_num} from MKV master ({track['title']})", env)
+        context = ExecutionContext(
+            ffmpeg_duration=ctx.duration,
+            ffmpeg_time_offset=start_time,
+            ffmpeg_prefix="Slicing"
+        )
+        run_command(cmd, f"Extracting track {track_num} from MKV master ({track['title']})", context=context)
 
     return flac_files
 
@@ -1218,14 +1267,16 @@ class Container(StrEnum):
     """
     Container formats supported by Carat.
 
+    Enum values omit the filename's leading period; add it when constructing a filename.
+
     Attributes:
         M4A: The standard MPEG-4 audio container (typically used for Atmos/MP4).
         MKV: The Matroska multimedia container (typically used for pure lossless extraction).
         FLAC: The Free Lossless Audio Codec container (used only for legacy, non-Atmos recordings).
     """
-    M4A = ".m4a"
-    MKV = ".mkv"
-    FLAC = ".flac"
+    M4A = "m4a"
+    MKV = "mkv"
+    FLAC = "flac"
 
 
 class Codec(StrEnum):
@@ -1266,7 +1317,7 @@ def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
     three possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos
     (lossy), and AC-3 Surround (not Atmos!).
 
-    If output_container is ".flac", or it's another value but the input does not contain an Atmos stream,
+    If output_container is Container.FLAC, or it's another value but the input does not contain an Atmos stream,
     carat will find the "best" lossless stream and rip it into a collection of flac files (with tags and
     no cue sheet). By "best," we mean the stream with the most channels or if there is a tie, the one
     with the most bytes (total length).
@@ -1289,7 +1340,7 @@ def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
         artist: The requested album artist (used for metadata fetching).
         album: The requested album title (used for metadata fetching).
         library_root: The destination directory for the processed album.
-        output_container: The target container format (.m4a, .mkv, or .flac).
+        output_container: The target container format (m4a, mkv, or flac).
         preferred_codec: The target Atmos codec (truehd, eac3, or ac3).
 
     Returns:
@@ -1325,7 +1376,7 @@ def prepare_album_rip(src: str, artist: str, album: str, library_root: str,
             artist: The requested album artist.
             album: The requested album title.
             library_root: The destination directory, verified for write access.
-            output_container: The target container format (.m4a, .mkv, or .flac).
+            output_container: The target container format (m4a, mkv, or flac).
             preferred_codec: The target Atmos codec (truehd, eac3, or ac3).
 
         Returns:
@@ -1426,38 +1477,41 @@ def execute_album_rip(plan: RipPlan) -> bool:
     profile = plan.audio_profile
     artist = plan.artist
     album = plan.album
+    internals = plan._internals # pyright: ignore[reportPrivateUsage]
     info = matched_candidate or MusicBrainzMetadata(title=album, artist=artist, year='unknown', mbid='unknown', medium_index=1, tracks=[])
-    log_dest = plan._internals.log_dest_path
+    log_dest = internals.log_dest_path
     dest = log_dest.parent
     logger.emit(f"[+] Executing Rip for: {artist} - {album}")
 
     try:
         dest.mkdir(parents=True, exist_ok=True)
         ctx = RipContext(
-            master_mkv=plan._internals.master_mkv_path, dest=dest, artist=artist, album=album,
-            clean_album=(_sanitize_filename(album)), profile=profile, duration=plan._internals.duration, info=info,
-            chapters=plan._internals.chapters, tracks=(matched_candidate.get('tracks', []) if matched_candidate else [])
+            master_mkv=internals.master_mkv_path, dest=dest, artist=artist, album=album,
+            clean_album=(_sanitize_filename(album)), profile=profile, duration=internals.duration, info=info,
+            chapters=internals.chapters, tracks=(matched_candidate.get('tracks', []) if matched_candidate else [])
         )
 
         # Execute Assembly (Concurrent)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
             cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, info.get('mbid'))
 
-            if profile.container != ".flac":
-                _assemble_gapless_album(ctx)
-            else:
+            is_flac = profile.container == Container.FLAC
+            flac_files: list[tuple[Path, MusicBrainzTrack, int]] = []
+            if is_flac:
                 flac_files = _extract_flac_tracks(ctx)
+            else:
+                _assemble_gapless_album(ctx)
 
             try:
                 cover_future.result(timeout=45)
             except (concurrent.futures.TimeoutError, Exception):
                 pass
 
-            if profile.container == ".flac":
+            if is_flac:
                 _tag_flac_files(flac_files, album, artist, info.get('year', 'Unknown'), dest / "cover.jpg")
 
         logger.emit(f"\n[+] Ingestion Complete: {album}")
-        logger.emit(f"[+] Total elapsed time: {(time.time() - plan._internals.ingestion_start_time):.1f} seconds.")
+        logger.emit(f"[+] Total elapsed time: {(time.time() - internals.ingestion_start_time):.1f} seconds.")
     finally:
         logger.close_log_file(log_dest)
 
@@ -1478,7 +1532,7 @@ class _RipPlanInternals:
         lib_path: The verified target base directory for the user's music library.
         src: The original source provided by user (for accurate logging)
         mkv_src_spec: # The validated MakeMKV target (used for re-extraction), or None if MKV extraction bypassed.
-        output_container: The requested target file extension (e.g., '.m4a', '.flac')
+        output_container: The requested target container format (m4a, mkv, or flac)
         ingestion_start_time: The epoch timestamp when the preparation phase began,
             used for calculating total pipeline duration.
         makemkv_streams: A set of absolute stream indices that MakeMKV explicitly
@@ -1491,11 +1545,34 @@ class _RipPlanInternals:
     lib_path: Path
     src: str
     mkv_src_spec: str | None
-    output_container: str
+    output_container: Container
     ingestion_start_time: float
     makemkv_streams: set[int]
     duration: float
     chapters: list[MkvChapter]
+
+
+@dataclass(frozen=True)
+class RipPlanRevision:
+    """A blueprint for modifying a rip plan.
+
+    Constructed from the user's requested changes and passed to `RipPlan.revise`.
+
+    Attributes:
+        title_idx: The MakeMKV index of the selected title.
+        stream_idx: The absolute MakeMKV/FFmpeg index of the selected audio stream.
+        mbid: The MusicBrainz Release ID for the selected metadata.
+        medium_idx: The selected medium number within the MusicBrainz release.
+        artist: The artist name to use in the revised plan.
+        album: The album title to use in the revised plan.
+    """
+    title_idx: str
+    stream_idx: int
+    mbid: str
+    medium_idx: int
+    artist: str
+    album: str
+
 
 @dataclass(frozen=True)
 class RipPlan:
@@ -1527,22 +1604,16 @@ class RipPlan:
         """Returns the fully resolved Path object for the final destination directory."""
         return self._internals.log_dest_path.parent
 
-    def revise(self, new_title_idx: str, new_stream_idx: int, new_mbid: str, new_medium_idx: int,
-               new_artist: str, new_album: str, start_new_log: bool = True) -> 'RipPlan':
+    def revise(self, revision: RipPlanRevision, start_new_log: bool = True) -> 'RipPlan':
         """
         Validates user overrides, fetches revised metadata, and generates a new extraction plan.
 
-        If the `new_title_idx` differs from the current plan, this method will validate the target chapter counts
+        If `revision.title_idx` differs from the current plan, this method will validate the target chapter counts
         against the cached disc topology. If the validation passes, it performs a synchronous physical extraction of
         the new title from the source drive to replace the temporary master MKV file.
 
          Args:
-             new_title_idx: The MakeMKV index of the newly selected Blu-ray title.
-             new_stream_idx: The absolute MakeMKV/FFmpeg index of the selected audio stream.
-             new_mbid: The MusicBrainz Release ID (MBID) for the desired metadata.
-             new_medium_idx: The specific medium (disc) number within the MusicBrainz release.
-             new_artist: Artist to be substituted (locally) for the one obtained from MusicBrainz.
-             new_album: Album title to be substituted (locally) for the one obtained from MusicBrainz.
+             revision: The requested title, stream, metadata, artist, and album changes.
              start_new_log: Whether to start a new log file for the revision or continue using the existing one.
 
          Returns:
@@ -1554,6 +1625,13 @@ class RipPlan:
              TrackMismatchError: If the chapter count of the newly selected physical title does
                  not perfectly match the track count of the selected metadata.
          """
+
+        new_title_idx = revision.title_idx
+        new_stream_idx = revision.stream_idx
+        new_mbid = revision.mbid
+        new_medium_idx = revision.medium_idx
+        new_artist = revision.artist
+        new_album = revision.album
 
         # ==========================================
         # 1. STATE DIFFING
@@ -1642,10 +1720,10 @@ class RipPlan:
         suffix = _suffix_for_stream_desc(stream_desc)
 
         is_atmos_stream = (new_stream_idx in new_atmos_streams)
-        if is_atmos_stream and internals.output_container != ".flac":
+        if is_atmos_stream and internals.output_container != Container.FLAC:
             final_container = internals.output_container
         else:
-            final_container = ".flac"
+            final_container = Container.FLAC
 
         new_profile = AudioProfile(
             stream_idx=new_stream_idx,
@@ -1732,12 +1810,12 @@ def main():
     init()
 
     got_metadata = rip_album_to_library(
-        _clean_path_arg(args.source),
+        clean_path_arg(args.source),
         args.artist,
         args.album,
-        _clean_path_arg(args.library_root),
-        output_container=f".{args.output_container}",
-        preferred_codec=args.preferred_codec
+        clean_path_arg(args.library_root),
+        output_container=Container(args.output_container),
+        preferred_codec=Codec(args.preferred_codec)
     )
 
     if not got_metadata:

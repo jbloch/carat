@@ -40,6 +40,6 @@ def normalize_for_fuzzy_comparison(s: str) -> str:
     return re.sub(r'\s+', ' ', s).strip()
 
 
-def _clean_path_arg(arg: str) -> str:
+def clean_path_arg(arg: str) -> str:
     """Strips rogue literal quotes caused by Windows shell path escaping."""
     return arg.strip('"')

@@ -20,7 +20,7 @@ import tkinter as tk
 from enum import Enum
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from typing import Any
+from typing import Any, Literal
 
 from PIL import Image, ImageTk
 
@@ -29,7 +29,13 @@ import logger
 import music_brainier
 from carat import Codec, Container
 from music_brainier import MusicBrainzMetadata
-from util import _clean_path_arg
+from util import clean_path_arg
+
+_ActionEvent = tuple[Literal["REVIEW", "SUFFIX"], carat.RipPlan]
+_DoneEvent = (
+    tuple[Literal["SUCCESS"], carat.RipPlan]
+    | tuple[Literal["FAIL"], carat.RipPlan | None]
+)
 
 CONFIG_FILE = Path.home() / ".carat_config.json"
 
@@ -82,7 +88,7 @@ class CaratGUI:
                 try:
                     # Extract the path from the end of the log message
                     path_str = msg.split("cover to")[1].strip()
-                    self.art_queue.put(path_str)
+                    self.art_queue.put(Path(path_str))
                 except IndexError:
                     pass
 
@@ -104,11 +110,11 @@ class CaratGUI:
         self.config = self._load_config()
 
         # Initialize thread-safe queues
-        self.log_queue = queue.Queue()
-        self.progress_queue = queue.Queue()
-        self.status_queue = queue.Queue()
-        self.art_queue = queue.Queue()
-        self.done_queue = queue.Queue()
+        self.log_queue: queue.Queue[str] = queue.Queue()
+        self.progress_queue: queue.Queue[float] = queue.Queue()
+        self.status_queue: queue.Queue[str] = queue.Queue()
+        self.art_queue: queue.Queue[Path] = queue.Queue()
+        self.done_queue: queue.Queue[_DoneEvent] = queue.Queue()
 
         # Initialize state variables
         self.current_cover_path = None
@@ -116,9 +122,10 @@ class CaratGUI:
         logger.init(self._log_callback)
 
         # Initialize variables used by rip-plan revision dialog
-        self.action_queue = queue.Queue()
+        self.action_queue: queue.Queue[_ActionEvent] = queue.Queue()
         self.review_event = threading.Event()
-        self.review_result = None
+        self.review_result: carat.RipPlanRevision | None = None
+        self.suffix_result: dict[str, str] | None = None
         self.review_metadata_var = tk.BooleanVar(value=self.config.get('review_metadata', False))
 
         # Override window close hook to give the user a chance to back out and clean up if they don't
@@ -147,7 +154,7 @@ class CaratGUI:
 
     def _save_config(self) -> None:
         """Saves persistent data to the config file."""
-        cfg = {
+        cfg: dict[str, str | bool] = {
             "library_root": self.dest_var.get(),
             "output_format": self.output_format_var.get(),
             "review_metadata": self.review_metadata_var.get()
@@ -376,12 +383,12 @@ class CaratGUI:
             self._apply_autofill(path)
 
     # noinspection PyUnusedLocal
-    def _on_metadata_changed(self, *_args) -> None:
+    def _on_metadata_changed(self, *_args: str) -> None:
         """Marks the metadata as manually edited if the user types in the fields."""
         if not getattr(self, '_is_autofilling', False):
             self._user_touched_metadata = True
 
-    def _on_source_changed(self, *_args):
+    def _on_source_changed(self, *_args: str) -> None:
         """Clears stale console output and cover art when the source is modified."""
 
         # Clear the console and art only if there is a stale rip log present
@@ -423,10 +430,10 @@ class CaratGUI:
     def _run_rip_thread(self) -> None:
         try:
             # Gather UI Variables safely
-            source_path = _clean_path_arg(self.src_var.get())
+            source_path = clean_path_arg(self.src_var.get())
             artist = self.artist_var.get().strip()
             album = self.album_var.get().strip()
-            lib_root = _clean_path_arg(self.dest_var.get())
+            lib_root = clean_path_arg(self.dest_var.get())
             profile = OutputProfile.from_display_string(self.output_format_var.get())
             output_container = profile.container
             preferred_codec = profile.codec
@@ -437,25 +444,24 @@ class CaratGUI:
             # Phase 2: (optional): inspect and possibly revise rip plan
             if self.review_metadata_var.get():
                 logger.emit("\n[*] Awaiting user confirmation of metadata...")
+                self.review_result = None
                 self.action_queue.put(("REVIEW", plan))
                 self.review_event.wait()
                 self.review_event.clear()
 
-                if self.review_result is None:
+                revision = self.review_result
+                if revision is None:
                     logger.emit("[-] Rip cancelled by user during review.")
-                    self.done_queue.put(("FAIL", None, None))
+                    self.done_queue.put(("FAIL", None))
                     return
 
                 logger.emit("[+] Re-calculating Rip Plan based on user overrides...\n")
-                plan = plan.revise(self.review_result.get('title_idx'), self.review_result.get('stream_idx'),
-                    new_mbid=self.review_result.get('mbid'), new_medium_idx=self.review_result.get('medium'),
-                    new_artist=self.review_result.get('artist'), new_album=self.review_result.get('album'),
-                    start_new_log=False)  # <-- Stops the Phase 3 log from clobbering Phase 1 log!
+                plan = plan.revise(revision, start_new_log=False)
 
             # Phase 2.5: Smart Overwrite Protection
             plan = self._enforce_overwrite_protection(plan)
             if not plan:
-                self.done_queue.put(("FAIL", None, None))
+                self.done_queue.put(("FAIL", None))
                 return
 
             # Phase 3: Execute rip plan
@@ -467,7 +473,7 @@ class CaratGUI:
                 self.done_queue.put(("FAIL", plan))
         except Exception as e:
             logger.emit(f"\n[!] Carat Engine Error: {str(e)}")
-            self.done_queue.put(("FAIL", None, None))
+            self.done_queue.put(("FAIL", None))
 
     def _enforce_overwrite_protection(self, plan: carat.RipPlan) -> carat.RipPlan | None:
         """
@@ -478,11 +484,17 @@ class CaratGUI:
             return plan
 
         logger.emit("\n[!] Target directory exists. Awaiting user conflict resolution...")
+        self.suffix_result = None
         self.action_queue.put(("SUFFIX", plan))
         self.review_event.wait()
         self.review_event.clear()
 
-        action = self.review_result.get("action") if self.review_result else "cancel"
+        suffix_result = self.suffix_result
+        if suffix_result is None:
+            logger.emit("[-] Rip cancelled by user to prevent overwrite.")
+            return None
+
+        action = suffix_result.get("action")
 
         if action == "cancel":
             logger.emit("[-] Rip cancelled by user to prevent overwrite.")
@@ -491,17 +503,18 @@ class CaratGUI:
             logger.emit("[!] User elected to OVERWRITE existing directory.")
             return plan
         elif action == "suffix":
-            safe_plan = plan.with_suffix(self.review_result["value"])
+            safe_plan = plan.with_suffix(suffix_result["value"])
             logger.emit(f"[+] Applied custom suffix for new mix: {safe_plan.audio_profile.suffix}")
             return safe_plan
 
         return None
 
-    def _trigger_post_rip_revise(self, plan) -> None:
+    def _trigger_post_rip_revise(self, plan: carat.RipPlan) -> None:
         dialog = ReviseDialog(self.parent, plan)
         self.parent.wait_window(dialog)
 
-        if dialog.result:
+        revision = dialog.result
+        if revision is not None:
             self._clear_console()
             self.btn_rip.config(state="disabled", text="Processing Revised Plan...")
             self.lbl_status.config(text="Initializing...")
@@ -509,17 +522,15 @@ class CaratGUI:
             self.progress_bar.config(mode="indeterminate")
             self.progress_bar.start(10)
             self.is_ripping = True
-            threading.Thread(target=self._run_revise_thread, args=(plan, dialog.result), daemon=True).start()
+            threading.Thread(target=self._run_revise_thread, args=(plan, revision), daemon=True).start()
 
-    def _run_revise_thread(self, old_plan, review_result) -> None:
+    def _run_revise_thread(self, old_plan: carat.RipPlan, revision: carat.RipPlanRevision) -> None:
         try:
             logger.emit("[*] Post-Rip override initiated by user. Re-calculating plan...\n")
-            new_plan = old_plan.revise(review_result.get('title_idx'), new_stream_idx=review_result.get('stream_idx'),
-                new_mbid=review_result.get('mbid'), new_medium_idx=review_result.get('medium'),
-                new_artist=review_result.get('artist'), new_album=review_result.get('album'))
+            new_plan = old_plan.revise(revision)
 
             if new_plan.matched_candidate and 'cover_art_path' in new_plan.matched_candidate:
-                self.art_queue.put(new_plan.matched_candidate['cover_art_path'])
+                self.art_queue.put(Path(new_plan.matched_candidate['cover_art_path']))
 
             safe_plan = self._enforce_overwrite_protection(new_plan)
             if not safe_plan:
@@ -582,18 +593,18 @@ class CaratGUI:
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to update cover: {e}")
 
-    def _show_review_dialog(self, plan) -> None:
+    def _show_review_dialog(self, plan: carat.RipPlan) -> None:
         """Isolated handler for the Revise Dialog to prevent blocking the poller."""
         dialog = ReviseDialog(self.parent, plan)
         self.parent.wait_window(dialog)
         self.review_result = dialog.result
         self.review_event.set()
 
-    def _show_suffix_dialog(self, plan) -> None:
+    def _show_suffix_dialog(self, plan: carat.RipPlan) -> None:
         """Isolated handler for the Suffix Dialog to prevent blocking the poller."""
-        dialog = SuffixDialog(self.parent, plan.target_dir, plan.audio_profile.suffix)
+        dialog = SuffixDialog(self.parent, str(plan.target_dir), plan.audio_profile.suffix)
         self.parent.wait_window(dialog)
-        self.review_result = dialog.result
+        self.suffix_result = dialog.result
         self.review_event.set()
 
     def _start_queue_poller(self) -> None:
@@ -601,7 +612,7 @@ class CaratGUI:
         # Bulk log insertion for responsiveness
         if not self.log_queue.empty():
             self.console.config(state="normal")
-            logs = []
+            logs: list[str] = []
             while not self.log_queue.empty():
                 try:
                     logs.append(self.log_queue.get_nowait())
@@ -615,9 +626,9 @@ class CaratGUI:
         # Check for UI Intercepts
         while not self.action_queue.empty():
             msg = self.action_queue.get_nowait()
-            if isinstance(msg, tuple) and msg[0] == "REVIEW":
+            if msg[0] == "REVIEW":
                 self.parent.after(0, self._show_review_dialog, msg[1])
-            elif isinstance(msg, tuple) and msg[0] == "SUFFIX":
+            elif msg[0] == "SUFFIX":
                 self.parent.after(0, self._show_suffix_dialog, msg[1])
 
         # --- Check for Rip Completion ---
@@ -630,34 +641,31 @@ class CaratGUI:
             self.is_ripping = False
             self.progress_var.set(100)
 
-            if isinstance(status, tuple):
-                msg_type = status[0]
-                # Safely extract the plan if it was passed back
-                plan: carat.RipPlan | None = status[1] if len(status) > 1 else None
-
-                if msg_type == "SUCCESS" and plan is not None:
-                    self.lbl_status.config(text="Idle")
+            if status[0] == "SUCCESS":
+                plan = status[1]
+                self.lbl_status.config(text="Idle")
+                self.btn_rip.config(
+                    state="normal",
+                    text="Rip Complete — Rip Additional Stream",
+                    command=lambda p=plan: self._trigger_post_rip_revise(p)
+                )
+            else:
+                plan = status[1]
+                self.lbl_status.config(text="Failed / Cancelled")
+                if plan is not None:
+                    # We have a plan! Guide them to the Revise flow to fix the collision.
                     self.btn_rip.config(
                         state="normal",
-                        text="Rip Complete — Rip Additional Stream",
+                        text="Revise Plan to Retry",
                         command=lambda p=plan: self._trigger_post_rip_revise(p)
                     )
-                elif msg_type == "FAIL":
-                    self.lbl_status.config(text="Failed / Cancelled")
-                    if plan:
-                        # We have a plan! Guide them to the Revise flow to fix the collision.
-                        self.btn_rip.config(
-                            state="normal",
-                            text="Revise Plan to Retry",
-                            command=lambda p=plan: self._trigger_post_rip_revise(p)
-                        )
-                    else:
-                        # Fatal error before a plan was created. Reset to square one.
-                        self.btn_rip.config(
-                            state="normal",
-                            text="Rip Failed! (Check Log)",
-                            command=self._start_rip_thread
-                        )
+                else:
+                    # Fatal error before a plan was created. Reset to square one.
+                    self.btn_rip.config(
+                        state="normal",
+                        text="Rip Failed! (Check Log)",
+                        command=self._start_rip_thread
+                    )
 
         while not self.progress_queue.empty():
             # If we get a valid number, we are Determinate. Stop any bouncing.
@@ -722,7 +730,7 @@ class CaratGUI:
 class ReviseDialog(tk.Toplevel):
     """ Modal Dialog that allows the user to override heuristic rip plans. """
 
-    def __init__(self, parent, plan):
+    def __init__(self, parent: tk.Tk, plan: carat.RipPlan):
         super().__init__(parent)
         self.title("Inspect or Revise Rip Plan")
         self.geometry("850x650")
@@ -730,7 +738,7 @@ class ReviseDialog(tk.Toplevel):
         self.grab_set()
 
         # 1. Initialize Core State
-        self.result = None
+        self.result: carat.RipPlanRevision | None = None
         self.plan = plan  # Saved for validation helper
         self.current_mb_tracks = 0
         self.current_mb_duration = 0
@@ -780,7 +788,7 @@ class ReviseDialog(tk.Toplevel):
         link_lbl.grid(row=2, column=1, sticky="w", padx=5)
         link_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://musicbrainz.org/release/{self.mbid_var.get()}"))
 
-    def _build_left_pane(self, parent_container):
+    def _build_left_pane(self, parent_container: ttk.Frame) -> None:
         """Constructs the local naming overrides and the MusicBrainz live preview tree."""
         left_frame = ttk.LabelFrame(parent_container, text="Current MusicBrainz Tracklist")
         left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
@@ -823,19 +831,19 @@ class ReviseDialog(tk.Toplevel):
                 title = track.get('title', 'Unknown')
                 self.mb_tree.insert("", "end", text=f"{i + 1}. {title}", values=(f"{mins}:{secs:02d}",))
 
-        def _prevent_mb_selection(_event):
+        def _prevent_mb_selection(_event: tk.Event[ttk.Treeview]) -> None:
             sel = self.mb_tree.selection()
             if sel: self.mb_tree.selection_remove(sel)
 
         self.mb_tree.bind("<<TreeviewSelect>>", _prevent_mb_selection)
 
-    def _build_right_pane(self, parent_container):
+    def _build_right_pane(self, parent_container: ttk.Frame) -> None:
         """Constructs the Disc Topology tree and populates it with MakeMKV state."""
         right_frame = ttk.LabelFrame(parent_container, text="Disc Topology Override")
         right_frame.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
 
         self.topo_tree = None
-        if self.plan.disc_topology is not None:
+        if self.plan.disc_topology:
             self.topo_tree = ttk.Treeview(right_frame, show="tree")
             self.topo_tree.tag_configure('title', font=("TkDefaultFont", 9, "bold"))
             self.topo_tree.tag_configure('atmos', font=("TkDefaultFont", 9, "bold"), foreground="blue")
@@ -863,7 +871,8 @@ class ReviseDialog(tk.Toplevel):
                             self.plan.audio_profile.stream_idx) == str(s_idx):
                         self.topo_tree.selection_set(s_node)
 
-            def _enforce_stream_selection(_event):
+            def _enforce_stream_selection(_event: tk.Event[ttk.Treeview]) -> None:
+                assert self.topo_tree is not None
                 sel = self.topo_tree.selection()
                 if sel and "|" not in sel[0]:
                     self.topo_tree.selection_remove(sel[0])
@@ -938,12 +947,12 @@ class ReviseDialog(tk.Toplevel):
             else:
                 self.lbl_dur_match.config(text="✖ Duration Mismatch (>10% variance)", foreground="red")
 
-    def _on_mbid_changed(self, *_args):
+    def _on_mbid_changed(self, *_args: str) -> None:
         """Resets the medium index to 1 when a new MBID is entered, and triggers a preview."""
         self.medium_var.set(1)
         self._trigger_live_preview()
 
-    def _trigger_live_preview(self, *_args):
+    def _trigger_live_preview(self, *_args: str) -> None:
         if hasattr(self, '_preview_timer') and self._preview_timer:
             self.after_cancel(self._preview_timer)
         self._preview_timer = self.after(750, self._fetch_live_preview)
@@ -975,10 +984,6 @@ class ReviseDialog(tk.Toplevel):
 
         self.mb_tree.delete(*self.mb_tree.get_children())
 
-        if not metadata:
-            self.lbl_preview_status.config(text=f"Error: Medium not found in this release.", foreground="red")
-            return
-
         artist = metadata['artist']
         album = metadata['title']
         tracks = metadata['tracks']
@@ -1003,9 +1008,10 @@ class ReviseDialog(tk.Toplevel):
         self._update_validation_status()
 
     def _on_rip(self):
+        from tkinter import messagebox
+
         new_mbid = self.mbid_var.get().strip()
         if len(new_mbid) > 0 and len(new_mbid) != 36:
-            from tkinter import messagebox
             messagebox.showerror("Invalid Input", "MBID must be a 36-character UUID, or empty.", parent=self)
             return
 
@@ -1023,19 +1029,24 @@ class ReviseDialog(tk.Toplevel):
                 else:
                     selected_title = iid
 
-        self.result = {
-            "mbid": new_mbid,
-            "medium": self.medium_var.get(),
-            "title_idx": selected_title,
-            "stream_idx": selected_stream,
-            'artist': self.artist_var.get().strip(),
-            'album': self.album_var.get().strip()
-        }
+        if selected_stream is None:
+            messagebox.showerror("No Stream Selected", "Select an audio stream before revising the rip plan.",
+                                 parent=self)
+            return
+
+        self.result = carat.RipPlanRevision(
+            title_idx=selected_title if selected_title is not None else str(self.plan.title_idx),
+            stream_idx=selected_stream,
+            mbid=new_mbid,
+            medium_idx=self.medium_var.get(),
+            artist=self.artist_var.get().strip(),
+            album=self.album_var.get().strip()
+        )
         self.destroy()
 
 class SuffixDialog(tk.Toplevel):
     """Modal Dialog to resolve directory overwrite conflicts."""
-    def __init__(self, parent, folder_name: str, current_suffix: str = ""):
+    def __init__(self, parent: tk.Tk, folder_name: str, current_suffix: str = ""):
         super().__init__(parent)
         self.title("Folder Already Exists")
         self.geometry("450x170")

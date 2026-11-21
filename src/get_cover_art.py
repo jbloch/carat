@@ -54,7 +54,7 @@ def download_cover_art(artist: str, album: str, target_dir: Path, mbid: str | No
 def get_mb_digital_art_url(artist: str, album: str, mbid: str | None = None) -> str | None:
     """ Consumes candidate URLs from MusicBrainz and returns the first valid image. """
     for url in generate_mb_art_urls(artist, album, mbid):
-        valid, w, h = is_valid_image(url)
+        valid, _, _ = is_valid_image(url)
         if valid:
             return url
         else:
@@ -96,7 +96,7 @@ def is_valid_image(url: str) -> tuple[bool, int, int]:
 def get_itunes_art_url(artist: str, album: str) -> str | None:
     """ Returns the URL of acceptable album art from Apple/iTunes, or None if not found. """
     url = "https://itunes.apple.com/search"
-    params = {"term": f"{artist} {album}", "entity": "album", "limit": MAX_APPLE_ALBUM_COVERS_TO_SEARCH}
+    params = {"term": f"{artist} {album}", "entity": "album", "limit": f"{MAX_APPLE_ALBUM_COVERS_TO_SEARCH}"}
     try:
         r = requests.get(url, params=params, timeout=10).json()
         results = r.get('results', [])
@@ -112,7 +112,7 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
             # The fuzzy match is necessary because Apple and MusicBrainz can disagree on names
             if target_album in retrieved_album and target_artist in retrieved_artist:
                 hq_url = res['artworkUrl100'].replace("100x100bb.jpg", "1200x1200bb.jpg")
-                valid, w, h = is_valid_image(hq_url)
+                valid, _, _ = is_valid_image(hq_url)
                 if valid:
                     return hq_url
             else:
