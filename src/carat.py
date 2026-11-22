@@ -33,10 +33,11 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Callable, NoReturn, NamedTuple, cast, TypedDict
+from typing import Any, NoReturn, NamedTuple, cast, TypedDict
 
 # noinspection PyProtectedMember
 from mutagen.flac import FLAC, Picture
@@ -60,6 +61,7 @@ class MkvChapter(TypedDict):
 
 
 class FFprobeStream(TypedDict, total=False):
+    """Subset of an FFprobe JSON stream entry read by Carat."""
     index: int
     channels: int
     codec_name: str
@@ -70,6 +72,7 @@ class FFprobeStream(TypedDict, total=False):
 
 
 class FFprobeChapter(TypedDict, total=False):
+    """Subset of an FFprobe JSON chapter entry read by Carat."""
     id: int
     start_time: str
     end_time: str
@@ -77,10 +80,12 @@ class FFprobeChapter(TypedDict, total=False):
 
 
 class FFprobeFormat(TypedDict, total=False):
+    """Subset of an FFprobe JSON format entry read by Carat."""
     duration: str
 
 
 class FFprobeOutput(TypedDict, total=False):
+    """Top-level FFprobe JSON response envelope."""
     streams: list[FFprobeStream]
     chapters: list[FFprobeChapter]
     format: FFprobeFormat
@@ -101,7 +106,7 @@ def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: MusicBrainzMe
             track = mb_tracks[i] if i < len(mb_tracks) else None
             title = track['title'] if track is not None else f"Track {i + 1}"
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n')
-            track_artist = track.get('track_artist') if track is not None else None
+            track_artist = track.get('track_artist', '') if track is not None else ''
             if track_artist and track_artist != info['artist']:
                 f.write(f'    PERFORMER "{track_artist}"\n')
             f.write(f'    INDEX 01 {seconds_to_cue(ch["start_time"])}\n')
@@ -317,7 +322,7 @@ class TitleInfo:
     size: int = 0
     file_name: str = "Unknown"
     duration: str = "Unknown"
-    duration_sec: float = 0.0
+    duration_sec: int = 0
     size_str: str = "Unknown"
     streams: dict[int, str] = field(default_factory=dict) # pyright: ignore[reportUnknownVariableType]
     atmos_streams: set[int] = field(default_factory=set) # pyright: ignore[reportUnknownVariableType]
@@ -428,7 +433,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch_ex:
         # 1. Fire off the network fetch in the background
-        MUSICBRAINZ_TIMEOUT = 60.0  # Maximum time (s) to wait for MusicBrainz
+        musicbrainz_timeout = 60.0  # Maximum time (s) to wait for MusicBrainz
         fetch_start = time.time()
         candidates_future = prefetch_ex.submit(fetch_candidate_metadata, artist, album)
 
@@ -443,7 +448,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         # 3. Synchronize: Grab the results of the background fetch
         candidates = []
         elapsed = time.time() - fetch_start
-        remaining_timeout = max(0.1, MUSICBRAINZ_TIMEOUT - elapsed)
+        remaining_timeout = max(0.1, musicbrainz_timeout - elapsed)
         try:
             if not candidates_future.done():
                 logger.emit(f"[*] Waiting for MusicBrainz metadata (Timeout in {remaining_timeout:.0f}s)...")
@@ -758,17 +763,16 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
             logger.emit("    [!] ERROR: No valid lossless multichannel streams found on disc!")
             return None
 
-        # noinspection shadowing-names
-        def mc_sort_key(s: FFprobeStream) -> tuple[int, int, int, int]:
+        def mc_sort_key(stream: FFprobeStream) -> tuple[int, int, int, int]:
             """Sort criterion: (Atmos Penalty, -IsMultichannel, -Channels, Index)"""
-            profile = s.get('profile', '').lower()
-            channels = int(s.get('channels', 0))
-            idx = int(s.get('index', 999))
+            stream_profile = stream.get('profile', '').lower()
+            channels = int(stream.get('channels', 0))
+            idx = int(stream.get('index', 999))
 
             is_multichannel = 1 if channels >= 4 else 0
-            is_atmos = 1 if "atmos" in profile else 0
+            atmos_penalty = 1 if "atmos" in stream_profile else 0
 
-            return is_atmos, -is_multichannel, -channels, idx
+            return atmos_penalty, -is_multichannel, -channels, idx
 
         valid_streams.sort(key=mc_sort_key)
 
@@ -784,7 +788,7 @@ def find_multichannel_stream(mkv_path: Path) -> tuple[int, int] | None:
         best_channels = int(best_stream.get('channels', 0))
 
         logger.emit(
-            f"\n[+] Selected Lossless Stream: Index {best_idx} ({best_stream.get('codec_name')}, {best_channels} channels)")
+            f"\n[+] Selected Lossless Stream: Index {best_idx} ({best_stream.get('codec_name', 'unknown')}, {best_channels} channels)")
 
         return best_idx, best_channels
     except json.JSONDecodeError:
@@ -988,7 +992,7 @@ def generate_topology_from_mkv(mkv_path: Path) -> dict[str, TitleInfo]:
 
     # 1. Ask ffprobe for the FORMAT, streams, and chapters in JSON format
     cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
+        TOOLS.FFPROBE, "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams", "-show_chapters", str(mkv_path)
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -999,7 +1003,8 @@ def generate_topology_from_mkv(mkv_path: Path) -> dict[str, TitleInfo]:
     chapter_count = len(chapters)
 
     # 3. Parse the duration (Safely cast string -> float -> int)
-    duration_str = probe_data.get("format", {}).get("duration")
+    fmt = probe_data.get("format")
+    duration_str = fmt.get("duration") if fmt else None
     if duration_str:
         duration_sec = int(float(duration_str))
     elif chapters:

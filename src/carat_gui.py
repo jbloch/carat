@@ -20,7 +20,7 @@ import tkinter as tk
 from enum import Enum
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from PIL import Image, ImageTk
 
@@ -31,8 +31,8 @@ from carat import Codec, Container
 from music_brainier import MusicBrainzMetadata
 from util import clean_path_arg
 
-_ActionEvent = tuple[Literal["REVIEW", "SUFFIX"], carat.RipPlan]
-_DoneEvent = (
+_ActionEvent: TypeAlias = tuple[Literal["REVIEW", "SUFFIX"], carat.RipPlan]
+_DoneEvent: TypeAlias = (
     tuple[Literal["SUCCESS"], carat.RipPlan]
     | tuple[Literal["FAIL"], carat.RipPlan | None]
 )
@@ -516,7 +516,6 @@ class CaratGUI:
         revision = dialog.result
         if revision is not None:
             self._clear_console()
-            self.btn_rip.config(state="disabled", text="Processing Revised Plan...")
             self.lbl_status.config(text="Initializing...")
             self.btn_rip.config(state="disabled", text="Re-ripping using new metadata...")
             self.progress_bar.config(mode="indeterminate")
@@ -528,9 +527,6 @@ class CaratGUI:
         try:
             logger.emit("[*] Post-Rip override initiated by user. Re-calculating plan...\n")
             new_plan = old_plan.revise(revision)
-
-            if new_plan.matched_candidate and 'cover_art_path' in new_plan.matched_candidate:
-                self.art_queue.put(Path(new_plan.matched_candidate['cover_art_path']))
 
             safe_plan = self._enforce_overwrite_protection(new_plan)
             if not safe_plan:

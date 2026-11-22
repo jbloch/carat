@@ -123,7 +123,7 @@ def get_itunes_art_url(artist: str, album: str) -> str | None:
     return None
 
 
-def main():
+def main() -> None:
     """ Simple command line tool to get cover art for the specified release """
     if len(sys.argv) < 4:
         logger.emit('Usage: python get_cover_art.py "Artist" "Album" "/Library/Root"')

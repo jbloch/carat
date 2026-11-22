@@ -9,7 +9,7 @@ import re
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 from urllib.error import URLError
 
 import logger
@@ -25,7 +25,7 @@ CONFIG_FILE: str = str(Path(ROOT_DIR) / ".carat_config.json")
 REFRESH_INTERVAL: int = 30 * 24 * 60 * 60
 
 
-def load_config() -> Dict[str, Any]:
+def load_config() -> dict[str, Any]:
     """Loads the Carat configuration dictionary from disk; returns an empty dict if not found."""
     if os.path.exists(CONFIG_FILE):
         try:
@@ -36,7 +36,7 @@ def load_config() -> Dict[str, Any]:
     return {}
 
 
-def save_config(config: Dict[str, Any]) -> None:
+def save_config(config: dict[str, Any]) -> None:
     """Saves the given Carat configuration dictionary to disk."""
     try:
         with open(CONFIG_FILE, 'w') as f:
@@ -121,7 +121,7 @@ def fetch_and_apply_beta_key() -> bool:
 
 def main() -> None:
     """Main entry point: checks if the MakeMKV key is valid, and updates the key if necessary."""
-    config: Dict[str, Any] = load_config()
+    config: dict[str, Any] = load_config()
     last_checked: float = config.get("makemkv_key_date", 0.0)
 
     # Check if we are within the 30-days (keys last 60 days)
