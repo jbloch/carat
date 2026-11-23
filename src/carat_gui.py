@@ -43,7 +43,7 @@ class OutputProfile(Enum):
     """Output format specification."""
     M4A_LOSSLESS = ("M4A Lossless (TrueHD) [Fire TV Stick / Cube]", Container.M4A, Codec.TRUEHD)
     M4A_LOSSY = ("M4A Lossy Audio (Dolby Digital+) [Apple Devices]", Container.M4A, Codec.EAC3)
-    MKV_LOSSLESS = ("MKV Lossless (TrueHD) [Nvidia Shield, PC]", Container.MKV, Codec.TRUEHD)
+    MKA_LOSSLESS = ("MKA Lossless (TrueHD) [Nvidia Shield, PC]", Container.MKA, Codec.TRUEHD)
     FLAC = ("FLAC (Legacy non-Atmos surround) [All Devices]", Container.FLAC, Codec.FLAC)
 
     def __init__(self, display_name: str, container: Container, codec: Codec):
@@ -52,11 +52,14 @@ class OutputProfile(Enum):
         self.codec = codec
 
     @classmethod
-    def from_display_string(cls, search_string: str):
+    def from_display_string(cls, search_string: str) -> OutputProfile:
         """Reverse lookup to find the enum from the UI string."""
         for profile in cls:
             if profile.display_name == search_string:
                 return profile
+        # Migrate legacy MKV profile strings saved by earlier beta versions
+        if search_string.startswith("MKV "):
+            return cls.MKA_LOSSLESS
         # Safe default if the config file has an obsolete string
         return cls.M4A_LOSSLESS
 
@@ -199,9 +202,9 @@ class CaratGUI:
 
         # --- Format Output Profile Dropdown ---
         self.profiles = [p.display_name for p in OutputProfile]
-        saved_profile = self.config.get("output_format", OutputProfile.M4A_LOSSLESS.display_name)
-        if saved_profile not in self.profiles:  # Safety check: if saved output format is invalid, revert to default
-            saved_profile = OutputProfile.M4A_LOSSLESS.display_name
+        saved_profile = OutputProfile.from_display_string(
+            self.config.get("output_format") or OutputProfile.M4A_LOSSLESS.display_name
+        ).display_name
         self.output_format_var = tk.StringVar(value=saved_profile)
 
         ttk.Separator(frame_dest, orient="vertical").pack(side="left", fill="y", padx=10)
@@ -312,7 +315,7 @@ class CaratGUI:
 
         # 0. Strip known media extensions early so they don't leak into the album title
         p = Path(source_path)
-        if p.suffix.lower() in ('.iso', '.mkv', '.mp4'):
+        if p.suffix.lower() in ('.iso', '.mkv', '.mka', '.mp4'):
             name = p.stem
         else:
             name = p.name

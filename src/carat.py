@@ -15,8 +15,8 @@ from __future__ import annotations
 __version__ = "1.0B4.1"
 
 __all__ = [
-    'rip_album_to_library', 'Container', 'Codec', 'prepare_album_rip', 'execute_album_rip', 'RipPlan',
-    'RipPlanRevision'
+    'rip_album_to_library', 'prepare_album_rip', 'execute_album_rip',
+    'Container', 'Codec', 'RipPlan', 'RipPlanRevision'
 ]
 
 import argparse
@@ -1199,7 +1199,7 @@ class RipContext:
 
 
 def _assemble_gapless_album(ctx: RipContext) -> None:
-    """Handles the FFmpeg remuxing for gapless M4A or MKV containers."""
+    """Handles the FFmpeg remuxing for gapless M4A or MKA containers."""
     final_audio_name = f"{ctx.clean_album}{ctx.profile.suffix}.{ctx.profile.container}"
 
     if ctx.tracks:
@@ -1271,11 +1271,11 @@ class Container(StrEnum):
 
     Attributes:
         M4A: The standard MPEG-4 audio container (typically used for Atmos/MP4).
-        MKV: The Matroska multimedia container (typically used for pure lossless extraction).
+        MKA: The Matroska audio container (typically used for pure lossless extraction).
         FLAC: The Free Lossless Audio Codec container (used only for legacy, non-Atmos recordings).
     """
     M4A = "m4a"
-    MKV = "mkv"
+    MKA = "mka"
     FLAC = "flac"
 
 
@@ -1305,7 +1305,7 @@ def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
 
     The artist and album title are used to obtain metadata and cover art, which are used to
     generate the cue file and cover.jpg in the music library. The library entry generally consists
-    of a chapterless audio file (M4A or MKV) containing only the Atmos stream, a cue sheet, and
+    of a chapterless audio file (M4A or MKA) containing only the Atmos stream, a cue sheet, and
     a cover.jpg. This format provides gapless playback of the entire album, as well as access to
     individual tracks, and is the only format known to do so on most platforms.
 
@@ -1339,7 +1339,7 @@ def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
         artist: The requested album artist (used for metadata fetching).
         album: The requested album title (used for metadata fetching).
         library_root: The destination directory for the processed album.
-        output_container: The target container format (m4a, mkv, or flac).
+        output_container: The target container format (m4a, mka, or flac).
         preferred_codec: The target Atmos codec (truehd, eac3, or ac3).
 
     Returns:
@@ -2010,7 +2010,7 @@ def main():
     parser.add_argument("library_root", help="Destination music library root")
 
     # Optional flags for format selection
-    parser.add_argument("--output-container", choices=["m4a", "mkv", "flac"], default="m4a",
+    parser.add_argument("--output-container", choices=["m4a", "mka", "flac"], default="m4a",
                         help="Output container format (default: m4a)")
     parser.add_argument("--preferred-codec", choices=["truehd", "eac3", "ac3"], default="truehd",
                         help="Preferred audio codec (default: truehd)")

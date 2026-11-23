@@ -23,10 +23,10 @@ Carat is built to handle the chaotic, developing landscape of Atmos release form
 * [IAA](https://immersiveaudioalbum.com/)-style folders (individual MKV or MP4 files per track)
 * [Headphone Dust](https://headphonedust.store/)-style single MKV files
 
-**The Output:** Regardless of what you feed it, Carat standardizes the output into one uniform, library-ready format: **a single, chapterless `.m4a` or `.mkv` file alongside a `.cue` sheet and a `cover.jpg`.** *Why this format?* It is currently the only format that reliably combines true gapless playback with accurate track indexing on media centers like Kodi. You can choose among three variants, depending on what hardware you're using to play your music:
+**The Output:** Regardless of what you feed it, Carat standardizes the output into one uniform, library-ready format: **a single, chapterless `.m4a` or `.mka` file alongside a `.cue` sheet and a `cover.jpg`.** *Why this format?* It is currently the only format that reliably combines true gapless playback with accurate track indexing on media centers like Kodi. You can choose among three variants, depending on what hardware you're using to play your music:
 * **M4A Lossless (TrueHD)** – the ideal format if you're running your media player software (e.g., Kodi) on a FireStick MAX 4K, Fire TV cube, or similar device.
 * **M4A Lossy (Dolby Digital+)** – the correct format for Mac, Apple TV, soundbars, and car audio systems.
-* **MKV Lossless (TrueHD)** – the ideal format for PC playback or Nvidia Shield.
+* **MKA Lossless (TrueHD)** – the ideal format for PC playback or Nvidia Shield.
 
 As the landscape evolves, we may extend Carat's capabilities to support more input and output formats, but it will remain laser-focused on one task: quickly incorporating Atmos albums into your digital music library. Well, OK, maybe not _so_ laser-focused: All of this machinery is equally applicable to legacy surround formats, and Carat will happily rip them into flac files for you. It will do this automatically on releases that don't contain an Atmos stream, and you can manually choose this behavior for releases that contain Atmos and lossless 5.1, quad, or stereo.
 
