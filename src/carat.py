@@ -23,6 +23,7 @@ import argparse
 import atexit
 import concurrent.futures
 import json
+import math
 import os
 import platform
 import re
@@ -97,10 +98,10 @@ def seconds_to_cue(seconds: float) -> str:
 
 
 def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: MusicBrainzMetadata, chapters: list[MkvChapter],
-                       mb_tracks: list[MusicBrainzTrack]) -> None:
+                       mb_tracks: list[MusicBrainzTrack], suffix: str = " (Atmos)") -> None:
     """Generates CUE sheet for track indexing into gapless playback."""
     with cue_path.open('w', encoding='utf-8') as f:
-        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]} (Atmos)"\n'
+        f.write(f'PERFORMER "{info["artist"]}"\nTITLE "{info["title"]}{suffix}"\n'
                 f'REM DATE {info.get("year", "Unknown")}\nFILE "{audio_file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             track = mb_tracks[i] if i < len(mb_tracks) else None
@@ -250,7 +251,7 @@ def _process_output_line(line: str, output_acc: list[str], context: ExecutionCon
 
 
 def run_command(cmd: list[str], desc: str | None = None, context: ExecutionContext | None = None,
-                suppress_summary: bool = False) -> str:
+                suppress_summary: bool = False, suppress_output: bool = False) -> str:
     """
     Synchronously executes command with live progress updates.
     Includes special handling for MakeMKV progress and ffmpeg status lines.
@@ -275,7 +276,12 @@ def run_command(cmd: list[str], desc: str | None = None, context: ExecutionConte
         output_acc: list[str] = []
         if process.stdout:  # Will always be satisfied, but PyCharm doesn't know it
             for line in process.stdout:
-                _process_output_line(line, output_acc, context)
+                if suppress_output:
+                    stripped = line.rstrip('\r\n')
+                    if stripped:
+                        output_acc.append(stripped)
+                else:
+                    _process_output_line(line, output_acc, context)
 
         process.wait()
     except:
@@ -486,7 +492,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         has_lossless_legacy = False
         for s_idx, s in titles[t_idx].streams.items():
             s_low = s.lower()
-            if s_idx in titles[t_idx].atmos_streams or "truehd" in s_low:
+            if s_idx in titles[t_idx].atmos_streams:
                 has_atmos = True
             elif "surround" in s_low or "4.0" in s_low or "5.1" in s_low or "quad" in s_low:
                 if any(codec in s_low for codec in ["lpcm", "pcm", "dts-hd ma", "flac", "alac", "truehd"]):
@@ -662,11 +668,12 @@ def rip_title_to_mkv(src_spec: str, out_path: Path, title_idx: str) -> Path:
 
 def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: str = "truehd") -> int | None:
     """
-        Returns the index of the highest quality Atmos stream based on the preferred_codec,
-        with appropriate fallbacks and warnings. Evaluates based on Format, Channels, and Stream Index.
+        Returns the index of the highest quality Dolby Atmos stream compatible with preferred_codec,
+        or None if no Atmos stream is found. Evaluates based on Format, Channels, and Stream Index.
     """
     logger.emit("\n[*] === AUDIO STREAM ANALYSIS ===")
-    cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a", "-show_entries", "stream=index,channels,codec_name",
+    cmd = [TOOLS.FFPROBE, "-v", "error", "-select_streams", "a",
+           "-show_entries", "stream=index,channels,codec_name,profile",
            "-of", "json", str(mkv_path)]
     res = run_command(cmd, "Scanning for Atmos Stream")
 
@@ -676,33 +683,30 @@ def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: 
         if not streams:
             return None
 
-        valid_streams: list[FFprobeStream] = [
-            s for s in streams if s.get('codec_name', '').lower() in [preferred_codec, "eac3", "ac3"]
-        ]
+        # Only TrueHD and E-AC-3 can carry Atmos; if the user requested lossy E-AC-3 (e.g., Apple devices),
+        # do not select TrueHD.
+        pref = preferred_codec.lower()
+        allowed_codecs = {"truehd", "eac3"} if pref == Codec.TRUEHD else (
+            {"eac3"} if pref == Codec.EAC3 else set()
+        )
+
+        valid_streams: list[FFprobeStream] = []
+        for s in streams:
+            idx = s.get('index')
+            codec = s.get('codec_name', '').lower()
+            profile = s.get('profile', '').lower()
+            if idx is not None and codec in allowed_codecs and (idx in atmos_streams or "atmos" in profile):
+                valid_streams.append(s)
         if not valid_streams:
             return None
 
-        def stream_sort_key(s: FFprobeStream) -> tuple[int, int, int]:
+        def stream_sort_key(stream: FFprobeStream) -> tuple[int, int, int]:
             """Sort criterion: (Format Penalty, -Channels, Index)"""
-            idx = int(s.get('index', 999))
-            codec = s.get('codec_name', '').lower()
-
-            if codec == preferred_codec:
-                # STRICT check: Did MakeMKV explicitly flag this absolute stream index as Atmos?
-                if atmos_streams:
-                    fmt_penalty = 0 if idx in atmos_streams else 1
-                else:
-                    # Failsafe if running against a raw MKV file without MakeMKV data
-                    fmt_penalty = 0 if int(s.get('channels', 0)) >= 8 else 1
-            elif codec == "eac3":
-                fmt_penalty = 2
-            elif codec == "ac3":
-                fmt_penalty = 3
-            else:
-                fmt_penalty = 4
-
-            channels = int(s.get('channels', 0))
-            return fmt_penalty, -channels, idx
+            stream_idx = int(stream.get('index', 999))
+            s_codec = stream.get('codec_name', '').lower()
+            fmt_penalty = 0 if s_codec == pref else 1
+            channels = int(stream.get('channels', 0))
+            return fmt_penalty, -channels, stream_idx
 
         valid_streams.sort(key=stream_sort_key)
 
@@ -719,10 +723,9 @@ def find_atmos_stream(mkv_path: Path, atmos_streams: set[int], preferred_codec: 
         best_channels = best_stream.get('channels', 'unknown')
 
         best_fmt_pen = stream_sort_key(best_stream)[0]
-        if best_fmt_pen == 1:
-            logger.emit("    [!] WARNING: No TrueHD Atmos found! Falling back to standard TrueHD/Lossy!")
-        elif best_fmt_pen == 2:
-            logger.emit("    [!] WARNING: NO ATMOS METADATA DETECTED! Falling back to lossy EAC3-JOC!")
+        if best_fmt_pen > 0:
+            logger.emit(f"    [!] WARNING: Preferred Atmos codec ({preferred_codec}) not found! "
+                        f"Falling back to {best_codec} Atmos.")
 
         logger.emit(f"\n[+] Selected Primary Audio Stream: Index {best_idx} ({best_codec}, {best_channels} channels)")
         return best_idx
@@ -1154,7 +1157,8 @@ class AudioProfile(NamedTuple):
 
 
 def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_container: Container,
-                          preferred_codec: Codec) -> AudioProfile:
+                          preferred_codec: Codec, chapters: list[MkvChapter] | None = None,
+                          duration: float = 0.0) -> AudioProfile:
     """
     Scans the master MKV and determines the optimal audio stream and output format.
     Will automatically fall back to lossless FLAC slicing if Atmos is requested but unavailable.
@@ -1173,17 +1177,8 @@ def resolve_audio_profile(master_mkv: Path, atmos_streams: set[int], requested_c
     legacy_info = find_multichannel_stream(master_mkv)
     if legacy_info is None:
         raise ValueError("No compatible audio stream (LPCM, DTS-HD MA, TrueHD, MLP, alac, flac) found in master file.")
-    idx, channels = legacy_info
-
-    if channels == 1:
-        suffix = " (Mono)"
-    elif channels == 2:
-        suffix = ""  # The implicit standard
-    elif channels == 4:
-        suffix = " (Quad)"
-    else:
-        # Catches 3.0, 5.0, 5.1, 7.1, etc.
-        suffix = " (Surround)"
+    idx, _channels = legacy_info
+    suffix = _determine_suffix(master_mkv, idx, idx in atmos_streams, Container.FLAC, chapters, duration)
 
     return AudioProfile(stream_idx=idx, container=Container.FLAC, suffix=suffix)
 
@@ -1211,7 +1206,7 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
         ctx.chapters = ctx.chapters[:len(ctx.tracks)]
 
     generate_cue_sheet(ctx.dest / f"{ctx.clean_album}{ctx.profile.suffix}.cue", final_audio_name, ctx.info,
-                       ctx.chapters, ctx.tracks)
+                       ctx.chapters, ctx.tracks, ctx.profile.suffix)
 
     cmd = [
         TOOLS.FFMPEG, "-hide_banner", "-loglevel", "error", "-stats",
@@ -1318,9 +1313,8 @@ def rip_album_to_library(src: str, artist: str, album: str, library_root: str,
     internet connection, or MusicBrainz is down), the album will still be ripped, but the track titles
     will all be "Track <#>" and the artist and album names will not be canonicalized.
 
-    The output codec will be the highest quality codec consistent with the caller's preferences. The
-    three possibilities, in order of decreasing quality, are TrueHD Atmos (lossless), E-AC-3-JOC Atmos
-    (lossy), and AC-3 Surround (not Atmos!).
+    For Atmos sources, the output codec will be the highest quality Atmos codec consistent with the caller's
+    preferences: TrueHD Atmos (lossless) or E-AC-3-JOC Atmos (lossy).
 
     If output_container is Container.FLAC, or it's another value but the input does not contain an Atmos stream,
     carat will find the "best" lossless stream and rip it into a collection of flac files (with tags and
@@ -1407,7 +1401,8 @@ def prepare_album_rip(src: str, artist: str, album: str, library_root: str,
 
     try:
         ar: AcquisitionResult = get_mkv_master_file_and_metadata(src, artist, album, output_container)
-        profile = resolve_audio_profile(ar.master_mkv_path, ar.atmos_streams, output_container, preferred_codec)
+        profile = resolve_audio_profile(ar.master_mkv_path, ar.atmos_streams, output_container, preferred_codec,
+                                        ar.chapters, ar.duration)
 
         # Canonicalize artist and album names if indicated by results of call to get_mkv_master_file_and_metadata
         canonical_artist = artist
@@ -1721,14 +1716,15 @@ class RipPlan:
         # ==========================================
         # 5. SUFFIX GENERATION & FORMAT RESOLUTION
         # ==========================================
-        stream_desc = title_info.streams.get(new_stream_idx, "")
-        suffix = _suffix_for_stream_desc(stream_desc)
-
         is_atmos_stream = (new_stream_idx in new_atmos_streams)
         if is_atmos_stream and internals.output_container != Container.FLAC:
             final_container = internals.output_container
         else:
             final_container = Container.FLAC
+
+        suffix = _determine_suffix(
+            new_mkv, new_stream_idx, is_atmos_stream, final_container, new_chapters, new_duration
+        )
 
         new_profile = AudioProfile(
             stream_idx=new_stream_idx,
@@ -1777,19 +1773,229 @@ class TrackMismatchError(Exception):
     pass
 
 
-def _suffix_for_stream_desc(stream_desc: str) -> str:
-    """
-    Determines the appropriate file suffix based on a MakeMKV stream description.
-    """
-    desc_lower = stream_desc.lower()
+_QUAD_TAG_RE = re.compile(r'\b(?:quad|quadraphonic|quadrophonic|4\.0)\b', re.IGNORECASE)
+_ASTATS_CHANNEL_RE = re.compile(r'Channel:\s*(\d+)')
+_ASTATS_PEAK_RE = re.compile(r'Peak level dB:\s*(\S+)')
 
-    if "atmos" in desc_lower or "truehd" in desc_lower:
+
+def _probe_audio_stream(mkv_path: Path, stream_idx: int) -> FFprobeStream | None:
+    """Returns FFprobe metadata (channels, layout, title tag) for a specific audio stream."""
+    if not mkv_path.exists():
+        logger.emit(f"[!] Cannot probe Stream {stream_idx}: MKV file not found ({mkv_path}).")
+        return None
+
+    cmd = [
+        TOOLS.FFPROBE, "-v", "error",
+        "-select_streams", "a",
+        "-show_entries", "stream=index,channels,channel_layout:stream_tags=title",
+        "-of", "json",
+        str(mkv_path),
+    ]
+    try:
+        res = run_command(cmd, f"Probing Audio Stream {stream_idx}", suppress_summary=True)
+        probe_data: FFprobeOutput = json.loads(res)
+        for stream in probe_data.get("streams", []):
+            if stream.get("index") == stream_idx:
+                return stream
+        logger.emit(f"[!] Stream {stream_idx} not found in FFprobe output.")
+    except (RuntimeError, OSError, json.JSONDecodeError) as e:
+        logger.emit(f"[!] Failed to probe Stream {stream_idx}: {e}")
+        return None
+    return None
+
+
+def _sample_windows(chapters: list[MkvChapter] | None, duration: float,
+                    sample_duration: float = 5.0, max_samples: int = 5) -> list[tuple[float, float]]:
+    """Selects short (start_sec, duration_sec) windows evenly distributed across chapters or total duration."""
+    if chapters:
+        usable = [ch for ch in chapters if (ch["end_time"] - ch["start_time"]) >= 10.0]
+        if not usable:
+            usable = [ch for ch in chapters if ch["end_time"] > ch["start_time"]]
+        if usable:
+            if len(usable) <= max_samples:
+                selected = usable
+            else:
+                indices = [round(i * (len(usable) - 1) / (max_samples - 1)) for i in range(max_samples)]
+                selected = [usable[i] for i in indices]
+
+            windows: list[tuple[float, float]] = []
+            for ch in selected:
+                mid = (ch["start_time"] + ch["end_time"]) / 2.0
+                start = max(ch["start_time"], mid - sample_duration / 2.0)
+                dur = min(sample_duration, ch["end_time"] - start)
+                if dur > 0:
+                    windows.append((start, dur))
+            if windows:
+                return windows
+
+    if duration > 0:
+        fractions = (0.2, 0.5, 0.8) if duration >= 15.0 else (0.5,)
+        windows = []
+        for frac in fractions:
+            mid = duration * frac
+            start = max(0.0, mid - sample_duration / 2.0)
+            dur = min(sample_duration, duration - start)
+            if dur > 0:
+                windows.append((start, dur))
+        if windows:
+            return windows
+
+    return [(0.0, sample_duration)]
+
+
+def _parse_astats_peak_db(ffmpeg_stderr: str) -> dict[int, float]:
+    """Parses per-channel Peak level dB values from FFmpeg astats stderr output."""
+    peaks: dict[int, float] = {}
+    current_ch: int | None = None
+    for line in ffmpeg_stderr.splitlines():
+        ch_match = _ASTATS_CHANNEL_RE.search(line)
+        if ch_match:
+            current_ch = int(ch_match.group(1))
+            continue
+        if current_ch is not None:
+            peak_match = _ASTATS_PEAK_RE.search(line)
+            if peak_match:
+                try:
+                    db = float(peak_match.group(1))
+                    if not math.isnan(db):
+                        peaks[current_ch] = db
+                except ValueError:
+                    pass
+                current_ch = None
+    return peaks
+
+
+def _is_quad_in_surround(mkv_path: Path, stream_idx: int, has_lfe: bool, chapters: list[MkvChapter] | None = None,
+                         duration: float = 0.0) -> bool:
+    """
+    Detects a Quadraphonic (4.0 or 4.1) mix packaged inside a 5.0 or 5.1 container with a silent Center channel.
+
+    In standard SMPTE layout:
+      - 5.1: 1=FL, 2=FR, 3=FC, 4=LFE, 5=BL/SL, 6=BR/SR
+      - 5.0: 1=FL, 2=FR, 3=FC, 4=BL/SL, 5=BR/SR
+
+    LFE activity is intentionally ignored so that 4.1 mixes (4.0 + LFE) are classified as Quad.
+    Samples short windows at chapter midpoints using FFmpeg's astats filter and short-circuits immediately
+    on the first window where Center (ch 3) has audible signal.
+    """
+    silent_db = -70.0
+    active_db = -50.0
+    total_channels = 6 if has_lfe else 5
+    corner_channels = (1, 2, 5, 6) if has_lfe else (1, 2, 4, 5)
+    required_channels = tuple(range(1, total_channels + 1))
+    container_label = "5.1" if has_lfe else "5.0"
+
+    max_corner_peaks: dict[int, float] = {ch: -math.inf for ch in corner_channels}
+    windows_checked = 0
+    windows = _sample_windows(chapters, duration)
+
+    for i, (start, dur) in enumerate(windows, start=1):
+        cmd = [
+            TOOLS.FFMPEG, "-hide_banner", "-nostats", "-v", "info",
+            "-ss", f"{start:.3f}",
+            "-i", str(mkv_path),
+            "-t", f"{dur:.3f}",
+            "-map", f"0:{stream_idx}",
+            "-af", "astats=metadata=0:reset=0:measure_overall=none:measure_perchannel=Peak_level",
+            "-f", "null", "-",
+        ]
+        try:
+            res = run_command(
+                cmd,
+                f"Analyzing {container_label} Stream {stream_idx} channels (sample {i}/{len(windows)} at {start:.1f}s)",
+                context=ExecutionContext(ffmpeg_prefix="Analyzing"),
+                suppress_summary=True,
+                suppress_output=True,
+            )
+        except (RuntimeError, OSError) as e:
+            logger.emit(f"[!] Channel analysis failed on sample {i}: {e}")
+            return False
+
+        peaks = _parse_astats_peak_db(res)
+        if not all(ch in peaks for ch in required_channels):
+            logger.emit(f"[!] Sample {i} returned incomplete channel stats: {peaks}")
+            return False
+
+        windows_checked += 1
+        if has_lfe:
+            logger.emit(
+                f"    -> Sample {i} peaks (dB): "
+                f"FL={peaks[1]:.1f}, FR={peaks[2]:.1f}, FC={peaks[3]:.1f}, "
+                f"LFE={peaks[4]:.1f}, SL/BL={peaks[5]:.1f}, SR/BR={peaks[6]:.1f}"
+            )
+        else:
+            logger.emit(
+                f"    -> Sample {i} peaks (dB): "
+                f"FL={peaks[1]:.1f}, FR={peaks[2]:.1f}, FC={peaks[3]:.1f}, "
+                f"SL/BL={peaks[4]:.1f}, SR/BR={peaks[5]:.1f}"
+            )
+
+        # Short-circuit: audible Center (ch 3) means genuine 5.0 / 5.1 surround
+        if peaks[3] >= silent_db:
+            logger.emit(
+                f"[*] Center active (FC={peaks[3]:.1f} dB >= {silent_db:.1f} dB); classifying as Surround."
+            )
+            return False
+
+        for ch in corner_channels:
+            max_corner_peaks[ch] = max(max_corner_peaks[ch], peaks[ch])
+
+    if windows_checked > 0 and all(max_corner_peaks[ch] > active_db for ch in corner_channels):
+        return True
+
+    logger.emit(f"[*] Center silent, but corner channels did not all exceed {active_db:.1f} dB "
+                f"({max_corner_peaks}); classifying as Surround.")
+    return False
+
+
+def _determine_suffix(
+    mkv_path: Path,
+    stream_idx: int,
+    is_atmos_stream: bool,
+    output_container: Container,
+    chapters: list[MkvChapter] | None = None,
+    duration: float = 0.0,
+) -> str:
+    """
+    Determines the appropriate folder/filename suffix for the selected audio stream and output format.
+
+    Returns " (Atmos)" only when the stream is Atmos and preserved in a non-FLAC container.
+    For all other outputs, inspects the stream with FFprobe (and checks 5.0/5.1 streams for a silent
+    Center channel to identify 4.0/4.1 Quad mixes stored inside surround containers). The presence or
+    absence of an LFE channel never affects the suffix.
+    """
+    if is_atmos_stream and output_container != Container.FLAC:
         return " (Atmos)"
-    elif "quad" in desc_lower or "4.0" in desc_lower:
+
+    stream = _probe_audio_stream(mkv_path, stream_idx)
+    if stream is None:
+        return " (Unknown)"
+
+    channels = int(stream.get("channels", 0))
+    layout = stream.get("channel_layout", "").lower()
+    title_tag = stream.get("tags", {}).get("title", "")
+    logger.emit(f"[*] Stream {stream_idx} metadata: {channels}ch, layout='{layout or 'unknown'}', title='{title_tag}'")
+
+    if channels >= 4 and _QUAD_TAG_RE.search(title_tag):
         return " (Quad)"
-    elif "stereo" in desc_lower or "2.0" in desc_lower:
-        return ""
-    elif "surround" in desc_lower or "5.0" in desc_lower or "5.1" in desc_lower or "7.1" in desc_lower:
+    if channels == 1:
+        return " (Mono)"
+    if channels == 2 or (channels == 3 and layout == "2.1"):
+        return ""  # The implicit standard (Stereo, with or without LFE)
+    if (channels == 4 and layout != "3.1") or (channels == 5 and (layout == "4.1" or "lfe" in layout)):
+        return " (Quad)"
+    if channels == 5 and layout in ("5.0", "5.0(side)", ""):
+        if _is_quad_in_surround(mkv_path, stream_idx, has_lfe=False, chapters=chapters, duration=duration):
+            logger.emit("[+] Detected Quadraphonic mix inside 5.0 container (silent Center channel).")
+            return " (Quad)"
+        return " (Surround)"
+    if channels == 6 and layout in ("5.1", "5.1(side)", ""):
+        if _is_quad_in_surround(mkv_path, stream_idx, has_lfe=True, chapters=chapters, duration=duration):
+            logger.emit("[+] Detected Quadraphonic mix inside 5.1 container (silent Center channel).")
+            return " (Quad)"
+        return " (Surround)"
+    if channels > 2:
+        # Catches 3.0, 3.1, 6.1, 7.0, 7.1, Atmos-transcoded-to-FLAC, etc.
         return " (Surround)"
 
     return " (Unknown)"
