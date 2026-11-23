@@ -105,7 +105,7 @@ def generate_cue_sheet(cue_path: Path, audio_file_name: str, info: MusicBrainzMe
                 f'REM DATE {info.get("year", "Unknown")}\nFILE "{audio_file_name}" WAVE\n')
         for i, ch in enumerate(chapters):
             track = mb_tracks[i] if i < len(mb_tracks) else None
-            title = track['title'] if track is not None else f"Track {i + 1}"
+            title = track['title'] if track is not None else f"Track {i + 1:02d}"
             f.write(f'  TRACK {i + 1:02d} AUDIO\n    TITLE "{title}"\n')
             track_artist = track.get('track_artist', '') if track is not None else ''
             if track_artist and track_artist != info['artist']:
@@ -462,7 +462,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
         except (concurrent.futures.TimeoutError, concurrent.futures.CancelledError):
             logger.emit("    [!] Warning: MusicBrainz candidate pre-fetch timed out or was cancelled.")
 
-    # Find all input titles with the same track count as a candidate MusicBrainz releases
+    # Find all input titles with the same track count as a candidate MusicBrainz release
     valid_titles: list[tuple[str, MusicBrainzMetadata | None]] = []
     if candidates:
         for title_index, info in titles.items():
@@ -473,14 +473,15 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
             logger.emit(f"\n[+] Finding best candidate for Title {title_index}")
             best_candidate = get_best_mb_candidate(artist, album, info.num_chapters, info.duration_sec, candidates)
 
-            # Keep the title if it matched a candidate, OR if MB is entirely offline
-            if best_candidate or not candidates:
+            if best_candidate:
                 valid_titles.append((title_index, best_candidate))
-    else:
-        # Graceful degradation if MB is down/offline
-        valid_titles = [(t_idx, None) for t_idx, info in titles.items() if info.score > 0]
+
     if not valid_titles:
-        raise RuntimeError("No titles in the input matched the expected track counts from MusicBrainz.")
+        # Graceful degradation if MB is down/offline OR no candidate matched the disc's track counts
+        if candidates:
+            logger.emit("\n[!] No MusicBrainz candidate matched any disc title's track count. "
+                        "Falling back to topology-based title selection with generic track titles.")
+        valid_titles = [(t_idx, None) for t_idx, info in titles.items() if info.score > 0]
 
     # noinspection PyShadowingNames
     def sort_key(item: tuple[str, MusicBrainzMetadata | None]) -> tuple[int, int, int, int]:
@@ -528,7 +529,7 @@ def find_primary_title(source_spec: str, artist: str, album: str, prefer_legacy:
                     f" [Scores: Format={format_penalty}, Duration={duration_penalty}, Rank={mb_rank}, Size={neg_size}]")
         else:
             logger.emit(f"    {bullet}  Title {title_index} ['Unknown']"
-                        f"[Scores: Rank={mb_rank}, Format={format_penalty}, Size={-neg_size} bytes]")
+                        f" [Scores: Format={format_penalty}, Duration={duration_penalty}, Rank={mb_rank}, Size={-neg_size} bytes]")
     logger.emit("")
 
     winner = valid_titles[0]
@@ -1215,7 +1216,7 @@ def _assemble_gapless_album(ctx: RipContext) -> None:
         "-metadata", f"title={ctx.album}", "-c:a", "copy"
     ]
 
-    mbid = ctx.info.get('mbid', "unknown")
+    mbid = ctx.info.get('mbid')
     if mbid:
         cmd.extend(["-metadata", f"MusicBrainz_Album_Id={mbid}"])
 
@@ -1233,8 +1234,15 @@ def _extract_flac_tracks(ctx: RipContext) -> list[tuple[Path, MusicBrainzTrack, 
     """Handles slicing the master MKV into individual FLAC tracks."""
     logger.emit(f"[*] Slicing tracks to FLAC{ctx.profile.suffix}...")
 
+    tracks: list[MusicBrainzTrack] = ctx.tracks if ctx.tracks else [
+        MusicBrainzTrack(
+            title=f"Track {i + 1:02d}",
+            duration_ms=int((ch['end_time'] - ch['start_time']) * 1000)
+        )
+        for i, ch in enumerate(ctx.chapters)
+    ]
     flac_files: list[tuple[Path, MusicBrainzTrack, int]] = []
-    for i, (track, chapter) in enumerate(zip(ctx.tracks, ctx.chapters)):
+    for i, (track, chapter) in enumerate(zip(tracks, ctx.chapters)):
         track_num = i + 1
         safe_title = _sanitize_filename(track['title'])
         out_filename = f"{track_num:02d} {safe_title}.{Container.FLAC}"
@@ -1478,7 +1486,9 @@ def execute_album_rip(plan: RipPlan) -> bool:
     artist = plan.artist
     album = plan.album
     internals = plan._internals # pyright: ignore[reportPrivateUsage]
-    info = matched_candidate or MusicBrainzMetadata(title=album, artist=artist, year='unknown', mbid='unknown', medium_index=1, tracks=[])
+    info = matched_candidate or MusicBrainzMetadata(
+        title=album, artist=artist, year='Unknown', mbid='', medium_index=1, tracks=[]
+    )
     log_dest = internals.log_dest_path
     dest = log_dest.parent
     logger.emit(f"[+] Executing Rip for: {artist} - {album}")
@@ -1493,7 +1503,7 @@ def execute_album_rip(plan: RipPlan) -> bool:
 
         # Execute Assembly (Concurrent)
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, info.get('mbid'))
+            cover_future = ex.submit(get_cover_art.download_cover_art, artist, album, dest, info.get('mbid') or None)
 
             is_flac = profile.container == Container.FLAC
             flac_files: list[tuple[Path, MusicBrainzTrack, int]] = []
@@ -1611,6 +1621,8 @@ class RipPlan:
         If `revision.title_idx` differs from the current plan, this method will validate the target chapter counts
         against the cached disc topology. If the validation passes, it performs a synchronous physical extraction of
         the new title from the source drive to replace the temporary master MKV file.
+        If `revision.mbid` is empty, MusicBrainz tracklist metadata is omitted and generic track names
+        (`Track 01`, `Track 02`, ...) will be used.
 
          Args:
              revision: The requested title, stream, metadata, artist, and album changes.
@@ -1628,7 +1640,7 @@ class RipPlan:
 
         new_title_idx = revision.title_idx
         new_stream_idx = revision.stream_idx
-        new_mbid = revision.mbid
+        new_mbid = revision.mbid.strip()
         new_medium_idx = revision.medium_idx
         new_artist = revision.artist
         new_album = revision.album
@@ -1636,12 +1648,13 @@ class RipPlan:
         # ==========================================
         # 1. STATE DIFFING
         # ==========================================
-        old_mbid = self.matched_candidate['mbid'] if self.matched_candidate else None
+        old_mbid = self.matched_candidate['mbid'] if self.matched_candidate else ""
         old_medium = self.matched_candidate['medium_index'] if self.matched_candidate else None
 
         mbid_changed = (new_mbid != old_mbid)
-        medium_changed = (new_medium_idx != old_medium)
-        metadata_fetch_needed = mbid_changed or medium_changed
+        medium_changed = bool(new_mbid) and (new_medium_idx != old_medium)
+        metadata_changed = mbid_changed or medium_changed
+        metadata_fetch_needed = bool(new_mbid) and metadata_changed
         artist_changed = (new_artist != self.artist)
         album_changed = (new_album != self.album)
         title_changed = (new_title_idx != self.title_idx)
@@ -1663,7 +1676,8 @@ class RipPlan:
         logger.emit(f"{_flag(album_changed)} Album          : {new_album}")
         logger.emit(f"{_flag(title_changed or stream_changed)} Data Source    : "
                     f"{internals.src} (Title {new_title_idx}, Stream {new_stream_idx})")
-        logger.emit(f"{_flag(metadata_fetch_needed)} Metadata Source: MBID {new_mbid} (Medium {new_medium_idx})")
+        meta_desc = f"MBID {new_mbid} (Medium {new_medium_idx})" if new_mbid else "None (Generic track titles)"
+        logger.emit(f"{_flag(metadata_changed)} Metadata Source: {meta_desc}")
         logger.emit("==========================================\n")
 
         # ==========================================
@@ -1673,18 +1687,22 @@ class RipPlan:
         if not title_info:
             raise ValueError(f"Title {new_title_idx} does not exist on this disc.")
 
-        if metadata_fetch_needed:
+        new_candidate: MusicBrainzMetadata | None
+        if not new_mbid:
+            new_candidate = None
+        elif metadata_fetch_needed:
             new_candidate = fetch_metadata(new_mbid, new_medium_idx)
         else:
             if not self.matched_candidate:
                 raise ValueError("No existing metadata to reuse, but fetch was bypassed.")
             new_candidate = self.matched_candidate
 
-        # Enforce chapter count matching
-        mb_track_count = len(new_candidate['tracks'])
-        if (title_changed or metadata_fetch_needed) and title_info.num_chapters != mb_track_count:
-            raise TrackMismatchError(f"Cannot revise: Title {new_title_idx} has {title_info.num_chapters} chapters, "
-                                     f"but metadata has {mb_track_count} tracks.")
+        # Enforce chapter count matching when MusicBrainz metadata is selected
+        if new_candidate is not None:
+            mb_track_count = len(new_candidate['tracks'])
+            if (title_changed or metadata_fetch_needed) and title_info.num_chapters != mb_track_count:
+                raise TrackMismatchError(f"Cannot revise: Title {new_title_idx} has {title_info.num_chapters} chapters, "
+                                         f"but metadata has {mb_track_count} tracks.")
 
         # ==========================================
         # 4. FINAL NAMING STATE & SLOW RE-RIP

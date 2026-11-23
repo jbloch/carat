@@ -17,6 +17,7 @@ import queue
 import re
 import threading
 import tkinter as tk
+import urllib.parse
 from enum import Enum
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -444,9 +445,12 @@ class CaratGUI:
             # Phase 1: prepare rip plan
             plan = carat.prepare_album_rip(source_path, artist, album, lib_root, output_container, preferred_codec)
 
-            # Phase 2: (optional): inspect and possibly revise rip plan
-            if self.review_metadata_var.get():
-                logger.emit("\n[*] Awaiting user confirmation of metadata...")
+            # Phase 2: (optional, or automatic when MusicBrainz found no match): inspect and possibly revise rip plan
+            if self.review_metadata_var.get() or plan.matched_candidate is None:
+                if plan.matched_candidate is None:
+                    logger.emit("\n[!] No matching MusicBrainz tracklist found. Opening Rip Plan dialog...")
+                else:
+                    logger.emit("\n[*] Awaiting user confirmation of metadata...")
                 self.review_result = None
                 self.action_queue.put(("REVIEW", plan))
                 self.review_event.wait()
@@ -468,12 +472,11 @@ class CaratGUI:
                 return
 
             # Phase 3: Execute rip plan
-            success = carat.execute_album_rip(plan)
-
-            if success:
-                self.done_queue.put(("SUCCESS", plan))
-            else:
-                self.done_queue.put(("FAIL", plan))
+            got_metadata = carat.execute_album_rip(plan)
+            if not got_metadata:
+                logger.emit("[!] Note: Generic track titles ('Track 01', 'Track 02', ...) were used. "
+                            "You can edit the generated CUE sheet or FLAC tags as desired.")
+            self.done_queue.put(("SUCCESS", plan))
         except Exception as e:
             logger.emit(f"\n[!] Carat Engine Error: {str(e)}")
             self.done_queue.put(("FAIL", None))
@@ -536,11 +539,11 @@ class CaratGUI:
                 self.done_queue.put(("FAIL", old_plan))
                 return
 
-            success = carat.execute_album_rip(safe_plan)
-            if success:
-                self.done_queue.put(("SUCCESS", safe_plan))
-            else:
-                self.done_queue.put(("FAIL", safe_plan))
+            got_metadata = carat.execute_album_rip(safe_plan)
+            if not got_metadata:
+                logger.emit("[!] Note: Generic track titles ('Track 01', 'Track 02', ...) were used. "
+                            "You can edit the generated CUE sheet or FLAC tags as desired.")
+            self.done_queue.put(("SUCCESS", safe_plan))
         except Exception as e:
             logger.emit(f"\n[!] Carat Engine Error during revise: {str(e)}")
             self.done_queue.put(("FAIL", old_plan))
@@ -741,10 +744,14 @@ class ReviseDialog(tk.Toplevel):
         self.plan = plan  # Saved for validation helper
         self.current_mb_tracks = 0
         self.current_mb_duration = 0
+        self._mb_state: Literal["loaded", "generic", "loading", "invalid", "error"] = "generic"
+        self._preview_timer: str | None = None
+        self._generic_preview_count: int | None = None
 
         if plan.matched_candidate and 'tracks' in plan.matched_candidate:
             self.current_mb_tracks = len(plan.matched_candidate['tracks'])
             self.current_mb_duration = sum((int(t.get('duration_ms') or 0)) for t in plan.matched_candidate['tracks'])
+            self._mb_state = "loaded"
 
         # 2. Build UI Regions
         self._build_top_frame()
@@ -775,6 +782,9 @@ class ReviseDialog(tk.Toplevel):
         self.mbid_var = tk.StringVar(value=current_mbid)
         self.mbid_var.trace_add("write", self._on_mbid_changed)
         ttk.Entry(top_frame, textvariable=self.mbid_var, width=45).grid(row=0, column=1, padx=5, sticky="w")
+        ttk.Button(top_frame, text="Use Generic Titles", command=self._use_generic_titles).grid(
+            row=0, column=2, padx=5, sticky="w"
+        )
 
         ttk.Label(top_frame, text="Medium:").grid(row=1, column=0, sticky="e", pady=5)
         self.medium_var = tk.IntVar(value=current_medium)
@@ -782,17 +792,38 @@ class ReviseDialog(tk.Toplevel):
         ttk.Spinbox(top_frame, from_=1, to=99, textvariable=self.medium_var, width=5).grid(row=1, column=1, sticky="w",
                                                                                            padx=5, pady=5)
 
+        self.link_lbl = ttk.Label(top_frame, foreground="blue", cursor="hand2")
+        self.link_lbl.grid(row=2, column=1, sticky="w", padx=5)
+        self.link_lbl.bind("<Button-1>", self._open_musicbrainz_link)
+        self._update_mb_link_label()
+
+    def _use_generic_titles(self) -> None:
+        """Clears the MusicBrainz ID so the rip proceeds with generic track titles."""
+        if self.mbid_var.get():
+            self.mbid_var.set("")
+
+    def _update_mb_link_label(self) -> None:
+        """Updates the MusicBrainz helper link text based on whether an MBID is entered."""
+        if len(self.mbid_var.get().strip()) == 36:
+            self.link_lbl.config(text="View Release on MusicBrainz")
+        else:
+            self.link_lbl.config(text="Search MusicBrainz for this Release")
+
+    def _open_musicbrainz_link(self, _event: object = None) -> None:
         import webbrowser
-        link_lbl = ttk.Label(top_frame, text="View Release on MusicBrainz", foreground="blue", cursor="hand2")
-        link_lbl.grid(row=2, column=1, sticky="w", padx=5)
-        link_lbl.bind("<Button-1>", lambda e: webbrowser.open(f"https://musicbrainz.org/release/{self.mbid_var.get()}"))
+        mbid = self.mbid_var.get().strip()
+        if len(mbid) == 36:
+            webbrowser.open(f"https://musicbrainz.org/release/{mbid}")
+        else:
+            query = urllib.parse.quote_plus(f"{self.artist_var.get().strip()} {self.album_var.get().strip()}".strip())
+            webbrowser.open(f"https://musicbrainz.org/search?query={query}&type=release")
 
     def _build_left_pane(self, parent_container: ttk.Frame) -> None:
         """Constructs the local naming overrides and the MusicBrainz live preview tree."""
-        left_frame = ttk.LabelFrame(parent_container, text="Current MusicBrainz Tracklist")
+        left_frame = ttk.LabelFrame(parent_container, text="Tracklist Preview")
         left_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
 
-        override_frame = ttk.LabelFrame(left_frame, text=" Local Naming Overrides (Does not trigger metadata search) ")
+        override_frame = ttk.LabelFrame(left_frame, text=" Locally Generated Titles")
         override_frame.pack(fill="x", padx=5, pady=(0, 10))
 
         ttk.Label(override_frame, text="Override Artist:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
@@ -899,17 +930,31 @@ class ReviseDialog(tk.Toplevel):
         self.btn_rip = ttk.Button(btn_frame, text="Rip", command=self._on_rip)
         self.btn_rip.pack(side="right")
 
+    def _populate_generic_preview(self, track_count: int) -> None:
+        """Populates the tracklist preview with generic 'Track 01', 'Track 02', ... placeholders."""
+        if self._generic_preview_count == track_count:
+            return
+        self._generic_preview_count = track_count
+        self.mb_tree.delete(*self.mb_tree.get_children())
+        for i in range(track_count):
+            self.mb_tree.insert("", "end", text=f"{i + 1}. Track {i + 1:02d}", values=("—",))
+        self.lbl_preview_status.config(
+            text="No MusicBrainz match — using generic titles",
+            foreground="#b35900",
+            font=("Segoe UI", 10, "bold")
+        )
+
     def _update_validation_status(self):
         """Compares the selected MKV Title against the Live MusicBrainz preview."""
-        if not hasattr(self, 'current_mb_tracks') or not self.topo_tree:
+        if not hasattr(self, 'btn_rip') or not self.topo_tree:
             return
 
         sel = self.topo_tree.selection()
         if not sel:
             self.lbl_track_match.config(text="No Stream Selected", foreground="gray")
             self.lbl_dur_match.config(text="")
-            if hasattr(self, 'btn_rip'):
-                self.btn_rip.state(['disabled'])  # Disable if nothing selected
+            self.btn_rip.config(text="Rip")
+            self.btn_rip.state(['disabled'])  # Disable if nothing selected
             return
 
         iid = sel[0]
@@ -922,19 +967,38 @@ class ReviseDialog(tk.Toplevel):
         mkv_tracks = title_info.num_chapters
         mkv_dur = title_info.duration_sec * 1000
 
+        if self._mb_state == "generic":
+            self._populate_generic_preview(mkv_tracks)
+            self.lbl_track_match.config(text=f"⚠ Generic Titles ({mkv_tracks} tracks)", foreground="#b35900")
+            self.lbl_dur_match.config(text="Edit CUE / tags after rip", foreground="gray")
+            self.btn_rip.config(text="Rip (Generic Titles)")
+            self.btn_rip.state(['!disabled'])
+            return
+
+        self.btn_rip.config(text="Rip")
+        if self._mb_state == "loading":
+            self.lbl_track_match.config(text="Checking MusicBrainz...", foreground="blue")
+            self.lbl_dur_match.config(text="")
+            self.btn_rip.state(['disabled'])
+            return
+
+        if self._mb_state in ("invalid", "error"):
+            self.lbl_track_match.config(text="✖ Invalid or Unavailable MBID", foreground="red")
+            self.lbl_dur_match.config(text="Clear MBID to use generic titles", foreground="gray")
+            self.btn_rip.state(['disabled'])
+            return
+
         mb_tracks = self.current_mb_tracks
         mb_dur = self.current_mb_duration
 
         # 1. Track Count Validation (THE FATAL GUARDRAIL)
         if mkv_tracks == mb_tracks:
             self.lbl_track_match.config(text=f"✔ Tracks Match ({mkv_tracks})", foreground="green")
-            if hasattr(self, 'btn_rip'):
-                self.btn_rip.state(['!disabled'])  # ENABLE BUTTON
+            self.btn_rip.state(['!disabled'])  # ENABLE BUTTON
         else:
             self.lbl_track_match.config(text=f"✖ Track Mismatch (MKV: {mkv_tracks} / MB: {mb_tracks})",
                                         foreground="red")
-            if hasattr(self, 'btn_rip'):
-                self.btn_rip.state(['disabled'])  # DISABLE BUTTON
+            self.btn_rip.state(['disabled'])  # DISABLE BUTTON
 
         # 2. Duration Validation
         if mb_dur == 0 or mkv_dur == 0:
@@ -948,39 +1012,95 @@ class ReviseDialog(tk.Toplevel):
 
     def _on_mbid_changed(self, *_args: str) -> None:
         """Resets the medium index to 1 when a new MBID is entered, and triggers a preview."""
+        self._update_mb_link_label()
+        if self._preview_timer:
+            self.after_cancel(self._preview_timer)
+            self._preview_timer = None
+
+        mbid = self.mbid_var.get().strip()
+        self._generic_preview_count = None
+        if not mbid:
+            self._mb_state = "generic"
+            self.current_mb_tracks = 0
+            self.current_mb_duration = 0
+            self._update_validation_status()
+            return
+
         self.medium_var.set(1)
         self._trigger_live_preview()
 
     def _trigger_live_preview(self, *_args: str) -> None:
-        if hasattr(self, '_preview_timer') and self._preview_timer:
+        if self._preview_timer:
             self.after_cancel(self._preview_timer)
+            self._preview_timer = None
+
+        mbid = self.mbid_var.get().strip()
+        if not mbid:
+            return
+
+        if len(mbid) != 36:
+            self._mb_state = "invalid"
+            self.lbl_preview_status.config(
+                text="Waiting for valid 36-character MBID (or clear for generic titles)...",
+                foreground="gray",
+                font=("TkDefaultFont", 9)
+            )
+            self._update_validation_status()
+            return
+
+        self._mb_state = "loading"
+        self._update_validation_status()
         self._preview_timer = self.after(750, self._fetch_live_preview)
 
     def _fetch_live_preview(self):
+        self._preview_timer = None
         mbid = self.mbid_var.get().strip()
-        medium = self.medium_var.get()
-
-        if len(mbid) != 36:
-            self.lbl_preview_status.config(text="Waiting for valid 36-character MBID...", foreground="gray")
+        try:
+            medium = self.medium_var.get()
+        except tk.TclError:
             return
 
-        self.lbl_preview_status.config(text="Fetching metadata...", foreground="blue")
+        if len(mbid) != 36:
+            return
+
+        self.lbl_preview_status.config(text="Fetching metadata...", foreground="blue", font=("TkDefaultFont", 9))
 
         def worker():
             """ Daemon thread to fetch the MB preview. """
             try:
                 metadata = music_brainier.fetch_metadata(mbid, medium)
-                self.after(0, lambda: self._update_preview_ui(metadata))
+                self.after(0, self._update_preview_ui, metadata, mbid, medium)
             except Exception as e:
-                self.after(0, lambda: self.lbl_preview_status.config(text=f"Fetch failed: {e}", foreground="red"))
+                self.after(0, self._on_preview_fetch_error, e, mbid, medium)
 
         import threading
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_preview_ui(self, metadata: MusicBrainzMetadata):
+    def _on_preview_fetch_error(self, error: Exception, expected_mbid: str, expected_medium: int) -> None:
+        if not self.winfo_exists() or self.mbid_var.get().strip() != expected_mbid:
+            return
+        try:
+            if self.medium_var.get() != expected_medium:
+                return
+        except tk.TclError:
+            return
+        self._mb_state = "error"
+        self.lbl_preview_status.config(text=f"Fetch failed: {error}", foreground="red", font=("TkDefaultFont", 9))
+        self._update_validation_status()
+
+    def _update_preview_ui(self, metadata: MusicBrainzMetadata, expected_mbid: str, expected_medium: int) -> None:
         if not self.winfo_exists():
             return
+        if self.mbid_var.get().strip() != expected_mbid:
+            return
+        try:
+            if self.medium_var.get() != expected_medium:
+                return
+        except tk.TclError:
+            return
 
+        self._generic_preview_count = None
+        self._mb_state = "loaded"
         self.mb_tree.delete(*self.mb_tree.get_children())
 
         artist = metadata['artist']
@@ -997,7 +1117,7 @@ class ReviseDialog(tk.Toplevel):
 
         total_mins, total_secs = divmod(total_ms // 1000, 60)
         status_text = f"{artist} - {album} ({len(tracks)} tracks, {total_mins}:{total_secs:02d})"
-        self.lbl_preview_status.config(text=status_text, font=("Segoe UI", 10, "bold"))
+        self.lbl_preview_status.config(text=status_text, foreground="black", font=("Segoe UI", 10, "bold"))
 
         # Update the state variables and trigger the validation check
         self.artist_var.set(artist)
@@ -1033,13 +1153,18 @@ class ReviseDialog(tk.Toplevel):
                                  parent=self)
             return
 
+        try:
+            medium_idx = self.medium_var.get()
+        except tk.TclError:
+            medium_idx = 1
+
         self.result = carat.RipPlanRevision(
             title_idx=selected_title if selected_title is not None else str(self.plan.title_idx),
             stream_idx=selected_stream,
             mbid=new_mbid,
-            medium_idx=self.medium_var.get(),
-            artist=self.artist_var.get().strip(),
-            album=self.album_var.get().strip()
+            medium_idx=medium_idx,
+            artist=self.artist_var.get().strip() or self.plan.artist,
+            album=self.album_var.get().strip() or self.plan.album
         )
         self.destroy()
 
