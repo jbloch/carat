@@ -1199,6 +1199,44 @@ class RipContext:
     tracks: list[MusicBrainzTrack]  # The tracklist metadata from MusicBrainz
 
 
+def _format_duration(seconds: float) -> str:
+    """Formats a duration in seconds as M:SS or H:MM:SS."""
+    total_secs = max(0, round(seconds))
+    hours, rem = divmod(total_secs, 3600)
+    mins, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{mins:02d}:{secs:02d}"
+    return f"{mins}:{secs:02d}"
+
+
+def _log_tracklist(ctx: RipContext) -> None:
+    """Emits a formatted tracklist with per-track and total durations to the rip log."""
+    chapters = ctx.chapters[:len(ctx.tracks)] if ctx.tracks else ctx.chapters
+    if not chapters:
+        return
+
+    rows: list[tuple[str, str]] = []
+    total_seconds = 0.0
+    for i, ch in enumerate(chapters):
+        track = ctx.tracks[i] if i < len(ctx.tracks) else None
+        title = track['title'] if track is not None else f"Track {i + 1:02d}"
+        track_artist = track.get('track_artist', '') if track is not None else ''
+        label = f"{title} — {track_artist}" if track_artist and track_artist != ctx.info['artist'] else title
+        dur_sec = max(0.0, ch['end_time'] - ch['start_time'])
+        total_seconds += dur_sec
+        rows.append((label, _format_duration(dur_sec)))
+
+    num_width = max(2, len(str(len(rows))))
+    title_width = max(len(label) for label, _ in rows)
+    dur_width = max(len(dur) for _, dur in rows)
+
+    logger.emit(f"\n[*] === TRACKLIST === for {ctx.dest}")
+    for i, (label, dur) in enumerate(rows, start=1):
+        logger.emit(f"    {i:0{num_width}d}. {label:<{title_width}}   {dur:>{dur_width}}")
+    track_word = "track" if len(rows) == 1 else "tracks"
+    logger.emit(f"    Total: {len(rows)} {track_word}, {_format_duration(total_seconds)}")
+
+
 def _assemble_gapless_album(ctx: RipContext) -> None:
     """Handles the FFmpeg remuxing for gapless M4A or MKA containers."""
     final_audio_name = f"{ctx.clean_album}{ctx.profile.suffix}.{ctx.profile.container}"
@@ -1520,6 +1558,7 @@ def execute_album_rip(plan: RipPlan) -> bool:
             if is_flac:
                 _tag_flac_files(flac_files, album, artist, info.get('year', 'Unknown'), dest / "cover.jpg")
 
+        _log_tracklist(ctx)
         logger.emit(f"\n[+] Ingestion Complete: {album}")
         logger.emit(f"[+] Total elapsed time: {(time.time() - internals.ingestion_start_time):.1f} seconds.")
     finally:
